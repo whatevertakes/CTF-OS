@@ -881,8 +881,10 @@ RUN set -eux; \
     ln -s /usr/bin/tcpdump /usr/local/libexec/ctf-os/tcpdump.real; \
     ln -s /usr/bin/photorec /usr/local/libexec/ctf-os/photorec.real; \
     ln -s /usr/bin/testdisk /usr/local/libexec/ctf-os/testdisk.real; \
-    ln -s /usr/bin/qemu-system-mips /usr/local/libexec/ctf-os/qemu-system-mips.real; \
-    ln -s /usr/bin/qemu-system-x86_64 /usr/local/libexec/ctf-os/qemu-system-x86_64.real; \
+    for architecture in aarch64 arm mips x86_64; do \
+      ln -s "/usr/bin/qemu-system-${architecture}" \
+        "/usr/local/libexec/ctf-os/qemu-system-${architecture}.real"; \
+    done; \
     ln -s /opt/venvs/mitm/bin/mitmdump /usr/local/libexec/ctf-os/mitmdump.real; \
     unlink /usr/local/bin/mitmdump; \
     printf '%s\n' \
@@ -901,14 +903,13 @@ RUN set -eux; \
       '    mitmdump) printf "Usage: mitmdump [OPTIONS] (explicit options required; use ctf-bg for server mode)\\n" >&2 ;;' \
       '    photorec) printf "Usage: photorec [OPTIONS] /cmd DEVICE COMMANDS\\n" >&2 ;;' \
       '    testdisk) printf "Usage: testdisk (/list [OPTIONS] [DEVICE] | [OPTIONS] /cmd DEVICE COMMANDS)\\n" >&2 ;;' \
-      '    qemu-system-mips) printf "Usage: qemu-system-mips [OPTIONS] (explicit machine or image options required)\\n" >&2 ;;' \
-      '    qemu-system-x86_64) printf "Usage: qemu-system-x86_64 [OPTIONS] (explicit machine or image options required)\\n" >&2 ;;' \
+      '    qemu-system-*) printf "Usage: %s [OPTIONS] (explicit machine or image options required)\\n" "${tool}" >&2 ;;' \
       '    *)        printf "ctf-tool-guard: unsupported invocation name: %s\\n" "${tool}" >&2 ;;' \
       '  esac' \
       '}' \
       '' \
       'case "${tool}" in' \
-      '  ciphey|clamscan|ngrep|tcpdump|mitmdump|photorec|testdisk|qemu-system-mips|qemu-system-x86_64) ;;' \
+      '  ciphey|clamscan|ngrep|tcpdump|mitmdump|photorec|testdisk|qemu-system-aarch64|qemu-system-arm|qemu-system-avr|qemu-system-mips|qemu-system-riscv64|qemu-system-x86_64) ;;' \
       '  *) usage; exit 126 ;;' \
       'esac' \
       '[[ -x "${real}" ]] || { printf "%s: preserved executable is unavailable: %s\\n" "${tool}" "${real}" >&2; exit 127; }' \
@@ -936,7 +937,8 @@ RUN set -eux; \
       > /usr/local/libexec/ctf-os/noninteractive-guard; \
     chmod 0755 /usr/local/libexec/ctf-os/noninteractive-guard; \
     for tool in ciphey clamscan ngrep tcpdump mitmdump photorec testdisk \
-        qemu-system-mips qemu-system-x86_64; do \
+        qemu-system-aarch64 qemu-system-arm qemu-system-mips \
+        qemu-system-x86_64; do \
       ln -s ../libexec/ctf-os/noninteractive-guard "/usr/local/bin/${tool}"; \
       test "$(command -v -- "${tool}")" = "/usr/local/bin/${tool}"; \
       set +e; \
@@ -1050,6 +1052,41 @@ RUN rm -rf /root/.cache /root/.cargo/registry /root/.cargo/git \
  && find /opt /usr /root -xdev -depth -type d -name __pycache__ -empty -delete \
  && rm -rf /root/.cache /tmp/*
 
+# 작은 offline architecture/DFIR 보강은 비싼 기존 tool build cache를 보존하도록
+# final stage의 독립 layer에 둔다. daemon, GUI, binfmt 등록은 설치하지 않는다.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bc bison libelf-dev kmod device-tree-compiler ovmf \
+      binutils-avr gcc-avr avr-libc gdb-avr simavr qemu-system-misc \
+      libc6-dev-mips-cross libc6-dev-mipsel-cross libc6-dev-riscv64-cross \
+      libscca-utils \
+ && rm -rf /var/lib/apt/lists/* \
+ && command -v \
+      aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc \
+      avr-gcc avr-gdb avr-objdump dtc mactime \
+      mips-linux-gnu-gcc mipsel-linux-gnu-gcc modinfo \
+      qemu-aarch64-static qemu-mips-static qemu-mipsel-static \
+      qemu-riscv64-static qemu-system-avr qemu-system-riscv64 \
+      riscv64-linux-gnu-gcc sccainfo simavr usnjls >/dev/null
+
+# 새 system emulators도 기존 noninteractive guard 계약을 그대로 사용한다.
+RUN set -eux; \
+    for architecture in avr riscv64; do \
+      ln -s "/usr/bin/qemu-system-${architecture}" \
+        "/usr/local/libexec/ctf-os/qemu-system-${architecture}.real"; \
+      ln -s ../libexec/ctf-os/noninteractive-guard \
+        "/usr/local/bin/qemu-system-${architecture}"; \
+      test "$(command -v -- "qemu-system-${architecture}")" = \
+        "/usr/local/bin/qemu-system-${architecture}"; \
+      set +e; \
+      timeout --signal=TERM --kill-after=1s 5s \
+        "qemu-system-${architecture}" </dev/null >/dev/null 2>&1; \
+      status=$?; \
+      set -e; \
+      test "${status}" -eq 2; \
+      "qemu-system-${architecture}" --version | \
+        grep -F 'QEMU emulator version' >/dev/null; \
+    done
+
 # 래퍼·인덱스·잡 시스템 (별도 산출물)
 #   ctfwrap, ctf-bg, ctf-jobs, ctf-log, ctf-kill, ctf-idle, ctf-tools,
 #   ctf-flag, ctf-browser, ctf-web-probe, ctf-egress-proxy,
@@ -1073,7 +1110,7 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
       and (.failed | type == "array" and length == 0) \
       and (.tools | type == "array" and length > 0) \
       and all(.tools[]; .available == true and (.path | startswith("/"))) \
-      and ((["ctfwrap", "ctf-bg", "ctf-jobs", "ctf-log", "ctf-kill", "ctf-idle", "ctf-tools", "ctf-flag", "ctf-browser", "ctf-web-probe", "ctf-egress-proxy", "ctf-network-smoke", "ktext", "ghidra-decompile"] - [.tools[].name]) | length == 0)' \
+      and ((["ctfwrap", "ctf-bg", "ctf-jobs", "ctf-log", "ctf-kill", "ctf-idle", "ctf-tools", "ctf-flag", "ctf-browser", "ctf-web-probe", "ctf-egress-proxy", "ctf-network-smoke", "ctf-sqlite-readonly", "ktext", "ghidra-decompile"] - [.tools[].name]) | length == 0)' \
       /tools/manifest.json >/dev/null \
  && python3 /usr/local/bin/ctf-tools --render-md > /tools/TOOLS.md \
  && python3 /usr/local/bin/ctf-tools --json --info ctfwrap \

@@ -64,6 +64,7 @@ forensic|binwalk|binwalk|Firmware analysis and embedded file extraction||firmwar
 forensic|blkcat|blkcat|Display filesystem data-unit contents||disk,sleuthkit
 forensic|blkls|blkls|List or extract filesystem data units||disk,sleuthkit
 forensic|clamscan|clamscan|ClamAV file scanner||malware
+forensic|ctf-sqlite-readonly|ctf-sqlite-readonly|Bounded immutable query-only SQLite artifact reader|sqlite,sqlite3|sqlite,database,offline,readonly
 forensic|dcfldd|dcfldd|Forensic disk imaging with hashing support||disk,imaging
 forensic|dwarf2json|dwarf2json|Generate Volatility symbol data from DWARF||memory,symbols
 forensic|evtxexport|evtxexport|Export Windows EVTX records as XML||windows,event-log
@@ -81,6 +82,7 @@ forensic|hwp5txt|hwp5txt|Extract text from HWP version 5 documents||hwp,korean
 forensic|icat|icat|Extract a file from a disk image by inode||disk,sleuthkit
 forensic|img_stat|img_stat|Display disk-image format details||disk,sleuthkit
 forensic|istat|istat|Display filesystem inode metadata||disk,sleuthkit
+forensic|mactime|mactime|Build body-file filesystem timelines||timeline,sleuthkit
 forensic|mmls|mmls|Display disk partition layouts||disk,sleuthkit
 forensic|msoffcrypto-tool|msoffcrypto-tool|Decrypt password-protected Microsoft Office documents|msoffcrypto|office
 forensic|ngrep|ngrep|Search packet payloads with regular expressions||network,pcap
@@ -99,12 +101,14 @@ forensic|regfexport|regfexport|Export Windows Registry hive records||windows,reg
 forensic|regfinfo|regfinfo|Inspect Windows Registry hive metadata||windows,registry
 forensic|rtfobj|rtfobj|Extract embedded objects from RTF files||office,rtf
 forensic|scalpel|scalpel|High-performance file carving||carving
+forensic|sccainfo|sccainfo|Inspect Windows Prefetch files|libscca|windows,prefetch
 forensic|ssdeep|ssdeep|Context-triggered piecewise hashing||hash
 forensic|tesseract|tesseract|OCR engine with Korean language assets||ocr,korean
 forensic|testdisk|testdisk|Partition and filesystem recovery||recovery
 forensic|tcpdump|tcpdump|Noninteractive packet capture and inspection||network,pcap
 forensic|tshark|tshark|Noninteractive packet capture analysis||network,pcap
 forensic|unsquashfs|unsquashfs|Extract SquashFS firmware filesystems||firmware,filesystem
+forensic|usnjls|usnjls|Parse NTFS USN change journals from evidence images||windows,ntfs,usnjrnl
 forensic|vol|vol|Volatility 3 memory forensics CLI|volatility3|memory
 forensic|zeek|zeek|Network security monitoring and protocol analysis||network,pcap
 korean|ktext|ktext|Extract UTF-8 and UTF-16 strings containing Hangul||korean,text
@@ -138,7 +142,10 @@ orchestration|ctfwrap|ctfwrap|Run a bounded foreground command with artifacts||r
 orchestration|ghidra-decompile|ghidra-decompile|Run headless Ghidra and export C decompilation||rev,decompiler
 pwn|ROPgadget|ROPgadget|Search binaries for ROP gadgets|ropgadget|rop
 pwn|angr-python|angr-python|Python interpreter with angr installed||symbolic
-pwn|checksec|checksec|Inspect executable hardening properties||elf
+pwn|aarch64-linux-gnu-gcc|aarch64-linux-gnu-gcc|Cross-compile Linux AArch64 binaries||compiler,aarch64,cross
+pwn|arm-linux-gnueabihf-gcc|arm-linux-gnueabihf-gcc|Cross-compile Linux ARM hard-float binaries||compiler,arm,cross
+pwn|checksec|/usr/bin/checksec|Inspect executable hardening properties||elf
+pwn|dtc|dtc|Compile and decompile flattened device trees|device-tree-compiler|kernel,firmware,device-tree
 pwn|extract-vmlinux|extract-vmlinux|Extract vmlinux from compressed kernel images||kernel
 pwn|gdb|gdb|GNU debugger configured with pwndbg||debugger
 pwn|gdb-multiarch|gdb-multiarch|GNU debugger with multiple architectures||debugger
@@ -146,17 +153,27 @@ pwn|gdbserver|gdbserver|Remote GNU debugger server||debugger,remote
 pwn|libc-find|libc-find|Search the offline libc database||libc
 pwn|libc-identify|libc-identify|Identify libc from leaked symbols||libc
 pwn|ltrace|ltrace|Trace dynamic library calls without an interactive UI||trace
+pwn|mips-linux-gnu-gcc|mips-linux-gnu-gcc|Cross-compile Linux big-endian MIPS binaries||compiler,mips,cross
+pwn|mipsel-linux-gnu-gcc|mipsel-linux-gnu-gcc|Cross-compile Linux little-endian MIPS binaries||compiler,mips,cross
+pwn|modinfo|modinfo|Inspect Linux kernel module metadata||kernel,module
 pwn|objdump|objdump|Display and disassemble object files||elf,disassembler
 pwn|one_gadget|one_gadget|Find one-shot execve gadgets in libc||rop,libc
 pwn|pahole|pahole|Inspect DWARF types and kernel structure layouts||kernel,dwarf
 pwn|patchelf|patchelf|Modify ELF interpreter and dynamic dependencies||elf
 pwn|pwn|pwn|Pwntools command-line utilities||pwntools
 pwn|pwninit|pwninit|Prepare pwn challenges with matching libc and loader||elf,libc
+pwn|qemu-aarch64-static|qemu-aarch64-static|Execute AArch64 Linux user-mode binaries under TCG||emulator,aarch64,cross
+pwn|qemu-mips-static|qemu-mips-static|Execute big-endian MIPS Linux user-mode binaries under TCG||emulator,mips,cross
+pwn|qemu-mipsel-static|qemu-mipsel-static|Execute little-endian MIPS Linux user-mode binaries under TCG||emulator,mips,cross
+pwn|qemu-riscv64-static|qemu-riscv64-static|Execute RISC-V 64 Linux user-mode binaries under TCG||emulator,riscv,cross
 pwn|qemu-system-aarch64|qemu-system-aarch64|Emulate complete AArch64 systems||kernel,emulator
 pwn|qemu-system-arm|qemu-system-arm|Emulate complete 32-bit ARM systems||kernel,emulator
+pwn|qemu-system-avr|qemu-system-avr|Emulate complete AVR systems under TCG||firmware,avr,emulator
 pwn|qemu-system-mips|qemu-system-mips|Emulate complete MIPS systems||kernel,emulator
+pwn|qemu-system-riscv64|qemu-system-riscv64|Emulate complete RISC-V 64 systems under TCG||kernel,riscv,emulator
 pwn|qemu-system-x86_64|qemu-system-x86_64|Emulate complete x86-64 systems||kernel,emulator
 pwn|readelf|readelf|Display ELF metadata||elf
+pwn|riscv64-linux-gnu-gcc|riscv64-linux-gnu-gcc|Cross-compile Linux RISC-V 64 binaries||compiler,riscv,cross
 pwn|ropr|ropr|Fast ROP gadget search for large binaries||rop
 pwn|ropper|ropper|Search and filter ROP gadgets||rop
 pwn|seccomp-tools|seccomp-tools|Inspect and assemble seccomp BPF filters||seccomp
@@ -165,6 +182,9 @@ pwn|strace|strace|Trace system calls without an interactive UI||trace
 pwn|valgrind|valgrind|Dynamic memory and execution analysis||debugger,memory
 pwn|vmlinux-to-elf|vmlinux-to-elf|Recover ELF files from raw vmlinux images||kernel
 rev|GoReSym|GoReSym|Recover symbols from stripped Go binaries|goresym|go,symbols
+rev|avr-gcc|avr-gcc|Compile classic AVR firmware|gcc-avr|avr,compiler,firmware
+rev|avr-gdb|avr-gdb|Batch-debug AVR firmware|gdb-avr|avr,debugger,firmware
+rev|avr-objdump|avr-objdump|Inspect and disassemble AVR objects|binutils-avr|avr,disassembler,firmware
 rev|apktool|apktool|Decode and rebuild Android APK resources||android
 rev|capa|capa|Identify executable capabilities from code patterns||malware
 rev|cfr|cfr|Decompile Java class and JAR files||java,decompiler
@@ -175,6 +195,7 @@ rev|ghidra-decompile|ghidra-decompile|Headless Ghidra decompiler wrapper|ghidra|
 rev|ilspycmd|ilspycmd|Command-line .NET decompiler||dotnet,decompiler
 rev|jadx|jadx|Command-line Android DEX and APK decompiler||android,decompiler
 rev|mono|mono|Execute managed .NET Framework assemblies||dotnet,runtime
+rev|node|node|Execute JavaScript with the packaged Node.js runtime|nodejs|javascript,runtime
 rev|objection|objection|Runtime mobile exploration toolkit||dynamic
 rev|pydisasm|pydisasm|Disassemble versioned Python bytecode|xdis|python,disassembler
 rev|pycdas|pycdas|Disassemble Python bytecode||python
@@ -184,6 +205,7 @@ rev|r2|r2|Radare2 reverse-engineering CLI|radare2|disassembler
 rev|rabin2|rabin2|Inspect binary metadata with Radare2||binary
 rev|radiff2|radiff2|Compare binary files with Radare2||binary,diff
 rev|rustfilt|rustfilt|Demangle Rust symbols||rust,symbols
+rev|simavr|simavr|Headless classic AVR firmware simulator||avr,emulator,firmware
 rev|strings|strings|Extract printable strings from binary files||strings
 rev|uncompyle6|uncompyle6|Decompile supported legacy Python bytecode||python,decompiler
 rev|upx|upx|Pack and unpack executable files||packer
@@ -214,11 +236,13 @@ web|jwt_tool|jwt_tool|Inspect and test JSON Web Tokens||jwt
 web|masscan|masscan|High-speed TCP port scanner||network
 web|mitmdump|mitmdump|Noninteractive mitmproxy entrypoint||proxy
 web|nmap|nmap|Network discovery and service scanner||network
+web|node|node|Execute JavaScript with the packaged Node.js runtime|nodejs|javascript,runtime
 web|nuclei-run|nuclei-run|Offline-safe nuclei wrapper with bundled templates|nuclei|scanner
 web|php|php|PHP CLI with curl XML mbstring and GD extensions||php,runtime
 web|playwright|playwright|Install and inspect the bundled headless Chromium runtime||browser
 web|phpggc|phpggc|PHP unserialize gadget-chain generator||deserialization
 web|pw-python|pw-python|Python interpreter with Playwright and bundled Chromium||browser,automation
+web|ctf-sqlite-readonly|ctf-sqlite-readonly|Bounded immutable query-only SQLite artifact reader|sqlite,sqlite3|sql,database,offline,readonly
 web|web-python|web-python|Python runtime with BeautifulSoup lxml HTTP/2 and WebSockets|bs4,h2,h2spacex,websockets|parser,http2,websocket
 web|ysoserial|ysoserial|Java deserialization payload generator||deserialization
 CATALOG
@@ -348,6 +372,30 @@ failed = read_failed_lines(failed_path)
 
 json.dump(
     {
+        "category_aliases": {
+            "binary": "pwn",
+            "binary exploitation": "pwn",
+            "binary-exploitation": "pwn",
+            "cryptography": "crypto",
+            "dfir": "forensic",
+            "digital forensics": "forensic",
+            "digital-forensics": "forensic",
+            "forensics": "forensic",
+            "miscellaneous": "misc",
+            "pwnable": "pwn",
+            "reverse engineering": "rev",
+            "reverse-engineering": "rev",
+            "reversing": "rev",
+            "steganography": "misc",
+            "stego": "misc",
+            "system hacking": "pwn",
+            "system-hacking": "pwn",
+            "web hacking": "web",
+            "web security": "web",
+            "web-hacking": "web",
+            "web-security": "web",
+        },
+        "shared_categories": ["system", "orchestration", "korean"],
         "schema_version": 1,
         "tools": tools,
         "failed": failed,

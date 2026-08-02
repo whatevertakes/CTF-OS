@@ -281,7 +281,25 @@ def _probe_file(
 
 def _classify(path: str, prefix: bytes) -> tuple[str, str, str]:
     lowered = path.casefold()
+    basename = lowered.rsplit("/", 1)[-1]
     suffix = lowered.rsplit(".", 1)[-1] if "." in lowered else ""
+    if prefix.startswith(b"SQLite format 3\x00"):
+        if basename == "history":
+            return "browser_history", "chromium-history-sqlite", "magic+name"
+        if basename == "places.sqlite":
+            return "browser_history", "firefox-places-sqlite", "magic+name"
+    if len(prefix) >= 8 and prefix[4:8] == b"SCCA":
+        return "execution_artifact", "windows-prefetch", "magic"
+    if prefix.startswith(b"MAM\x04"):
+        return "execution_artifact", "windows-prefetch-compressed", "magic"
+    if basename in {"$j", "$usnjrnl"} or basename.endswith("$usnjrnl:$j"):
+        return "filesystem_artifact", "windows-usn-journal", "name"
+    if basename == "$mft":
+        return "filesystem_artifact", "windows-mft", "name"
+    if basename == "consolehost_history.txt":
+        return "shell_history", "powershell-history", "name"
+    if basename == ".bash_history":
+        return "shell_history", "bash-history", "name"
     magic_rules = (
         (b"\x0a\x0d\x0d\x0a", "network", "pcapng"),
         (b"\xd4\xc3\xb2\xa1", "network", "pcap"),
@@ -290,6 +308,7 @@ def _classify(path: str, prefix: bytes) -> tuple[str, str, str]:
         (b"\xa1\xb2\x3c\x4d", "network", "pcap-nanosecond"),
         (b"ElfFile\x00", "event_log", "windows-evtx"),
         (b"regf", "registry", "windows-registry-hive"),
+        (b"EVF\x09\x0d\x0a\xff\x00", "disk", "ewf-e01"),
         (b"%PDF-", "document", "pdf"),
         (b"PK\x03\x04", "archive", "zip"),
         (b"\x1f\x8b", "archive", "gzip"),
@@ -317,6 +336,7 @@ def _classify(path: str, prefix: bytes) -> tuple[str, str, str]:
         "pcapng": ("network", "pcapng"),
         "dd": ("disk", "raw-disk-image"),
         "e01": ("disk", "ewf-e01"),
+        "ex01": ("disk", "ewf-ex01"),
         "img": ("disk", "disk-image"),
         "qcow2": ("disk", "qcow2"),
         "vhd": ("disk", "vhd"),
@@ -325,8 +345,11 @@ def _classify(path: str, prefix: bytes) -> tuple[str, str, str]:
         "dmp": ("memory", "memory-dump"),
         "lime": ("memory", "lime-memory"),
         "mem": ("memory", "memory-dump"),
+        "vmem": ("memory", "vmware-memory"),
+        "vmsn": ("memory", "vmware-snapshot"),
         "raw": ("memory", "raw-memory-or-disk"),
         "evtx": ("event_log", "windows-evtx"),
+        "pf": ("execution_artifact", "windows-prefetch"),
         "eml": ("mail", "rfc822-message"),
         "mbox": ("mail", "mbox"),
         "pst": ("mail", "outlook-pst"),

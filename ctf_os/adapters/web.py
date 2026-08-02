@@ -61,6 +61,8 @@ class WebAdapter(GenericAdapter):
             "work, run /opt/ctf-templates/web/request.py or ctf-browser with "
             "--session attacker|user|admin so both tools share isolated cookie "
             "jars and one redacted timeline. "
+            "Inspect local SQLite artifacts with ctf-sqlite-readonly; exercise "
+            "remote SQL behavior only through the allowlisted HTTP helpers. "
             "Never copy cookie or token values into prompts. Remote requests "
             "require an explicit target allowlist and shared host rate limit."
         )

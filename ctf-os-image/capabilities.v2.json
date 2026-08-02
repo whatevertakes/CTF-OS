@@ -137,7 +137,7 @@
       "attestation_schema_version": 1,
       "contract_id": "ctfos.forensic.evidence_index",
       "contract_version": 1,
-      "sha256": "a2d84dc83fb041413b667b1164bbe3f93c7ab1b7db5485d9156f1b51f92eddf2"
+      "sha256": "b2837ae5942f25afd88505ecc65a75947711bacecc0d8a4c659db156701d214b"
     },
     {
       "name": "forensic_assertion_python3",

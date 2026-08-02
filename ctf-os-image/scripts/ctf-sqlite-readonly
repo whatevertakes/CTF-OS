@@ -1,64 +1,386 @@
 #!/usr/bin/env python3
-"""Bounded, query-only SQLite reader for challenge data."""
+"""Bounded, offline, query-only SQLite reader for challenge data."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import math
+import os
 import sqlite3
+import stat
+import sys
+import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 
+MAX_DATABASE_BYTES = 16 * 1024 * 1024 * 1024
+MAX_QUERY_BYTES = 64 * 1024
+MAX_CELL_BYTES = 64 * 1024
+MAX_ROW_JSON_BYTES = 1024 * 1024
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+DEFAULT_TIMEOUT_SECONDS = 10.0
+MAX_TIMEOUT_SECONDS = 30.0
+
+
+class ReaderError(RuntimeError):
+    """A stable, operator-facing failure without SQL or database contents."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _InvalidText(bytes):
+    """SQLite TEXT bytes which are not valid UTF-8."""
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ctf-sqlite-readonly")
+    parser = argparse.ArgumentParser(
+        prog="ctf-sqlite-readonly",
+        description=(
+            "Run one bounded read-only query against an offline SQLite artifact."
+        ),
+    )
     parser.add_argument("database", nargs="?")
     parser.add_argument("query", nargs="?")
+    parser.add_argument(
+        "--schema",
+        action="store_true",
+        help="list sqlite_schema without accepting a query",
+    )
     parser.add_argument("--max-rows", type=int, default=100)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+    )
     parser.add_argument("--self-test", action="store_true")
     return parser
 
 
-def main() -> int:
-    arguments = _parser().parse_args()
-    if arguments.self_test:
-        connection = sqlite3.connect(":memory:")
-        connection.execute("PRAGMA query_only=ON")
-        assert connection.execute("SELECT 1").fetchone() == (1,)
-        connection.close()
-        return 0
-    if not arguments.database or not arguments.query:
-        raise SystemExit("database and query are required")
+def _error(code: str, message: str) -> int:
+    json.dump(
+        {"error": code, "message": message, "ok": False},
+        sys.stdout,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    sys.stdout.write("\n")
+    return 1
+
+
+def _validate_arguments(arguments: argparse.Namespace) -> None:
+    if not arguments.database:
+        raise ReaderError("usage", "database is required")
+    if arguments.schema and arguments.query:
+        raise ReaderError("usage", "--schema and QUERY are mutually exclusive")
+    if not arguments.schema and not arguments.query:
+        raise ReaderError("usage", "QUERY or --schema is required")
     if not 1 <= arguments.max_rows <= 1000:
-        raise SystemExit("--max-rows must be between 1 and 1000")
-    database = Path(arguments.database).resolve(strict=True)
-    if not database.is_file():
-        raise SystemExit("database must be a regular file")
-    uri = f"file:{quote(str(database))}?mode=ro&immutable=1"
-    connection = sqlite3.connect(uri, uri=True)
+        raise ReaderError("usage", "--max-rows must be between 1 and 1000")
+    if not 0.05 <= arguments.timeout <= MAX_TIMEOUT_SECONDS:
+        raise ReaderError(
+            "usage",
+            f"--timeout must be between 0.05 and {MAX_TIMEOUT_SECONDS:g} seconds",
+        )
+    if arguments.query is not None:
+        try:
+            query_size = len(arguments.query.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ReaderError("invalid_query", "query must be valid UTF-8") from exc
+        if query_size > MAX_QUERY_BYTES:
+            raise ReaderError(
+                "query_too_large",
+                f"query exceeds the {MAX_QUERY_BYTES} byte limit",
+            )
+
+
+def _open_regular_database(path: str) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise ReaderError("invalid_database", "database does not exist") from exc
+    except OSError as exc:
+        raise ReaderError(
+            "invalid_database",
+            "database must be a readable regular file and not a symlink",
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReaderError("invalid_database", "database must be a regular file")
+        if metadata.st_size > MAX_DATABASE_BYTES:
+            raise ReaderError(
+                "database_too_large",
+                f"database exceeds the {MAX_DATABASE_BYTES} byte limit",
+            )
+        return descriptor, metadata
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _readonly_authorizer(
+    action: int,
+    argument_one: str | None,
+    argument_two: str | None,
+    database_name: str | None,
+    trigger_name: str | None,
+) -> int:
+    del argument_one, database_name, trigger_name
+    denied_names = (
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DELETE",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_DROP_VTABLE",
+        "SQLITE_INSERT",
+        "SQLITE_PRAGMA",
+        "SQLITE_REINDEX",
+        "SQLITE_SAVEPOINT",
+        "SQLITE_TRANSACTION",
+        "SQLITE_UPDATE",
+    )
+    denied = {
+        value
+        for name in denied_names
+        if isinstance((value := getattr(sqlite3, name, None)), int)
+    }
+    if action in denied:
+        return sqlite3.SQLITE_DENY
+    if (
+        action == getattr(sqlite3, "SQLITE_FUNCTION", -1)
+        and (argument_two or "").casefold() == "load_extension"
+    ):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+def _text_factory(value: bytes) -> str | _InvalidText:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return _InvalidText(value)
+
+
+def _bounded_bytes(value: bytes, *, kind: str) -> dict[str, Any]:
+    original_bytes = len(value)
+    bounded = value[:MAX_CELL_BYTES]
+    return {
+        "base64": base64.b64encode(bounded).decode("ascii"),
+        "original_bytes": original_bytes,
+        "truncated": original_bytes > len(bounded),
+        "type": kind,
+    }
+
+
+def _bounded_text(value: str) -> str | dict[str, Any]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= MAX_CELL_BYTES:
+        return value
+    bounded = encoded[:MAX_CELL_BYTES]
+    while bounded:
+        try:
+            decoded = bounded.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            bounded = bounded[: exc.start]
+    else:
+        decoded = ""
+    return {
+        "original_bytes": len(encoded),
+        "truncated": True,
+        "type": "text",
+        "value": decoded,
+    }
+
+
+def _json_value(value: object) -> object:
+    if isinstance(value, _InvalidText):
+        return _bounded_bytes(bytes(value), kind="invalid_utf8_text")
+    if isinstance(value, bytes):
+        return _bounded_bytes(value, kind="blob")
+    if isinstance(value, str):
+        return _bounded_text(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            label = "nan"
+        elif value > 0:
+            label = "+infinity"
+        else:
+            label = "-infinity"
+        return {"type": "non_finite_float", "value": label}
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return {"type": "unsupported", "value": type(value).__name__}
+
+
+def _query_payload(
+    connection: sqlite3.Connection,
+    query: str,
+    *,
+    max_rows: int,
+) -> dict[str, Any]:
+    cursor = connection.execute(query)
+    columns = [str(item[0])[:4096] for item in cursor.description or ()]
+    rows: list[list[object]] = []
+    encoded_rows_bytes = 0
+    truncated = False
+    truncation_reason: str | None = None
+
+    for _ in range(max_rows + 1):
+        row = cursor.fetchone()
+        if row is None:
+            break
+        if len(rows) >= max_rows:
+            truncated = True
+            truncation_reason = "row_limit"
+            break
+        normalized = [_json_value(value) for value in row]
+        encoded_row = json.dumps(
+            normalized,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_row) > MAX_ROW_JSON_BYTES:
+            truncated = True
+            truncation_reason = "row_size_limit"
+            break
+        if encoded_rows_bytes + len(encoded_row) > MAX_OUTPUT_BYTES - 16 * 1024:
+            truncated = True
+            truncation_reason = "output_limit"
+            break
+        rows.append(normalized)
+        encoded_rows_bytes += len(encoded_row)
+
+    payload: dict[str, Any] = {
+        "columns": columns,
+        "ok": True,
+        "row_count": len(rows),
+        "rows": rows,
+        "truncated": truncated,
+    }
+    if truncation_reason is not None:
+        payload["truncation_reason"] = truncation_reason
+    return payload
+
+
+def _run_query(arguments: argparse.Namespace) -> dict[str, Any]:
+    descriptor, _metadata = _open_regular_database(arguments.database)
+    connection: sqlite3.Connection | None = None
+    try:
+        descriptor_path = f"/proc/self/fd/{descriptor}"
+        uri = f"file:{quote(descriptor_path, safe='/')}?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.0)
+        connection.text_factory = _text_factory
+        connection.execute("PRAGMA query_only=ON")
+        connection.enable_load_extension(False)
+        if hasattr(connection, "setlimit"):
+            connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, MAX_QUERY_BYTES)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, 256)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_COMPOUND_SELECT, 64)
+        deadline = time.monotonic() + arguments.timeout
+        connection.set_progress_handler(
+            lambda: 1 if time.monotonic() >= deadline else 0,
+            1000,
+        )
+        connection.set_authorizer(_readonly_authorizer)
+        query = (
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+            if arguments.schema
+            else arguments.query
+        )
+        assert isinstance(query, str)
+        return _query_payload(connection, query, max_rows=arguments.max_rows)
+    except sqlite3.DatabaseError as exc:
+        message = str(exc).casefold()
+        if "not authorized" in message or "authorization denied" in message:
+            raise ReaderError(
+                "query_denied", "query violates the read-only policy"
+            ) from exc
+        if "interrupted" in message:
+            raise ReaderError("query_timeout", "query exceeded its deadline") from exc
+        raise ReaderError("query_failed", "database query failed") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(descriptor)
+
+
+def _self_test() -> None:
+    connection = sqlite3.connect(":memory:")
     try:
         connection.execute("PRAGMA query_only=ON")
-        cursor = connection.execute(arguments.query)
-        columns = [item[0] for item in cursor.description or ()]
-        rows = cursor.fetchmany(arguments.max_rows + 1)
-        truncated = len(rows) > arguments.max_rows
-        rows = rows[: arguments.max_rows]
-        print(
-            json.dumps(
-                {
-                    "columns": columns,
-                    "rows": rows,
-                    "row_count": len(rows),
-                    "truncated": truncated,
-                },
-                ensure_ascii=True,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-        )
+        connection.set_authorizer(_readonly_authorizer)
+        if connection.execute("SELECT 1").fetchone() != (1,):
+            raise ReaderError("self_test_failed", "read-only SELECT failed")
+        try:
+            connection.execute("ATTACH DATABASE '/tmp/ctfos-denied' AS denied")
+        except sqlite3.DatabaseError:
+            pass
+        else:
+            raise ReaderError("self_test_failed", "ATTACH was not denied")
     finally:
         connection.close()
-    return 0
+
+
+def main() -> int:
+    parser = _parser()
+    if len(sys.argv) == 1:
+        parser.print_usage(sys.stderr)
+        return 2
+    arguments = parser.parse_args()
+    try:
+        if arguments.self_test:
+            if arguments.database or arguments.query or arguments.schema:
+                raise ReaderError("usage", "--self-test accepts no database or query")
+            _self_test()
+            return 0
+        _validate_arguments(arguments)
+        payload = _run_query(arguments)
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise ReaderError("output_limit", "encoded result exceeds the output limit")
+        sys.stdout.buffer.write(encoded + b"\n")
+        return 0
+    except ReaderError as exc:
+        return _error(exc.code, str(exc))
+    except (OSError, ValueError):
+        return _error("reader_failed", "SQLite reader failed safely")
 
 
 if __name__ == "__main__":

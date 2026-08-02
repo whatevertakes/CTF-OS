@@ -909,6 +909,25 @@ ctfos tool run \
   -- curl -i https://challenge.example/
 ```
 
+도구 선택은 취약점 키워드별 자동 매핑이 아니라 exact image가 생성한 manifest를
+조회한다. sandbox 안의 `ctf-tools toolbox CATEGORY`는 해당 카테고리와 공용
+system/orchestration/한글 도구를 보여 줄 뿐, 문제를 전환하거나 도구를 자동
+실행하지 않는다. 대회에서 쓰는 `System Hacking`, `Digital Forensics`,
+`Web Hacking`, `Reversing` 같은 표기도 canonical 카테고리로 해석한다.
+
+```sh
+ctfos tool run \
+  --contest 'Demo CTF' --category forensic --challenge 'Disk' \
+  --expected '현재 exact image의 forensic toolbox 목록' \
+  --keep-if '필요한 parser가 available=true다' \
+  --drop-if 'manifest failed가 비어 있지 않다' \
+  -- ctf-tools --json toolbox digital-forensics
+```
+
+manifest의 executable 존재 여부와 managed capability의 기능 attestation은 서로
+다른 계약이다. 전자는 “바로 찾을 수 있음”, 후자는 `ctfos doctor`가 실제 bounded
+probe와 exact image pin으로 확인한 “핵심 경로가 동작함”을 뜻한다.
+
 서로 독립적인 로컬 분석은 운영자가 standalone CLI에서 `--read-only`를
 명시했을 때만 동시에 실행할 수 있습니다. 여기서 read-only는 명령 자체가
 파일을 쓰지 않는다는 뜻이 아니라 **canonical challenge workspace를 직접

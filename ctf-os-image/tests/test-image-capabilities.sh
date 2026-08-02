@@ -61,12 +61,17 @@ jq -e '
 ' "${test_root}/managed-capabilities.json" >/dev/null
 
 required_tools=(
-    bkcrack cryptominisat5 crypto-python ctf-browser ctf-egress-proxy
+    aarch64-linux-gnu-gcc avr-gcc avr-gdb avr-objdump bkcrack
+    cryptominisat5 crypto-python ctf-browser ctf-egress-proxy
     ctf-network-smoke ctf-web-probe
-    evtxexport ewfinfo ewfverify fls frida-trace hash_extender
+    ctf-sqlite-readonly evtxexport ewfinfo ewfverify fls frida-trace
+    hash_extender mactime mips-linux-gnu-gcc mipsel-linux-gnu-gcc
     msoffcrypto-tool pahole pdfimages playwright pw-python qemu-img
-    qemu-system-aarch64 rabin2 ropr sage-python uncompyle6 unsquashfs
-    wasm2wat web-python wine wine64
+    qemu-aarch64-static qemu-mips-static qemu-mipsel-static
+    qemu-riscv64-static qemu-system-aarch64 qemu-system-avr
+    qemu-system-riscv64 rabin2 riscv64-linux-gnu-gcc ropr sage-python
+    sccainfo simavr uncompyle6 unsquashfs usnjls wasm2wat web-python
+    wine wine64
 )
 for tool in "${required_tools[@]}"; do
     jq -e --arg tool "${tool}" \
@@ -79,6 +84,54 @@ for removed in sqlmap sqlite3 mysql psql; do
     ! command -v -- "${removed}" >/dev/null 2>&1
 done
 [[ ! -e /opt/venvs/sqlmap ]]
+
+ctf-sqlite-readonly --self-test
+ctf-tools --json toolbox digital-forensics >"${test_root}/forensic-toolbox.json"
+jq -e '
+    .command == "toolbox"
+    and .category == "forensic"
+    and (.categories == ["forensic", "system", "orchestration", "korean"])
+    and any(.tools[]; .name == "ctf-sqlite-readonly")
+    and any(.tools[]; .name == "sccainfo")
+    and any(.tools[]; .name == "ktext")
+    and all(.tools[]; .category != "web" and .category != "pwn")
+' "${test_root}/forensic-toolbox.json" >/dev/null
+ctf-tools --json --search sqlite3 >"${test_root}/sqlite-search.json"
+jq -e '
+    .count == 2
+    and all(.tools[]; .name == "ctf-sqlite-readonly" and .available == true)
+' "${test_root}/sqlite-search.json" >/dev/null
+ctf-tools --json --info checksec \
+    | jq -e '.found == true and .tool.path == "/usr/bin/checksec"' >/dev/null
+
+python3 - "${test_root}/artifact.sqlite" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, value TEXT)")
+connection.execute("INSERT INTO events(value) VALUES('ready')")
+connection.commit()
+connection.close()
+PY
+sqlite_before=$(sha256sum "${test_root}/artifact.sqlite")
+ctf-sqlite-readonly "${test_root}/artifact.sqlite" \
+    'SELECT id,value FROM events' >"${test_root}/sqlite-result.json"
+jq -e '
+    .ok == true and .columns == ["id", "value"]
+    and .rows == [[1, "ready"]] and .truncated == false
+' "${test_root}/sqlite-result.json" >/dev/null
+[[ "$(sha256sum "${test_root}/artifact.sqlite")" == "${sqlite_before}" ]]
+set +e
+ctf-sqlite-readonly "${test_root}/artifact.sqlite" \
+    "ATTACH DATABASE '${test_root}/forbidden.sqlite' AS forbidden" \
+    >"${test_root}/sqlite-denied.json"
+sqlite_denied_status=$?
+set -e
+[[ "${sqlite_denied_status}" -eq 1 ]]
+jq -e '.ok == false and .error == "query_denied"' \
+    "${test_root}/sqlite-denied.json" >/dev/null
+[[ ! -e "${test_root}/forbidden.sqlite" ]]
 
 python - <<'PY'
 import importlib.metadata
@@ -335,14 +388,143 @@ wasm2wat "${test_root}/answer.wasm" | grep -F 'i32.const 42' >/dev/null
 wasm-opt "${test_root}/answer.wasm" -O -o "${test_root}/answer-opt.wasm"
 [[ -s "${test_root}/answer-opt.wasm" ]]
 
+cat >"${test_root}/native-oracle.c" <<'C'
+#include <stdio.h>
+#include <string.h>
+
+static const char accepted[] = "OPEN-SESAME";
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], accepted) == 0) {
+        puts("REV_OK_93D1");
+        return 0;
+    }
+    puts("REV_NO");
+    return 7;
+}
+C
+gcc -O0 -fno-pie -no-pie -fno-stack-protector -Wl,-z,noexecstack \
+    "${test_root}/native-oracle.c" -o "${test_root}/native-oracle"
+"${test_root}/native-oracle" OPEN-SESAME \
+    | grep -Fx 'REV_OK_93D1' >/dev/null
+set +e
+"${test_root}/native-oracle" WRONG >"${test_root}/native-control.txt"
+native_control_status=$?
+set -e
+[[ "${native_control_status}" -eq 7 ]]
+grep -Fx 'REV_NO' "${test_root}/native-control.txt" >/dev/null
+/usr/bin/checksec --file="${test_root}/native-oracle" \
+    >"${test_root}/checksec.txt"
+grep -F 'NX enabled' "${test_root}/checksec.txt" >/dev/null
+grep -F 'No PIE' "${test_root}/checksec.txt" >/dev/null
+ROPgadget --binary "${test_root}/native-oracle" --only 'ret' \
+    >"${test_root}/ropgadget.txt"
+grep -F 'Unique gadgets found:' "${test_root}/ropgadget.txt" >/dev/null
+rabin2 -j -I "${test_root}/native-oracle" >"${test_root}/rabin2.json"
+jq -e '
+    .info.bintype == "elf" and .info.arch == "x86" and .info.bits == 64
+    and .info.nx == true and .info.pic == false
+' "${test_root}/rabin2.json" >/dev/null
+r2 -q -2 -c 'aaa;afl~main;q' "${test_root}/native-oracle" \
+    | grep -F 'main' >/dev/null
+strings "${test_root}/native-oracle" | grep -Fx 'OPEN-SESAME' >/dev/null
+strings "${test_root}/native-oracle" | grep -Fx 'REV_OK_93D1' >/dev/null
+/opt/venvs/main/bin/python - "${test_root}/native-oracle" <<'PY'
+import sys
+from pwn import ELF
+
+binary = ELF(sys.argv[1], checksec=False)
+assert binary.bits == 64
+assert binary.pie is False
+assert binary.nx is True
+assert binary.symbols["main"] > 0
+PY
+
+cat >"${test_root}/cross-ready.c" <<'C'
+#include <stdio.h>
+int main(void) {
+    puts("CTFOS_CROSS_READY");
+    return 0;
+}
+C
+while read -r compiler emulator label; do
+    output="${test_root}/cross-${label}"
+    "${compiler}" -static -O2 "${test_root}/cross-ready.c" -o "${output}"
+    "${emulator}" "${output}" | grep -Fx 'CTFOS_CROSS_READY' >/dev/null
+done <<'CROSS'
+aarch64-linux-gnu-gcc qemu-aarch64-static aarch64
+mips-linux-gnu-gcc qemu-mips-static mips
+mipsel-linux-gnu-gcc qemu-mipsel-static mipsel
+riscv64-linux-gnu-gcc qemu-riscv64-static riscv64
+CROSS
+
+cat >"${test_root}/avr-ready.c" <<'C'
+#include <avr/io.h>
+
+volatile uint8_t ctfos_marker;
+
+int main(void) {
+    ctfos_marker = 0x5a;
+    __asm__ __volatile__("break");
+    for (;;) {}
+}
+C
+avr-gcc -mmcu=atmega328p -Os "${test_root}/avr-ready.c" \
+    -o "${test_root}/avr-ready.elf"
+avr-objdump -d "${test_root}/avr-ready.elf" >"${test_root}/avr-ready.asm"
+grep -F '<main>:' "${test_root}/avr-ready.asm" >/dev/null
+grep -F 'break' "${test_root}/avr-ready.asm" >/dev/null
+avr-gdb -q -batch "${test_root}/avr-ready.elf" \
+    -ex 'info address main' >"${test_root}/avr-gdb.txt"
+grep -F 'Symbol "main" is' "${test_root}/avr-gdb.txt" >/dev/null
+set +e
+timeout --signal=TERM --kill-after=1s 3s \
+    simavr -m atmega328p -f 16000000 "${test_root}/avr-ready.elf" \
+    >"${test_root}/simavr.txt" 2>&1
+simavr_status=$?
+set -e
+[[ "${simavr_status}" -eq 0 || "${simavr_status}" -eq 124 ]]
+! grep -Eiq 'unknown mcu|could not.*(read|load)|invalid.*elf' \
+    "${test_root}/simavr.txt"
+
 wine --version | grep -F 'wine-9.0' >/dev/null
 wine64 --version | grep -F 'wine-9.0' >/dev/null
 mono --version | grep -F 'Mono JIT compiler version' >/dev/null
 ropr --version | grep -F 'ropr 0.2.27' >/dev/null
 bkcrack --version | grep -F '1.8.1' >/dev/null
 qemu-system-aarch64 --version | grep -F 'QEMU emulator version' >/dev/null
+qemu-system-arm --version | grep -F 'QEMU emulator version' >/dev/null
+qemu-system-avr --version | grep -F 'QEMU emulator version' >/dev/null
 qemu-system-mips --version | grep -F 'QEMU emulator version' >/dev/null
+qemu-system-riscv64 --version | grep -F 'QEMU emulator version' >/dev/null
 qemu-system-x86_64 --version | grep -F 'QEMU emulator version' >/dev/null
+qemu-system-avr -machine help | grep -F 'Arduino' >/dev/null
+qemu-system-riscv64 -machine help | grep -F 'virt' >/dev/null
+
+cat >"${test_root}/boot-exit.S" <<'ASM'
+.code16
+.global _start
+_start:
+    movb $0x10, %al
+    outb %al, $0xf4
+    hlt
+.org 510
+.word 0xaa55
+ASM
+as --32 "${test_root}/boot-exit.S" -o "${test_root}/boot-exit.o"
+ld -m elf_i386 --oformat binary -Ttext 0x7c00 \
+    "${test_root}/boot-exit.o" -o "${test_root}/boot-exit.bin"
+[[ "$(stat -c %s "${test_root}/boot-exit.bin")" -eq 512 ]]
+set +e
+/opt/ctf-templates/pwn/qemu-headless.sh --timeout 10 \
+    qemu-system-x86_64 \
+    -machine pc \
+    -drive "file=${test_root}/boot-exit.bin,format=raw,if=floppy" \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    >"${test_root}/qemu-boot.txt" 2>&1
+qemu_boot_status=$?
+set -e
+[[ "${qemu_boot_status}" -eq 33 ]]
 
 assert_noarg_exit_2() {
     local tool=$1
@@ -357,7 +539,8 @@ assert_noarg_exit_2() {
 
 for tool in \
     crypto-python ctf-browser ctf-egress-proxy ctf-network-smoke \
-    ctf-web-probe pw-python qemu-system-mips qemu-system-x86_64 \
+    ctf-web-probe pw-python qemu-system-aarch64 qemu-system-arm \
+    qemu-system-avr qemu-system-mips qemu-system-riscv64 qemu-system-x86_64 \
     sage-python web-python wine wine64
 do
     assert_noarg_exit_2 "${tool}"
@@ -409,5 +592,5 @@ assert not timeouts, timeouts
 assert not crashes, crashes
 PY
 
-printf '{"manifest_tools":%s,"browser_title":"CTF Browser Ready","sql_tools":0}\n' \
+printf '{"manifest_tools":%s,"browser_title":"CTF Browser Ready","interactive_sql_clients":0,"sqlite_readonly":1}\n' \
     "$(jq '.tools | length' /tools/manifest.json)"

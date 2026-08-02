@@ -93,14 +93,27 @@ REQUIRED_MANAGED_CAPABILITIES = frozenset(
 )
 _CATEGORY_ALIASES = {
     "binary": "pwn",
+    "binary exploitation": "pwn",
     "binary-exploitation": "pwn",
+    "pwnable": "pwn",
+    "system hacking": "pwn",
+    "system-hacking": "pwn",
     "re": "rev",
     "reversing": "rev",
     "reverse": "rev",
+    "reverse engineering": "rev",
+    "reverse-engineering": "rev",
     "cryptography": "crypto",
     "forensics": "forensic",
     "dfir": "forensic",
+    "digital forensics": "forensic",
+    "digital-forensics": "forensic",
+    "web hacking": "web",
+    "web-hacking": "web",
+    "web security": "web",
     "web-security": "web",
+    "miscellaneous": "misc",
+    "steganography": "misc",
     "stego": "misc",
     "jail": "misc",
     "ppc": "misc",
@@ -203,8 +216,8 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "contract_version": 1,
         "path": "/opt/ctf-templates/forensic/evidence_index.py",
         "sha256": (
-            "a2d84dc83fb041413b667b1164bbe3f9"
-            "3c7ab1b7db5485d9156f1b51f92eddf2"
+            "b2837ae5942f25afd88505ecc65a75947"
+            "711bacecc0d8a4c659db156701d214b"
         ),
     },
 }

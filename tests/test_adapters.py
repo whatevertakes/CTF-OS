@@ -23,6 +23,25 @@ class AdapterTests(unittest.TestCase):
                     adapter.proof_policy().clean_repetitions, 1
                 )
 
+    def test_competition_category_labels_resolve_without_changing_state_names(self) -> None:
+        aliases = {
+            "System Hacking": "pwn",
+            "system-hacking": "pwn",
+            "binary exploitation": "pwn",
+            "Reverse Engineering": "reversing",
+            "reverse-engineering": "reversing",
+            "Cryptography": "crypto",
+            "Digital Forensics": "forensics",
+            "digital-forensics": "forensics",
+            "Web Hacking": "web",
+            "web security": "web",
+            "Miscellaneous": "misc",
+            "Steganography": "misc",
+        }
+        for label, expected in aliases.items():
+            with self.subTest(label=label):
+                self.assertEqual(get_adapter(label).name, expected)
+
     def test_pwn_markers_are_capabilities_not_a_required_ladder(self) -> None:
         adapter = get_adapter("pwn")
         keys = {marker.key for marker in adapter.progress_markers()}
@@ -103,6 +122,8 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("auth_state_captured", marker_keys)
         self.assertIn("impact_verified", marker_keys)
         self.assertIn("--session attacker|user|admin", adapter.captain_guidance())
+        self.assertIn("ctf-sqlite-readonly", adapter.captain_guidance())
+        self.assertIn("allowlisted HTTP", adapter.captain_guidance())
 
     def test_forensics_intake_uses_bounded_read_only_evidence_index(
         self,

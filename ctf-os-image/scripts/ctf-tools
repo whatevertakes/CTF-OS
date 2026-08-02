@@ -14,6 +14,30 @@ from typing import Any
 SCHEMA_VERSION = 1
 DEFAULT_MANIFEST = "/tools/manifest.json"
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+DEFAULT_CATEGORY_ALIASES = {
+    "binary": "pwn",
+    "binary exploitation": "pwn",
+    "binary-exploitation": "pwn",
+    "cryptography": "crypto",
+    "dfir": "forensic",
+    "digital forensics": "forensic",
+    "digital-forensics": "forensic",
+    "forensics": "forensic",
+    "miscellaneous": "misc",
+    "pwnable": "pwn",
+    "reverse engineering": "rev",
+    "reverse-engineering": "rev",
+    "reversing": "rev",
+    "steganography": "misc",
+    "stego": "misc",
+    "system hacking": "pwn",
+    "system-hacking": "pwn",
+    "web hacking": "web",
+    "web security": "web",
+    "web-hacking": "web",
+    "web-security": "web",
+}
+DEFAULT_SHARED_CATEGORIES = ("system", "orchestration", "korean")
 
 
 class ManifestError(RuntimeError):
@@ -42,6 +66,11 @@ def _usage_parser() -> argparse.ArgumentParser:
         metavar="CATEGORY",
         help="list tools, optionally restricted to CATEGORY",
     )
+    operation.add_argument(
+        "--toolbox",
+        metavar="CATEGORY",
+        help="list CATEGORY plus shared system/orchestration/Korean tools",
+    )
     operation.add_argument("--search", metavar="QUERY", help="search tool metadata")
     operation.add_argument("--info", metavar="NAME", help="show one tool")
     operation.add_argument(
@@ -54,6 +83,7 @@ def _normalize_command_form(argv: list[str]) -> list[str]:
     """Accept both `ctf-tools search x` and `ctf-tools --search x`."""
     commands = {
         "list": "--list",
+        "toolbox": "--toolbox",
         "search": "--search",
         "info": "--info",
         "render-md": "--render-md",
@@ -199,6 +229,63 @@ def _load_manifest(path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         }
         tools.append(normalized)
     tools.sort(key=lambda tool: (tool["category"].casefold(), tool["name"].casefold()))
+    categories = {tool["category"].casefold(): tool["category"] for tool in tools}
+
+    raw_aliases = raw.get("category_aliases")
+    if raw_aliases is None:
+        raw_aliases = {
+            alias: target
+            for alias, target in DEFAULT_CATEGORY_ALIASES.items()
+            if target.casefold() in categories
+        }
+    if not isinstance(raw_aliases, dict) or not all(
+        isinstance(alias, str) and isinstance(target, str)
+        for alias, target in raw_aliases.items()
+    ):
+        raise ManifestError("manifest category_aliases must be an object of strings")
+    aliases: dict[str, str] = {}
+    for alias, target in raw_aliases.items():
+        normalized_alias = alias.strip().casefold()
+        normalized_target = target.strip().casefold()
+        if not normalized_alias or not normalized_target:
+            raise ManifestError("manifest category_aliases must not contain empty names")
+        if normalized_alias in categories:
+            raise ManifestError(
+                f"manifest category alias shadows a canonical category: {alias}"
+            )
+        if normalized_target not in categories:
+            raise ManifestError(
+                f"manifest category alias has unknown target: {alias} -> {target}"
+            )
+        if normalized_alias in aliases:
+            raise ManifestError(f"manifest category alias is duplicated: {alias}")
+        aliases[normalized_alias] = categories[normalized_target]
+
+    raw_shared = raw.get("shared_categories")
+    if raw_shared is None:
+        raw_shared = [
+            category
+            for category in DEFAULT_SHARED_CATEGORIES
+            if category.casefold() in categories
+        ]
+    if not isinstance(raw_shared, list) or not all(
+        isinstance(category, str) for category in raw_shared
+    ):
+        raise ManifestError("manifest shared_categories must be an array of strings")
+    shared: list[str] = []
+    seen_shared: set[str] = set()
+    for category in raw_shared:
+        normalized = category.strip().casefold()
+        if not normalized or normalized not in categories:
+            raise ManifestError(
+                f"manifest shared category is unknown: {category or '<empty>'}"
+            )
+        if normalized in seen_shared:
+            raise ManifestError(f"manifest shared category is duplicated: {category}")
+        seen_shared.add(normalized)
+        shared.append(categories[normalized])
+    raw["category_aliases"] = aliases
+    raw["shared_categories"] = shared
     return raw, tools
 
 
@@ -229,6 +316,23 @@ def _search(tools: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
             ]
         ).casefold()
     ]
+
+
+def _resolve_category(
+    raw: dict[str, Any], tools: list[dict[str, Any]], requested: str
+) -> str:
+    normalized = requested.strip().casefold()
+    categories = {tool["category"].casefold(): tool["category"] for tool in tools}
+    if normalized in categories:
+        return categories[normalized]
+    aliases = raw["category_aliases"]
+    assert isinstance(aliases, dict)
+    target = aliases.get(normalized)
+    if isinstance(target, str):
+        return target
+    accepted = sorted({*categories.values(), *aliases.keys()}, key=str.casefold)
+    preview = ", ".join(accepted)
+    raise ManifestError(f"unknown toolbox category: {requested}; accepted: {preview}")
 
 
 def _json_dump(payload: dict[str, Any]) -> None:
@@ -327,6 +431,45 @@ def main(argv: list[str]) -> int:
                     "schema_version": SCHEMA_VERSION,
                     "command": "list",
                     "category": category or None,
+                    "count": len(tools),
+                    "failed": raw["failed"],
+                    "tools": tools,
+                }
+            )
+        else:
+            _plain_list(tools)
+        return 0
+
+    if args.toolbox is not None:
+        try:
+            category = _resolve_category(raw, all_tools, args.toolbox)
+        except ManifestError as exc:
+            if args.json:
+                _json_dump(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "command": "toolbox",
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+            else:
+                print(f"ctf-tools: {exc}", file=sys.stderr)
+            return 1
+        selected_categories = [category]
+        for shared in raw["shared_categories"]:
+            if shared.casefold() != category.casefold():
+                selected_categories.append(shared)
+        selected = {item.casefold() for item in selected_categories}
+        tools = [tool for tool in tools if tool["category"].casefold() in selected]
+        if args.json:
+            _json_dump(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "toolbox",
+                    "requested_category": args.toolbox,
+                    "category": category,
+                    "categories": selected_categories,
                     "count": len(tools),
                     "failed": raw["failed"],
                     "tools": tools,

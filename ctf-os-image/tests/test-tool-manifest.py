@@ -29,7 +29,10 @@ def tool(category: str, name: str) -> dict[str, object]:
     }
 
 
-def invoke(manifest: dict[str, object]) -> subprocess.CompletedProcess[str]:
+def invoke_arguments(
+    manifest: dict[str, object],
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
     with tempfile.TemporaryDirectory() as directory:
         path = pathlib.Path(directory) / "manifest.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -39,8 +42,7 @@ def invoke(manifest: dict[str, object]) -> subprocess.CompletedProcess[str]:
                 str(CTF_TOOLS),
                 "--manifest",
                 str(path),
-                "--json",
-                "--list",
+                *arguments,
             ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -48,6 +50,10 @@ def invoke(manifest: dict[str, object]) -> subprocess.CompletedProcess[str]:
             check=False,
             timeout=3,
         )
+
+
+def invoke(manifest: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    return invoke_arguments(manifest, "--json", "--list")
 
 
 base = {
@@ -64,6 +70,89 @@ payload = json.loads(result.stdout)
 assert payload["schema_version"] == 1, payload
 assert payload["count"] == 2, payload
 assert payload["failed"] == [], payload
+
+# Toolbox is a category-level discovery surface, not a keyword-to-tool planner.
+# It resolves normal category aliases and includes only the declared shared
+# system/orchestration/Korean utilities.
+toolbox_manifest = {
+    "schema_version": 1,
+    "failed": [],
+    "category_aliases": {
+        "system hacking": "pwn",
+        "system-hacking": "pwn",
+    },
+    "shared_categories": ["system", "orchestration", "korean"],
+    "tools": [
+        tool("pwn", "gdb"),
+        tool("system", "file"),
+        tool("orchestration", "ctfwrap"),
+        tool("korean", "ktext"),
+        tool("web", "curl"),
+        {
+            **tool("pwn", "optional"),
+            "available": False,
+            "path": "",
+        },
+    ],
+}
+toolbox = invoke_arguments(
+    toolbox_manifest,
+    "--json",
+    "toolbox",
+    "system-hacking",
+)
+assert toolbox.returncode == 0, toolbox
+toolbox_payload = json.loads(toolbox.stdout)
+assert toolbox_payload["category"] == "pwn", toolbox_payload
+assert toolbox_payload["categories"] == [
+    "pwn",
+    "system",
+    "orchestration",
+    "korean",
+], toolbox_payload
+assert {item["name"] for item in toolbox_payload["tools"]} == {
+    "gdb",
+    "file",
+    "ctfwrap",
+    "ktext",
+}, toolbox_payload
+
+toolbox_all = invoke_arguments(
+    toolbox_manifest,
+    "--json",
+    "--all",
+    "--toolbox",
+    "system hacking",
+)
+assert toolbox_all.returncode == 0, toolbox_all
+assert "optional" in {
+    item["name"] for item in json.loads(toolbox_all.stdout)["tools"]
+}
+
+unknown_toolbox = invoke_arguments(
+    toolbox_manifest,
+    "--json",
+    "toolbox",
+    "mobile",
+)
+assert unknown_toolbox.returncode == 1, unknown_toolbox
+assert "unknown toolbox category" in json.loads(unknown_toolbox.stdout)["error"]
+
+# Legacy schema-v1 manifests remain usable and receive only aliases/shared
+# categories whose canonical categories are actually present.
+legacy_toolbox = {
+    "schema_version": 1,
+    "failed": [],
+    "tools": [tool("pwn", "gdb"), tool("system", "file")],
+}
+legacy_result = invoke_arguments(
+    legacy_toolbox,
+    "--json",
+    "toolbox",
+    "binary",
+)
+assert legacy_result.returncode == 0, legacy_result
+assert json.loads(legacy_result.stdout)["categories"] == ["pwn", "system"]
 
 invalid_manifests: list[tuple[str, dict[str, object]]] = []
 
@@ -90,6 +179,18 @@ invalid_manifests.append(("aliases must be an array of strings", invalid_aliases
 invalid_description = copy.deepcopy(base)
 invalid_description["tools"][0]["description"] = 7  # type: ignore[index]
 invalid_manifests.append(("description must be a string", invalid_description))
+
+invalid_alias_target = copy.deepcopy(toolbox_manifest)
+invalid_alias_target["category_aliases"] = {"dfir": "forensic"}
+invalid_manifests.append(("category alias has unknown target", invalid_alias_target))
+
+shadowed_category = copy.deepcopy(toolbox_manifest)
+shadowed_category["category_aliases"] = {"pwn": "web"}
+invalid_manifests.append(("category alias shadows", shadowed_category))
+
+duplicate_shared = copy.deepcopy(toolbox_manifest)
+duplicate_shared["shared_categories"] = ["system", "SYSTEM"]
+invalid_manifests.append(("shared category is duplicated", duplicate_shared))
 
 for expected_error, manifest in invalid_manifests:
     result = invoke(manifest)
@@ -191,5 +292,15 @@ with tempfile.TemporaryDirectory() as directory:
     )
     assert oversized_failed_result.returncode != 0, oversized_failed_result
     assert "byte limit" in oversized_failed_result.stderr, oversized_failed_result
+
+catalog_source = GEN_MANIFEST.read_text(encoding="utf-8")
+for required in (
+    "forensic|ctf-sqlite-readonly|ctf-sqlite-readonly|",
+    "web|ctf-sqlite-readonly|ctf-sqlite-readonly|",
+    "pwn|checksec|/usr/bin/checksec|",
+    "rev|avr-gcc|avr-gcc|",
+    "forensic|sccainfo|sccainfo|",
+):
+    assert required in catalog_source, required
 
 print("ctf-tools manifest schema and duplicate regressions: ok")

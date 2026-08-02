@@ -109,6 +109,42 @@ class ForensicEvidenceIndexTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_common_windows_and_browser_artifacts_are_typed(self) -> None:
+        sqlite_magic = b"SQLite format 3\x00" + b"\x00" * 32
+        cases = {
+            ("Users/A/AppData/Local/Google/Chrome/User Data/Default/History", sqlite_magic): (
+                "browser_history",
+                "chromium-history-sqlite",
+                "magic+name",
+            ),
+            ("Users/A/AppData/Roaming/Mozilla/Firefox/x/places.sqlite", sqlite_magic): (
+                "browser_history",
+                "firefox-places-sqlite",
+                "magic+name",
+            ),
+            ("Windows/Prefetch/CMD.EXE-12345678.pf", b"\x1e\x00\x00\x00SCCA"):
+                ("execution_artifact", "windows-prefetch", "magic"),
+            ("Windows/Prefetch/POWERSHELL.EXE-12345678.pf", b"MAM\x04"):
+                ("execution_artifact", "windows-prefetch-compressed", "magic"),
+            ("$Extend/$UsnJrnl:$J", b"records"):
+                ("filesystem_artifact", "windows-usn-journal", "name"),
+            ("$MFT", b"FILE0"):
+                ("filesystem_artifact", "windows-mft", "name"),
+            ("Users/A/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt", b"Get-ChildItem"):
+                ("shell_history", "powershell-history", "name"),
+            ("home/a/.bash_history", b"id\n"):
+                ("shell_history", "bash-history", "name"),
+            ("disk.E01", b"EVF\x09\x0d\x0a\xff\x00"):
+                ("disk", "ewf-e01", "magic"),
+            ("memory.vmem", b"unknown"):
+                ("memory", "vmware-memory", "extension"),
+            ("snapshot.vmsn", b"unknown"):
+                ("memory", "vmware-snapshot", "extension"),
+        }
+        for (path, prefix), expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(MODULE._classify(path, prefix), expected)
+
     def test_index_is_deterministic_typed_and_hash_bound(self) -> None:
         packets = self.root / "traffic.pcapng"
         packets.write_bytes(b"\x0a\x0d\x0d\x0a" + b"P" * 32)

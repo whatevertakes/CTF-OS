@@ -3,6 +3,7 @@
 초기 검증일: 2026-07-27 (Asia/Seoul)
 Managed Rev 재빌드 검증일: 2026-07-30 (Asia/Seoul)
 SAT/카테고리 preflight 검증일: 2026-07-31 (Asia/Seoul)
+카테고리 toolbox/포렌식/AVR-QEMU 검증일: 2026-08-01 (Asia/Seoul)
 
 GitHub 항목은 각 저장소의 `GET /repos/{owner}/{repo}/releases/latest` 응답에서
 `draft=false`, `prerelease=false`인 릴리스와 실제 자산명을 확인했다. 아래 직접
@@ -634,10 +635,40 @@ engine state preissue, 독립 host 재계산, 실제 challenge의 typed P→E �
 전 카테고리 release matrix 영수증은 최종 source gate에서 별도로 판정하며,
 이 이미지 빌드만으로 solve·flag·원격 portability를 주장하지 않는다.
 
+## 2026-08-01 실전 도구 접근성과 포맷 대응 보강 이미지
+
+키워드별 실행 규칙을 새로 만들지 않고, 기존 exact-image manifest에 카테고리
+별칭과 공용 toolbox 조회를 추가했다. SQLite·브라우저 기록·Prefetch·AVR·
+cross-architecture user emulation·headless system QEMU의 대표 경로를 실제
+산출물로 검증하고 이미지를 다시 빌드해 pin했다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:50a44c2047a06e078e706abd2868d1442ed2cf46395370e38b3419c9f2010967` |
+| 생성 시각 | `2026-08-01T19:33:06.959523956+09:00` |
+| Docker inspect Size | 12,661,970,683 bytes |
+| 도구 manifest | schema v1, 212개 중 212개 사용 가능, failed 0 |
+| managed capability manifest | schema v2, 34개 중 34개 사용 가능 |
+| host source suite | 2,101개 통과, 13개 skip, 실패 0 |
+| `ctfos doctor` | pin matched, attestation error 0, warning 0 |
+
+대표 실행 smoke는 native ELF 분석, AArch64/MIPS/MIPSel/RISC-V 정적 바이너리의
+qemu-user 실행, AVR compile/disassemble/GDB/simavr load, x86 boot sector의
+TCG·network-none QEMU 실행, SQLite immutable read와 쓰기/ATTACH 차단, Chromium
+timeline 추출, 포렌식 triage parser 분기를 포함했다. `/challenge` read-only,
+`/work` read-write artifact 경계와 no-input 무한 대기 방지도 그대로 유지했다.
+
+이는 도구의 발견 가능성과 대표 안전 실행 경로에 대한 개발 빌드 검증이다.
+모든 키워드·파일 형식의 완전한 풀이, full kernel/V8 exploit 환경, 범용 `d8`,
+원격 서비스 portability, 자동 문제 선택 또는 자동 flag 제출을 보장하지 않는다.
+clean committed source가 필요한 `ENGINE_RELEASE_GO` 영수증은 이 작업 기록과
+별개이며, 현재 변경을 운영자가 검토·commit한 뒤 release acceptance gate에서
+발급해야 한다.
+
 ## 보장 범위
 
 위 검증은 이미지 빌드, catalog 노출, 무인 실행 계약, 그리고 대표 기능 경로를
-보장한다. 183개 도구의 모든 옵션과 지원 파일 형식을 실제 CTF 샘플로 전수
+보장한다. 212개 도구의 모든 옵션과 지원 파일 형식을 실제 CTF 샘플로 전수
 검증했다는 뜻은 아니다. GPU는 호스트 NVIDIA 런타임, KVM 가속은 `/dev/kvm`,
 디버깅은 ptrace 권한, 네트워크 도구는 대상 연결과 필요한 capability가 별도로
 있어야 한다. 이 외부 조건이 없을 때도 이미지 자체의 catalog와 무인 실행

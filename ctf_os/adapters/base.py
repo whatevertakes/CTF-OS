@@ -117,11 +117,26 @@ class GenericAdapter:
 
 def get_adapter(category: str) -> CategoryAdapter:
     normalized = category.strip().lower()
-    if normalized in {"pwn", "binary", "binary-exploitation"}:
+    if normalized in {
+        "pwn",
+        "binary",
+        "binary exploitation",
+        "binary-exploitation",
+        "pwnable",
+        "system hacking",
+        "system-hacking",
+    }:
         from .pwn import PwnAdapter
 
         return PwnAdapter()
-    if normalized in {"rev", "re", "reversing", "reverse"}:
+    if normalized in {
+        "rev",
+        "re",
+        "reversing",
+        "reverse",
+        "reverse engineering",
+        "reverse-engineering",
+    }:
         from .reversing import ReversingAdapter
 
         return ReversingAdapter()
@@ -129,16 +144,30 @@ def get_adapter(category: str) -> CategoryAdapter:
         from .crypto import CryptoAdapter
 
         return CryptoAdapter()
-    if normalized in {"forensic", "forensics", "dfir"}:
+    if normalized in {
+        "forensic",
+        "forensics",
+        "dfir",
+        "digital forensics",
+        "digital-forensics",
+    }:
         from .forensics import ForensicsAdapter
 
         return ForensicsAdapter()
-    if normalized in {"web", "web-security"}:
+    if normalized in {
+        "web",
+        "web hacking",
+        "web-hacking",
+        "web security",
+        "web-security",
+    }:
         from .web import WebAdapter
 
         return WebAdapter()
     if normalized in {
         "misc",
+        "miscellaneous",
+        "steganography",
         "stego",
         "jail",
         "ppc",

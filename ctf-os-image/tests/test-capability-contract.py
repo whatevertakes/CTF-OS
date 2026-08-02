@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression contract for the repaired non-SQL CTF tool surface."""
+"""Regression contract for the bounded offline CTF tool surface."""
 
 from __future__ import annotations
 
@@ -44,6 +44,15 @@ functional_probe_source = (
 sqlite_wrapper_source = (
     REPO_ROOT / "scripts" / "ctf-sqlite-readonly"
 ).read_text(encoding="utf-8")
+forensic_triage_source = (
+    REPO_ROOT / "templates" / "forensic" / "triage.sh"
+).read_text(encoding="utf-8")
+browser_timeline_source = (
+    REPO_ROOT / "templates" / "forensic" / "browser_timeline.py"
+).read_text(encoding="utf-8")
+qemu_headless_source = (
+    REPO_ROOT / "templates" / "pwn" / "qemu-headless.sh"
+).read_text(encoding="utf-8")
 
 assert "sqlmap" not in dockerfile.casefold()
 assert not re.search(r"\b25\s*gb\b", dockerfile, flags=re.IGNORECASE)
@@ -61,6 +70,18 @@ required_dockerfile_tokens = {
     "--only-shell chromium",
     "qemu-system-arm",
     "qemu-system-mips",
+    "qemu-system-misc",
+    "binutils-avr",
+    "gcc-avr",
+    "avr-libc",
+    "gdb-avr",
+    "simavr",
+    "libc6-dev-mips-cross",
+    "libc6-dev-mipsel-cross",
+    "libc6-dev-riscv64-cross",
+    "device-tree-compiler",
+    "ovmf",
+    "libscca-utils",
     "wine32:i386",
     "libregf-utils",
     "libevtx-utils",
@@ -77,8 +98,9 @@ required_dockerfile_tokens = {
     "CRYPTOMINISAT_VER=5.14.7",
     "536d4cb03bbd2b4cbcca6230ed30e2aa844f170b5bbcfb0a0d7adb4852cf3ab7",
     "ewf-tools",
-    "qemu-system-mips.real",
-    "qemu-system-x86_64.real",
+    'for architecture in aarch64 arm mips x86_64',
+    'for architecture in avr riscv64',
+    'qemu-system-${architecture}.real',
     "/usr/local/lib/ctf-cuda",
     "libnvrtc.so.13",
 }
@@ -102,6 +124,10 @@ assert len(identities) == len(set(identities))
 
 catalog_names = {row[1] for row in catalog_rows}
 required_catalog_names = {
+    "aarch64-linux-gnu-gcc",
+    "avr-gcc",
+    "avr-gdb",
+    "avr-objdump",
     "bkcrack",
     "crypto-python",
     "cryptominisat5",
@@ -109,6 +135,7 @@ required_catalog_names = {
     "ctf-egress-proxy",
     "ctf-network-smoke",
     "ctf-web-probe",
+    "ctf-sqlite-readonly",
     "evtxexport",
     "ewfinfo",
     "ewfverify",
@@ -116,17 +143,29 @@ required_catalog_names = {
     "frida-trace",
     "hash_extender",
     "msoffcrypto-tool",
+    "mactime",
+    "mips-linux-gnu-gcc",
+    "mipsel-linux-gnu-gcc",
     "pahole",
     "pdfimages",
     "playwright",
     "pw-python",
     "qemu-img",
+    "qemu-aarch64-static",
+    "qemu-mips-static",
+    "qemu-mipsel-static",
+    "qemu-riscv64-static",
     "qemu-system-aarch64",
+    "qemu-system-avr",
+    "qemu-system-riscv64",
     "rabin2",
     "ropr",
     "sage-python",
+    "sccainfo",
+    "simavr",
     "uncompyle6",
     "unsquashfs",
+    "usnjls",
     "wasm2wat",
     "web-python",
     "wine",
@@ -156,6 +195,13 @@ ast.parse(
     filename="scripts/ctf-capability-smoke",
 )
 ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
+ast.parse(
+    browser_timeline_source,
+    filename="templates/forensic/browser_timeline.py",
+)
+assert browser_timeline_source.startswith("#!/usr/bin/env python3\n")
+assert forensic_triage_source.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
+assert qemu_headless_source.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
 assert managed_manifest["schema_version"] == 2
 assert len(managed_manifest["capabilities"]) == 34
 assert {
@@ -434,6 +480,44 @@ assert 'rm -f -- "${archive}"' in dockerfile
 assert dockerfile.count('rm -f -- "${partial}"') >= 2
 assert "mode=ro&immutable=1" in sqlite_wrapper_source
 assert "PRAGMA query_only=ON" in sqlite_wrapper_source
+assert "set_authorizer(_readonly_authorizer)" in sqlite_wrapper_source
+assert "set_progress_handler(" in sqlite_wrapper_source
+assert "O_NOFOLLOW" in sqlite_wrapper_source
+assert "MAX_OUTPUT_BYTES" in sqlite_wrapper_source
+assert "SQLITE_ATTACH" in sqlite_wrapper_source
+assert "SQLITE_PRAGMA" in sqlite_wrapper_source
+assert "ulimit -f 16384" in forensic_triage_source
+for forensic_dispatch in (
+    "evtxexport",
+    "regfexport",
+    "ewfverify",
+    "sccainfo",
+    "olevba",
+    "pdfdetach",
+    "ctf-sqlite-readonly",
+    "browser_timeline.py",
+    "qemu-img info --output=json",
+):
+    assert forensic_dispatch in forensic_triage_source
+for qemu_boundary in (
+    "-display none",
+    "-monitor none",
+    "-serial stdio",
+    "-no-reboot",
+    "-net none",
+    "-accel tcg",
+    "*accel=*",
+    "-readconfig",
+    "-qmp-pretty",
+    "-parallel",
+    '*\\"driver\\":\\"nbd\\"*',
+    '*\\"type\\":\\"inet\\"*',
+):
+    assert qemu_boundary in qemu_headless_source
+
+catalog_text = "\n".join("|".join(row) for row in catalog_rows).casefold()
+assert "|d8|" not in catalog_text
+assert "v8 runtime" not in catalog_text
 
 probe_regular_file_set = probe_namespace["_probe_regular_file_set"]
 with tempfile.TemporaryDirectory() as temporary:

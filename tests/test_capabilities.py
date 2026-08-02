@@ -85,6 +85,26 @@ class CapabilityTests(unittest.TestCase):
             CORE_MANAGED_CAPABILITIES
             | CATEGORY_MANAGED_CAPABILITIES["misc"],
         )
+        alias_matrix = {
+            "System Hacking": "pwn",
+            "system-hacking": "pwn",
+            "binary exploitation": "pwn",
+            "Reverse Engineering": "rev",
+            "reverse-engineering": "rev",
+            "Digital Forensics": "forensic",
+            "digital-forensics": "forensic",
+            "Web Hacking": "web",
+            "web security": "web",
+            "Miscellaneous": "misc",
+            "Steganography": "misc",
+        }
+        for label, canonical in alias_matrix.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    required_managed_capabilities_for_category(label),
+                    CORE_MANAGED_CAPABILITIES
+                    | CATEGORY_MANAGED_CAPABILITIES[canonical],
+                )
         self.assertEqual(
             REQUIRED_MANAGED_CAPABILITIES,
             CORE_MANAGED_CAPABILITIES.union(

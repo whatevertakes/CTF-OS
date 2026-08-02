@@ -51,7 +51,9 @@ required=(
   ctf-os-image/scripts/gen-manifest.sh
   ctf-os-image/templates/README.md
   ctf-os-image/templates/common/data_transcript.py
+  ctf-os-image/templates/forensic/browser_timeline.py
   ctf-os-image/templates/pwn/crash_oracle.py
+  ctf-os-image/templates/pwn/qemu-headless.sh
   ctf-os-image/templates/pwn/runtime_snapshot.py
   ctf-os-image/templates/rev/inventory_v2.py
   ctf-os-image/templates/rev/runtime_exec.py
@@ -61,11 +63,15 @@ required=(
   ctf-os-image/tests/fixtures/pwn-runtime-snapshot.c
   ctf-os-image/tests/fixtures/rev-stdin-oracle.c
   ctf-os-image/tests/test-capability-contract.py
+  ctf-os-image/tests/test-forensic-browser-timeline.py
+  ctf-os-image/tests/test-forensic-triage.py
+  ctf-os-image/tests/test-pwn-qemu-headless.py
   ctf-os-image/tests/test-pwn-crash-oracle.py
   ctf-os-image/tests/test-pwn-runtime-snapshot.py
   ctf-os-image/tests/test-rev-inventory.py
   ctf-os-image/tests/test-rev-runtime-exec.py
   ctf-os-image/tests/test-rev-stdin-exec.py
+  ctf-os-image/tests/test-sqlite-readonly.py
   scripts/check-pwn-docker-crash.py
   scripts/check-pwn-docker-snapshot.py
   scripts/check-rev-docker-proof.py
@@ -95,11 +101,15 @@ fi
 "${python_bin}" ctf-os-image/tests/test-capability-contract.py
 "${python_bin}" ctf-os-image/tests/test-tool-manifest.py
 "${python_bin}" ctf-os-image/tests/test-browser-safety.py
+"${python_bin}" ctf-os-image/tests/test-forensic-browser-timeline.py
+"${python_bin}" ctf-os-image/tests/test-forensic-triage.py
 "${python_bin}" ctf-os-image/tests/test-pwn-crash-oracle.py
+"${python_bin}" ctf-os-image/tests/test-pwn-qemu-headless.py
 "${python_bin}" ctf-os-image/tests/test-pwn-runtime-snapshot.py
 "${python_bin}" ctf-os-image/tests/test-rev-inventory.py
 "${python_bin}" ctf-os-image/tests/test-rev-runtime-exec.py
 "${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
+"${python_bin}" ctf-os-image/tests/test-sqlite-readonly.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-crash.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-snapshot.py
 "${python_bin}" -m py_compile scripts/check-rev-docker-proof.py
