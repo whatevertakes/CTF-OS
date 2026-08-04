@@ -3191,6 +3191,45 @@ class SandboxTests(unittest.TestCase):
                 maximum_bytes=len(payload),
             )
 
+    def test_unbound_bounded_read_rejects_same_size_mutation(
+        self,
+    ) -> None:
+        source_root = self.root / "unbound-bounded-read-race"
+        source_root.mkdir()
+        source = source_root / "source.bin"
+        original = b"original"
+        replacement = b"mutated!"
+        self.assertEqual(len(original), len(replacement))
+        source.write_bytes(original)
+        real_read = sandbox_files.os.read
+        mutated = False
+
+        def mutate_after_read(descriptor, size):
+            nonlocal mutated
+            block = real_read(descriptor, size)
+            if block and not mutated:
+                mutated = True
+                source.write_bytes(replacement)
+            return block
+
+        with (
+            patch.object(
+                sandbox_files.os,
+                "read",
+                side_effect=mutate_after_read,
+            ),
+            self.assertRaisesRegex(
+                SafeFileError,
+                "changed while reading",
+            ),
+        ):
+            read_bounded_regular_unbound(
+                source_root,
+                source.name,
+                maximum_bytes=len(original),
+            )
+        self.assertTrue(mutated)
+
     def test_prefix_read_is_exact_bounded_and_nofollow(self) -> None:
         source_root = self.root / "prefix-read-source"
         nested = source_root / "nested"
@@ -3491,6 +3530,49 @@ class SandboxTests(unittest.TestCase):
             )
 
         writes.assert_not_called()
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
+
+    def test_bounded_copy_rejects_same_size_mutation_during_copy(
+        self,
+    ) -> None:
+        source_root = self.root / "bounded-copy-race"
+        source_root.mkdir()
+        source = source_root / "source.bin"
+        destination = self.root / "bounded-copy-race-output" / "copy.bin"
+        original = b"original"
+        replacement = b"mutated!"
+        self.assertEqual(len(original), len(replacement))
+        source.write_bytes(original)
+        real_read = sandbox_files.os.read
+        mutated = False
+
+        def mutate_after_read(descriptor, size):
+            nonlocal mutated
+            block = real_read(descriptor, size)
+            if block and not mutated:
+                mutated = True
+                source.write_bytes(replacement)
+            return block
+
+        with (
+            patch.object(
+                sandbox_files.os,
+                "read",
+                side_effect=mutate_after_read,
+            ),
+            self.assertRaisesRegex(
+                SafeFileError,
+                "changed while copying",
+            ),
+        ):
+            copy_bounded_regular(
+                source_root,
+                source.name,
+                destination,
+            )
+
+        self.assertTrue(mutated)
         self.assertFalse(destination.exists())
         self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
 

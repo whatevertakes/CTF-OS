@@ -598,6 +598,38 @@ def _open_relative_regular(
     return source_descriptor, opened, normalized
 
 
+def _descriptor_matches_digest(
+    descriptor: int,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    require_eof: bool,
+) -> bool:
+    """Re-read one open descriptor without disturbing its stream offset.
+
+    Some filesystems coalesce timestamp updates closely enough that a
+    same-inode, same-size rewrite can leave the metadata fields used by the
+    surrounding stability check unchanged.  A bounded second pass through the
+    already-open descriptor closes that gap for persistent content changes.
+    """
+
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < expected_size:
+        block = os.pread(
+            descriptor,
+            min(_COPY_CHUNK_BYTES, expected_size - offset),
+            offset,
+        )
+        if not block:
+            return False
+        digest.update(block)
+        offset += len(block)
+    if require_eof and os.pread(descriptor, 1, expected_size):
+        return False
+    return digest.hexdigest() == expected_sha256
+
+
 def read_bounded_regular(
     root: Path,
     locator: str,
@@ -661,6 +693,17 @@ def read_bounded_regular(
             payload.extend(block)
             digest.update(block)
 
+        first_pass_sha256 = digest.hexdigest()
+        if (
+            len(payload) != before.st_size
+            or not _descriptor_matches_digest(
+                source_descriptor,
+                expected_sha256=first_pass_sha256,
+                expected_size=len(payload),
+                require_eof=True,
+            )
+        ):
+            raise SafeFileError("bounded source changed while reading")
         after = os.fstat(source_descriptor)
         stable_fields = (
             "st_dev",
@@ -670,8 +713,7 @@ def read_bounded_regular(
             "st_ctime_ns",
         )
         if (
-            len(payload) != before.st_size
-            or any(
+            any(
                 getattr(after, field) != getattr(before, field)
                 for field in stable_fields
             )
@@ -681,7 +723,7 @@ def read_bounded_regular(
             raise SafeFileError(
                 "bounded source size does not match its expected binding"
             )
-        if digest.hexdigest() != expected_sha256.lower():
+        if first_pass_sha256 != expected_sha256.lower():
             raise SafeFileError(
                 "bounded source hash does not match its expected binding"
             )
@@ -720,6 +762,7 @@ def read_bounded_regular_unbound(
     _validate_maximum_bytes(maximum_bytes)
     source_descriptor: int | None = None
     owned_source_descriptors: _OwnedDescriptors = {}
+    digest = hashlib.sha256()
     payload = bytearray()
     try:
         source_descriptor, before, _normalized = _open_relative_regular(
@@ -741,7 +784,18 @@ def read_bounded_regular_unbound(
                     "bounded source grew beyond its size limit"
                 )
             payload.extend(block)
+            digest.update(block)
 
+        if (
+            len(payload) != before.st_size
+            or not _descriptor_matches_digest(
+                source_descriptor,
+                expected_sha256=digest.hexdigest(),
+                expected_size=len(payload),
+                require_eof=True,
+            )
+        ):
+            raise SafeFileError("bounded source changed while reading")
         after = os.fstat(source_descriptor)
         stable_fields = (
             "st_dev",
@@ -751,8 +805,7 @@ def read_bounded_regular_unbound(
             "st_ctime_ns",
         )
         if (
-            len(payload) != before.st_size
-            or any(
+            any(
                 getattr(after, field) != getattr(before, field)
                 for field in stable_fields
             )
@@ -826,6 +879,17 @@ def read_regular_prefix(
                 )
             payload.extend(block)
 
+        if len(payload) != expected_prefix_size:
+            raise SafeFileError(
+                "prefix source length does not match its expected binding"
+            )
+        if not _descriptor_matches_digest(
+            source_descriptor,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            expected_size=len(payload),
+            require_eof=expected_prefix_size == expected_size,
+        ):
+            raise SafeFileError("prefix source changed while reading")
         after = os.fstat(source_descriptor)
         stable_fields = (
             "st_dev",
@@ -839,10 +903,6 @@ def read_regular_prefix(
             for field in stable_fields
         ):
             raise SafeFileError("prefix source changed while reading")
-        if len(payload) != expected_prefix_size:
-            raise SafeFileError(
-                "prefix source length does not match its expected binding"
-            )
         return bytes(payload)
     except OSError as error:
         raise SafeFileError("prefix source read failed") from error
@@ -969,6 +1029,17 @@ def copy_bounded_regular(
                     )
                 view = view[written:]
 
+        actual_sha256 = digest.hexdigest()
+        if (
+            total != before.st_size
+            or not _descriptor_matches_digest(
+                source_descriptor,
+                expected_sha256=actual_sha256,
+                expected_size=total,
+                require_eof=True,
+            )
+        ):
+            raise SafeFileError("snapshot source changed while copying")
         after = os.fstat(source_descriptor)
         stable_fields = (
             "st_dev",
@@ -979,14 +1050,12 @@ def copy_bounded_regular(
             "st_ctime_ns",
         )
         if (
-            total != before.st_size
-            or any(
+            any(
                 getattr(after, field) != getattr(before, field)
                 for field in stable_fields
             )
         ):
             raise SafeFileError("snapshot source changed while copying")
-        actual_sha256 = digest.hexdigest()
         if (
             expected_sha256 is not None
             and actual_sha256 != expected_sha256.lower()
