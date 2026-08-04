@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -165,6 +166,7 @@ class NYUStageTests(unittest.TestCase):
         source: Path | None = None,
         split: str = "dev",
         case_ids: tuple[str, ...] | None = None,
+        source_dataset: str = "test",
     ) -> tuple[dict[str, object], Path]:
         selected_workspace = workspace or self.workspace
         selected_output = output or selected_workspace / "nyu-partial.json"
@@ -183,6 +185,7 @@ class NYUStageTests(unittest.TestCase):
                 wall_seconds=600,
                 model_call_limit=12,
                 total_token_limit=100_000,
+                source_dataset=source_dataset,
             )
         return result, selected_output
 
@@ -215,6 +218,99 @@ class NYUStageTests(unittest.TestCase):
         self.assertEqual(arguments.benchmark_command, "nyu-stage")
         self.assertEqual(arguments.cases, [self.case_ids[0]])
         self.assertEqual(arguments.budget_wall_seconds, 600)
+        self.assertEqual(arguments.source_dataset, "test")
+
+        development_arguments = cli.build_parser().parse_args(
+            [
+                "benchmark",
+                "nyu-stage",
+                "--source",
+                str(self.source),
+                "--release-commit",
+                self.commit,
+                "--source-dataset",
+                "development",
+                "--case",
+                self.case_ids[0],
+                "--output-manifest",
+                "partial.json",
+                "--contest",
+                "nyu",
+                "--split",
+                "dev",
+                "--wall-seconds",
+                "600",
+                "--model-call-limit",
+                "12",
+                "--total-token-limit",
+                "100000",
+            ]
+        )
+        self.assertEqual(development_arguments.source_dataset, "development")
+
+    def test_official_development_dataset_is_selected_and_release_bound(
+        self,
+    ) -> None:
+        test_dataset = json.loads(
+            (self.source / "test_dataset.json").read_text(encoding="utf-8")
+        )
+        development_dataset: dict[str, object] = {}
+        for case_id, raw_entry in test_dataset.items():
+            entry = dict(raw_entry)
+            test_relative = entry["path"]
+            development_relative = test_relative.replace("test/", "development/", 1)
+            shutil.copytree(
+                self.source / test_relative,
+                self.source / development_relative,
+            )
+            (self.source / development_relative / "public.bin").write_bytes(
+                f"development input for {case_id}\n".encode()
+            )
+            entry["path"] = development_relative
+            development_dataset[case_id] = entry
+        (self.source / "development_dataset.json").write_text(
+            json.dumps(development_dataset, sort_keys=True),
+            encoding="utf-8",
+        )
+        development_commit = self._commit("official development dataset fixture")
+        development_workspace = self.root / "development-workspace"
+        development_workspace.mkdir()
+
+        _result, output = self._stage(
+            workspace=development_workspace,
+            output=development_workspace / "development.partial.json",
+            commit=development_commit,
+            source_dataset="development",
+        )
+
+        manifest = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["metadata"]["source_dataset"],
+            "development_dataset.json",
+        )
+        for case in manifest["splits"][0]["cases"]:
+            session = case["sessions"][0]
+            incoming = (
+                development_workspace
+                / "incoming"
+                / "nyu-fixture"
+                / case["category"]
+                / session["challenge_id"]
+            )
+            public_metadata = json.loads(
+                (incoming / NYU_PUBLIC_METADATA_FILE).read_text(encoding="utf-8")
+            )
+            self.assertTrue(public_metadata["path"].startswith("development/"))
+            self.assertEqual(
+                (incoming / "public.bin").read_bytes(),
+                f"development input for {case['case_id']}\n".encode(),
+            )
+
+    def test_unknown_source_dataset_fails_before_workspace_mutation(self) -> None:
+        with self.assertRaisesRegex(NYUStageError, "source-dataset"):
+            self._stage(source_dataset="dev")
+
+        self.assertEqual(list(self.workspace.iterdir()), [])
 
     def test_stages_six_fresh_sessions_per_case_without_private_fields(
         self,
@@ -635,6 +731,14 @@ class NYUStageTests(unittest.TestCase):
         self.assertFalse((mismatch_workspace / ".ctfos").exists())
 
     def test_git_query_bounds_both_streams_and_timeout(self) -> None:
+        self.assertEqual(
+            nyu_stage_module.MAX_PUBLIC_ASSET_BYTES,
+            32 * 1024 * 1024,
+        )
+        self.assertEqual(
+            nyu_stage_module.MAX_GIT_OUTPUT_BYTES,
+            4 * 1024 * 1024,
+        )
         fake_bin = self.root / "fake-bin"
         fake_bin.mkdir()
         fake_git = fake_bin / "git"
@@ -648,6 +752,11 @@ class NYUStageTests(unittest.TestCase):
                 "if mode == 'stdout':\n"
                 "    os.write(1, b'x' * 2048)\n"
                 "elif mode == 'stderr':\n"
+                "    os.write(2, b'x' * 2048)\n"
+                "elif mode == 'public-stdout':\n"
+                "    os.write(1, b'x' * 2048)\n"
+                "    sys.exit(0)\n"
+                "elif mode == 'public-stderr':\n"
                 "    os.write(2, b'x' * 2048)\n"
                 "time.sleep(60)\n"
             ),
@@ -681,6 +790,42 @@ class NYUStageTests(unittest.TestCase):
                             label=f"synthetic Git {mode}",
                         )
                     self.assertLess(time.monotonic() - started, 2)
+
+            self.assertEqual(
+                nyu_stage_module._git_query(
+                    self.source,
+                    "public-stdout",
+                    label="bounded public Git stdout",
+                    maximum_stdout_bytes=(
+                        nyu_stage_module.MAX_PUBLIC_ASSET_BYTES
+                    ),
+                ),
+                b"x" * 2048,
+            )
+            with self.assertRaises(NYUStageError):
+                nyu_stage_module._git_query(
+                    self.source,
+                    "public-stderr",
+                    label="bounded public Git stderr",
+                    maximum_stdout_bytes=(
+                        nyu_stage_module.MAX_PUBLIC_ASSET_BYTES
+                    ),
+                )
+            with mock.patch.object(
+                nyu_stage_module.subprocess, "Popen"
+            ) as popen:
+                with self.assertRaisesRegex(
+                    NYUStageError, "invalid output bound"
+                ):
+                    nyu_stage_module._git_query(
+                        self.source,
+                        "public-stdout",
+                        label="oversized public Git bound",
+                        maximum_stdout_bytes=(
+                            nyu_stage_module.MAX_PUBLIC_ASSET_BYTES + 1
+                        ),
+                    )
+                popen.assert_not_called()
 
             started = time.monotonic()
             with (

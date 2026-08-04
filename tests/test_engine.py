@@ -2369,6 +2369,68 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(state.submissions, [])
         self.assertEqual(state.status, before.status)
 
+    def test_rev_inventory_fact_can_support_downstream_experiment(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-downstream-evidence"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        seeded = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in seeded.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+        inventory_fact = next(
+            fact
+            for fact in state.facts
+            if fact.id.endswith("-rev-inventory")
+        )
+        downstream_id = "E-downstream-static-reduction"
+        state.experiments.append(
+            Experiment(
+                id=downstream_id,
+                hypothesis_ids=[],
+                command="true",
+                expected_observation="bounded semantic reduction",
+                keep_if="the reduction identifies a transform",
+                drop_if="the reduction excludes the transform",
+                timeout_seconds=1,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.INCONCLUSIVE,
+                result={"run_id": "R-downstream-static-reduction"},
+                evidence_fact_ids=[inventory_fact.id],
+            )
+        )
+
+        errors = models_module._rev_inventory_state_errors(
+            state,
+            runs={run.id: run for run in state.runs},
+            receipts={receipt.id: receipt for receipt in state.receipts},
+            artifacts={
+                artifact.id: artifact for artifact in state.artifacts
+            },
+            facts={fact.id: fact for fact in state.facts},
+        )
+
+        self.assertFalse(
+            any(downstream_id in error for error in errors),
+            errors,
+        )
+
     def test_rev_inventory_oracle_state_rejects_round_trip_tamper(
         self,
     ) -> None:
@@ -2565,6 +2627,253 @@ class EngineTests(unittest.TestCase):
         self.assertIn("incomplete_binary_profile", fact.statement)
         self.assertEqual(state.candidates, [])
         self.assertEqual(state.submissions, [])
+
+    def test_model_evaluation_cannot_rewrite_rev_inventory_semantics(
+        self,
+    ) -> None:
+        source_bytes = b"print('script handout')\n"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(
+                source_bytes,
+                arch=None,
+                bits=None,
+                bintype="unknown",
+                havecode=False,
+            )
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "checker.py").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+        evaluated = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        self.assertIs(evaluated.status, ExperimentStatus.INCONCLUSIVE)
+        canonical_inventory = evaluated.to_dict(v2=True)
+
+        class InventoryEvaluationExecutor:
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                del inner_self, cwd, timeout, on_stdout_line
+                role = _role_for(command)
+                self.assertIs(role, Role.CAPTAIN)
+                payload = _payload(role)
+                payload["evaluations"] = [
+                    {
+                        "experiment_id": evaluated.id,
+                        "status": "inconclusive",
+                        "reason": "model-supplied replacement reason",
+                        "evidence_fact_ids": list(
+                            evaluated.evidence_fact_ids
+                        ),
+                        "evidence_artifact_ids": list(
+                            evaluated.artifact_ids
+                        ),
+                        "evidence_run_ids": list(
+                            evaluated.evidence_run_ids
+                        ),
+                        "support_hypothesis_ids": [],
+                        "refute_hypothesis_ids": [],
+                    }
+                ]
+                _output_path(command).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        engine.batch_runner = BatchRunner(
+            process_executor=InventoryEvaluationExecutor(),
+            limiter=FifoModelCallLimiter(1),
+            limiter_wait_timeout=2,
+            max_schema_retries=0,
+        )
+        result = engine.run_role(
+            self.identity,
+            Role.CAPTAIN,
+            instruction="propose a bounded next state",
+        )
+
+        self.assertTrue(result.validation.valid)
+        state = engine.store.load(self.identity)
+        after = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        self.assertEqual(after.to_dict(v2=True), canonical_inventory)
+        captain_run = next(
+            run for run in state.runs if run.role == Role.CAPTAIN.value
+        )
+        rejection = captain_run.extra["rejected_evaluations"][0]
+        self.assertEqual(rejection["experiment_id"], inventory.id)
+        self.assertIn("owned by", rejection["reason"])
+
+    def test_model_inconclusive_cannot_override_typed_engine_executor(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        engine.manage_hypothesis(
+            self.identity,
+            action="create",
+            hypothesis_id="H-typed-engine-owned",
+            statement="the typed probe has one engine-owned outcome",
+            falsifier="the deterministic typed executor rejects it",
+        )
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="one typed engine result",
+            keep_if="the typed result supports the hypothesis",
+            drop_if="the typed result refutes the hypothesis",
+            hypothesis_ids=("H-typed-engine-owned",),
+        )
+        executed = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(experiment_id,),
+        )
+        typed = next(
+            item
+            for item in executed.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(
+            typed.status,
+            ExperimentStatus.AWAITING_EVALUATION,
+        )
+        def mark_engine_owned(current: ChallengeState) -> None:
+            experiment = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+            experiment.extra["engine_executor"] = (
+                "test_typed_engine_executor_v1"
+            )
+
+        marked = engine.store.update(
+            self.identity,
+            mark_engine_owned,
+        )
+        typed = next(
+            item
+            for item in marked.experiments
+            if item.id == experiment_id
+        )
+        canonical_typed = typed.to_dict(v2=True)
+
+        class TypedEvaluationExecutor:
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                del inner_self, cwd, timeout, on_stdout_line
+                role = _role_for(command)
+                self.assertIs(role, Role.CAPTAIN)
+                payload = _payload(role)
+                payload.update(
+                    {
+                        "observations": [],
+                        "hypotheses": [],
+                        "hypothesis_updates": [],
+                        "evaluations": [
+                            {
+                                "experiment_id": typed.id,
+                                "status": "inconclusive",
+                                "reason": "model attempted typed replacement",
+                                "evidence_fact_ids": [],
+                                "evidence_artifact_ids": [],
+                                "evidence_run_ids": [],
+                                "support_hypothesis_ids": [],
+                                "refute_hypothesis_ids": [],
+                            }
+                        ],
+                        "actions": [],
+                        "artifacts": [],
+                        "progress_markers": [],
+                        "flag_candidates": [],
+                    }
+                )
+                _output_path(command).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        engine.batch_runner = BatchRunner(
+            process_executor=TypedEvaluationExecutor(),
+            limiter=FifoModelCallLimiter(1),
+            limiter_wait_timeout=2,
+            max_schema_retries=0,
+        )
+        result = engine.run_role(
+            self.identity,
+            Role.CAPTAIN,
+            instruction="try to replace typed engine semantics",
+        )
+
+        self.assertTrue(result.validation.valid)
+        rejected = engine.store.load(self.identity)
+        unchanged = next(
+            item for item in rejected.experiments if item.id == typed.id
+        )
+        self.assertEqual(unchanged.to_dict(v2=True), canonical_typed)
+        captain_run = next(
+            item
+            for item in rejected.runs
+            if item.id == result.invocation.run_id
+        )
+        self.assertIn(
+            "owned by",
+            captain_run.extra["rejected_evaluations"][0]["reason"],
+        )
+
+        operator_evaluated = engine.evaluate_experiment(
+            self.identity,
+            typed.id,
+            status=ExperimentStatus.INCONCLUSIVE,
+            reason="operator accepted the bounded typed observation",
+        )
+        operator_typed = next(
+            item
+            for item in operator_evaluated.experiments
+            if item.id == typed.id
+        )
+        self.assertIs(
+            operator_typed.status,
+            ExperimentStatus.INCONCLUSIVE,
+        )
+        self.assertEqual(
+            operator_typed.evaluation_reason,
+            "operator accepted the bounded typed observation",
+        )
 
     def test_rev_inventory_oracle_errors_do_not_create_facts(
         self,
@@ -4124,6 +4433,47 @@ class EngineTests(unittest.TestCase):
         ]
         self.assertEqual(len(seeded), 1)
         self.assertIn("/challenge/zz-task.py", seeded[0].command)
+
+    def test_adapter_primary_source_excludes_generated_nyu_metadata(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        cases = (
+            ("crypto", "README.md"),
+            ("forensics", "qr_code.txt"),
+            ("misc", "output"),
+        )
+        for category, handout_name in cases:
+            with self.subTest(category=category):
+                identity = ChallengeIdentity(
+                    "selector contest",
+                    category,
+                    f"nyu metadata {category}",
+                )
+                input_dir = engine.challenge_input(identity)
+                input_dir.mkdir(parents=True)
+                (input_dir / "nyu_public_metadata.json").write_text(
+                    '{"case_id":"public-provenance"}\n',
+                    encoding="utf-8",
+                )
+                (input_dir / handout_name).write_text(
+                    "public challenge handout\n",
+                    encoding="utf-8",
+                )
+
+                state = engine.add_challenge(identity, prompt="solve")
+
+                self.assertEqual(
+                    state.metadata["adapter_primary_source"],
+                    handout_name,
+                )
+                self.assertTrue(
+                    all(
+                        "nyu_public_metadata.json" not in experiment.command
+                        for experiment in state.experiments
+                        if experiment.extra.get("adapter_seed")
+                    )
+                )
 
     def test_engine_budget_sets_deadline_and_clamps_tool_timeout(
         self,
@@ -7667,6 +8017,669 @@ class EngineTests(unittest.TestCase):
             )
         )
 
+    def _model_semantic_witness_fixture(
+        self,
+        stdout_text: str,
+        *,
+        contract_version: int | None,
+        requested_status: str = "dropped",
+    ) -> tuple[ChallengeState, str, str, str]:
+        sandbox_payloads = [
+            "REC: independent_control=true\n",
+            stdout_text,
+        ]
+        sandbox_call_count = 0
+
+        class CompleteTextSandbox(FakeSandbox):
+            def run(inner_self, spec):
+                nonlocal sandbox_call_count
+                inner_self.specs.append(spec)
+                sandbox_call_count += 1
+                ordinal = sandbox_call_count
+                raw = inner_self.work / "raw" / str(ordinal)
+                raw.mkdir(parents=True, exist_ok=False)
+                stdout = raw / "stdout.log"
+                stderr = raw / "stderr.log"
+                payload = sandbox_payloads[ordinal - 1]
+                stdout.write_text(payload, encoding="utf-8")
+                stderr.write_bytes(b"")
+                stdout_bytes = stdout.stat().st_size
+                return SandboxResult(
+                    run_id=f"semantic-tool-{ordinal}",
+                    status="completed",
+                    exit_code=0,
+                    timed_out=False,
+                    duration_ms=5,
+                    stdout_summary=payload,
+                    stderr_summary="",
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=0,
+                    stdout_path=f"/work/raw/{ordinal}/stdout.log",
+                    stderr_path=f"/work/raw/{ordinal}/stderr.log",
+                    stdout_stored_bytes=stdout_bytes,
+                    stderr_stored_bytes=0,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                    stdout_truncated=False,
+                    stderr_truncated=False,
+                    stdout_truncation_known=True,
+                    stderr_truncation_known=True,
+                    stdout_capture_complete=True,
+                    stderr_capture_complete=True,
+                    stdout_summary_truncated=False,
+                    stderr_summary_truncated=False,
+                )
+
+        class EvaluationExecutor:
+            evaluation: dict[str, object] | None = None
+
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                del cwd, timeout, on_stdout_line
+                role = _role_for(command)
+                self.assertIs(role, Role.CAPTAIN)
+                self.assertIsNotNone(inner_self.evaluation)
+                payload = _payload(role)
+                payload.update(
+                    {
+                        "observations": [],
+                        "hypotheses": [],
+                        "hypothesis_updates": [],
+                        "evaluations": [inner_self.evaluation],
+                        "actions": [],
+                        "artifacts": [],
+                        "progress_markers": [],
+                        "flag_candidates": [],
+                    }
+                )
+                _output_path(command).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        executor = EvaluationExecutor()
+        runner = BatchRunner(
+            process_executor=executor,
+            limiter=FifoModelCallLimiter(1),
+            limiter_wait_timeout=2,
+            max_schema_retries=0,
+        )
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=runner,
+            sandbox_factory=(
+                lambda state, work, policy: CompleteTextSandbox(work)
+            ),
+        )
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        engine.manage_hypothesis(
+            self.identity,
+            action="create",
+            hypothesis_id="H-semantic-witness",
+            statement="the generic probe has one semantic interpretation",
+            falsifier="a bounded raw record contradicts the interpretation",
+        )
+        _state, control_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="independent control completes",
+            keep_if="the control record is present",
+            drop_if="the control record is absent",
+        )
+        control_state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(control_id,),
+        )
+        control = next(
+            item for item in control_state.experiments if item.id == control_id
+        )
+        control_run_id = str(control.result["run_id"])
+        control_receipt = next(
+            item
+            for item in control_state.receipts
+            if item.experiment_id == control_id
+        )
+        control_artifact_id = str(control_receipt.stdout_artifact_id)
+        control_artifact = next(
+            item
+            for item in control_state.artifacts
+            if item.id == control_artifact_id
+        )
+
+        def add_unrelated_fact(current: ChallengeState) -> None:
+            current.facts.append(
+                Fact(
+                    id="F-unrelated-executed-control",
+                    statement="the independent control completed",
+                    provenance=Provenance.EXECUTED,
+                    challenge_id=current.challenge_id,
+                    source_run_id=control_run_id,
+                    artifact_id=control_artifact_id,
+                    locator=control_artifact.path,
+                )
+            )
+
+        engine.store.update(self.identity, add_unrelated_fact)
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="one bounded semantic discriminator",
+            keep_if="the exact record supports the hypothesis",
+            drop_if="the exact record refutes the hypothesis",
+            hypothesis_ids=("H-semantic-witness",),
+        )
+
+        def mark_contract(current: ChallengeState) -> None:
+            experiment = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+            if contract_version is not None:
+                experiment.extra[
+                    "managed_semantic_evaluation_contract_version"
+                ] = contract_version
+
+        engine.store.update(self.identity, mark_contract)
+        executed = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(experiment_id,),
+        )
+        experiment = next(
+            item for item in executed.experiments if item.id == experiment_id
+        )
+        target_run_id = str(experiment.result["run_id"])
+        target_receipt = next(
+            item
+            for item in executed.receipts
+            if item.experiment_id == experiment_id
+        )
+        target_artifact_id = str(target_receipt.stdout_artifact_id)
+        refute_ids = (
+            ["H-semantic-witness"]
+            if requested_status == "dropped"
+            else []
+        )
+        support_ids = (
+            ["H-semantic-witness"]
+            if requested_status == "kept"
+            else []
+        )
+        executor.evaluation = {
+            "experiment_id": experiment_id,
+            "status": requested_status,
+            "reason": "Captain reconciled the requested disposition",
+            "evidence_fact_ids": ["F-unrelated-executed-control"],
+            "evidence_artifact_ids": [target_artifact_id],
+            "evidence_run_ids": [target_run_id],
+            "support_hypothesis_ids": support_ids,
+            "refute_hypothesis_ids": refute_ids,
+        }
+        result = engine.run_role(
+            self.identity,
+            Role.CAPTAIN,
+            instruction="evaluate the completed generic experiment",
+        )
+        self.assertTrue(result.validation.valid)
+        return (
+            engine.store.load(self.identity),
+            experiment_id,
+            "H-semantic-witness",
+            "F-unrelated-executed-control",
+        )
+
+    def test_model_summary_only_drop_cannot_refute_v2_generic_action(
+        self,
+    ) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "SUMMARY: hidden=1 oracle=DROP\n",
+                contract_version=2,
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+        receipt = next(
+            item
+            for item in state.receipts
+            if item.experiment_id == experiment_id
+        )
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.contradicts, [])
+        self.assertIs(receipt.extra["semantic_authority"], False)
+        self.assertIs(receipt.extra["semantic_witness_available"], False)
+        self.assertEqual(
+            experiment.extra["semantic_evaluation_admission"][
+                "reason_code"
+            ],
+            "missing_complete_structured_rec_witness",
+        )
+
+    def test_model_rec_witness_is_audit_only_for_v2_generic_drop(
+        self,
+    ) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "REC: hidden_ref=0x11d5->0x4050 count=8\n"
+                "SUMMARY: oracle=DROP\n",
+                contract_version=2,
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+        receipt = next(
+            item
+            for item in state.receipts
+            if item.experiment_id == experiment_id
+        )
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertIsNone(hypothesis.refuted_by)
+        self.assertEqual(fact.contradicts, [])
+        self.assertIs(receipt.extra["semantic_witness_available"], True)
+        admission = experiment.extra["semantic_evaluation_admission"]
+        self.assertEqual(admission["requested_status"], "dropped")
+        self.assertEqual(admission["applied_status"], "inconclusive")
+        self.assertEqual(
+            admission["reason_code"],
+            "complete_structured_rec_witness",
+        )
+        self.assertIs(admission["semantic_authority"], False)
+
+    def test_model_v1_generic_drop_is_also_proposal_only(self) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "SUMMARY: hidden=1 oracle=DROP\n",
+                contract_version=1,
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.contradicts, [])
+        admission = experiment.extra["semantic_evaluation_admission"]
+        self.assertEqual(admission["contract_version"], 1)
+        self.assertEqual(admission["requested_status"], "dropped")
+        self.assertEqual(admission["applied_status"], "inconclusive")
+        self.assertIs(admission["witness_available"], False)
+
+    def test_model_missing_contract_drop_is_proposal_only(self) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "REC: arbitrary_model_claim=true\n",
+                contract_version=None,
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.contradicts, [])
+        admission = experiment.extra["semantic_evaluation_admission"]
+        self.assertIsNone(admission["contract_version"])
+        self.assertEqual(admission["requested_status"], "dropped")
+        self.assertEqual(admission["applied_status"], "inconclusive")
+        self.assertIs(admission["witness_available"], False)
+
+    def test_model_middle_rec_cannot_change_generic_semantics(self) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "ordinary prefix\nREC: middle_claim=true\nordinary suffix\n",
+                contract_version=2,
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+        receipt = next(
+            item
+            for item in state.receipts
+            if item.experiment_id == experiment_id
+        )
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.contradicts, [])
+        self.assertIs(receipt.extra["semantic_witness_available"], False)
+        self.assertIs(
+            experiment.extra["semantic_evaluation_admission"][
+                "semantic_authority"
+            ],
+            False,
+        )
+        self.assertIs(
+            experiment.extra["semantic_evaluation_admission"][
+                "witness_available"
+            ],
+            False,
+        )
+
+    def test_model_overlong_rec_cannot_change_generic_semantics(self) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "REC: " + ("A" * 201) + "\n",
+                contract_version=2,
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+        receipt = next(
+            item
+            for item in state.receipts
+            if item.experiment_id == experiment_id
+        )
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.contradicts, [])
+        self.assertIs(receipt.extra["semantic_witness_available"], False)
+        self.assertIs(
+            experiment.extra["semantic_evaluation_admission"][
+                "witness_available"
+            ],
+            False,
+        )
+
+    def test_model_rec_keep_cannot_support_generic_hypothesis(self) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "REC: arbitrary_support_claim=true\n",
+                contract_version=2,
+                requested_status="kept",
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.supports, [])
+        admission = experiment.extra["semantic_evaluation_admission"]
+        self.assertEqual(admission["requested_status"], "kept")
+        self.assertEqual(admission["applied_status"], "inconclusive")
+
+    def test_model_failed_generic_evaluation_is_rejected(self) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "REC: successful_transport=true\n",
+                contract_version=2,
+                requested_status="failed",
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+        captain = next(
+            item for item in state.runs if item.role == Role.CAPTAIN.value
+        )
+
+        self.assertIs(
+            experiment.status,
+            ExperimentStatus.AWAITING_EVALUATION,
+        )
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.supports, [])
+        self.assertEqual(fact.contradicts, [])
+        self.assertNotIn("semantic_evaluation_admission", experiment.extra)
+        rejection = captain.extra["rejected_evaluations"][0]
+        self.assertEqual(rejection["experiment_id"], experiment_id)
+        self.assertIn("FAILED is not authoritative", rejection["reason"])
+
+    def test_model_inconclusive_v2_generic_action_needs_no_witness(
+        self,
+    ) -> None:
+        state, experiment_id, hypothesis_id, fact_id = (
+            self._model_semantic_witness_fixture(
+                "SUMMARY: analysis=ambiguous oracle=FAIL\n",
+                contract_version=2,
+                requested_status="inconclusive",
+            )
+        )
+        experiment = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        hypothesis = next(
+            item for item in state.hypotheses if item.id == hypothesis_id
+        )
+        fact = next(item for item in state.facts if item.id == fact_id)
+
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(fact.contradicts, [])
+
+    def test_operator_generic_evaluations_remain_authoritative(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        cases = (
+            (
+                "drop-v1",
+                1,
+                ExperimentStatus.DROPPED,
+                HypothesisStatus.REFUTED,
+            ),
+            (
+                "keep-v2",
+                2,
+                ExperimentStatus.KEPT,
+                HypothesisStatus.SUPPORTED,
+            ),
+            (
+                "failed-v1",
+                1,
+                ExperimentStatus.FAILED,
+                HypothesisStatus.OPEN,
+            ),
+        )
+        experiment_ids: list[str] = []
+        for label, contract_version, _status, _hypothesis_status in cases:
+            hypothesis_id = f"H-operator-{label}"
+            engine.manage_hypothesis(
+                self.identity,
+                action="create",
+                hypothesis_id=hypothesis_id,
+                statement=f"operator controls {label} semantics",
+                falsifier=f"operator rejects {label} semantics",
+            )
+            _state, experiment_id = engine.register_experiment(
+                self.identity,
+                command=("true",),
+                expected_observation=f"bounded {label} result",
+                keep_if=f"operator keeps {label}",
+                drop_if=f"operator drops {label}",
+                hypothesis_ids=(hypothesis_id,),
+            )
+
+            def mark_contract(
+                current: ChallengeState,
+                *,
+                selected_id: str = experiment_id,
+                version: int = contract_version,
+            ) -> None:
+                experiment = next(
+                    item
+                    for item in current.experiments
+                    if item.id == selected_id
+                )
+                experiment.extra[
+                    "managed_semantic_evaluation_contract_version"
+                ] = version
+
+            engine.store.update(self.identity, mark_contract)
+            experiment_ids.append(experiment_id)
+
+        engine.execute_registered_experiments(
+            self.identity,
+            maximum=len(experiment_ids),
+            experiment_ids=tuple(experiment_ids),
+        )
+        for (
+            label,
+            _contract_version,
+            status,
+            _hypothesis_status,
+        ), experiment_id in zip(cases, experiment_ids, strict=True):
+            hypothesis_id = f"H-operator-{label}"
+            engine.evaluate_experiment(
+                self.identity,
+                experiment_id,
+                status=status,
+                reason=f"explicit operator {status.value}",
+                support_hypothesis_ids=(
+                    (hypothesis_id,)
+                    if status is ExperimentStatus.KEPT
+                    else ()
+                ),
+                refute_hypothesis_ids=(
+                    (hypothesis_id,)
+                    if status is ExperimentStatus.DROPPED
+                    else ()
+                ),
+            )
+
+        state = engine.store.load(self.identity)
+        experiments = {item.id: item for item in state.experiments}
+        hypotheses = {item.id: item for item in state.hypotheses}
+        for (
+            label,
+            _contract_version,
+            status,
+            hypothesis_status,
+        ), experiment_id in zip(cases, experiment_ids, strict=True):
+            self.assertIs(experiments[experiment_id].status, status)
+            self.assertIs(
+                hypotheses[f"H-operator-{label}"].status,
+                hypothesis_status,
+            )
+            self.assertNotIn(
+                "semantic_evaluation_admission",
+                experiments[experiment_id].extra,
+            )
+
+    def test_model_authored_tool_transport_failure_remains_engine_failed(
+        self,
+    ) -> None:
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: RevInventorySandbox(
+                work,
+                b"",
+                status="failed",
+                exit_code=1,
+                orchestration_error="synthetic model tool transport failure",
+            ),
+        )
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        engine.manage_hypothesis(
+            self.identity,
+            action="create",
+            hypothesis_id="H-model-transport-failure",
+            statement="the model tool transport succeeds",
+            falsifier="the engine records a transport failure",
+        )
+
+        state = engine.run_tool_command(
+            self.identity,
+            ("true",),
+            expected_observation="one successful model tool transport",
+            keep_if="the transport succeeds",
+            drop_if="the output refutes the hypothesis",
+            hypothesis_ids=("H-model-transport-failure",),
+            _model_authored=True,
+        )
+
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.hypothesis_ids == ["H-model-transport-failure"]
+        )
+        hypothesis = next(
+            item
+            for item in state.hypotheses
+            if item.id == "H-model-transport-failure"
+        )
+        receipt = next(
+            item
+            for item in state.receipts
+            if item.experiment_id == experiment.id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.FAILED)
+        self.assertEqual(receipt.outcome.value, "failed")
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(
+            experiment.extra[
+                "managed_semantic_evaluation_contract_version"
+            ],
+            2,
+        )
+        self.assertNotIn("semantic_evaluation_admission", experiment.extra)
+
     def test_experiment_evaluation_requires_its_own_executed_chain(
         self,
     ) -> None:
@@ -7967,7 +8980,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0], OSError)
 
-    def test_batch_falsifier_updates_existing_hypothesis_and_experiment(
+    def test_batch_falsifier_semantic_disposition_is_proposal_only(
         self,
     ) -> None:
         class MutablePayloadExecutor:
@@ -8070,7 +9083,7 @@ class EngineTests(unittest.TestCase):
                         "hypothesis_id": "H-existing",
                         "statement": "revised after the probe",
                         "falsifier": None,
-                        "status": "supported",
+                        "status": "open",
                         "evidence_fact_ids": [fact_id],
                         "evidence_artifact_ids": [],
                         "evidence_run_ids": [],
@@ -8081,7 +9094,7 @@ class EngineTests(unittest.TestCase):
                         "hypothesis_id": "H-unreferenced",
                         "statement": "attempted post-hoc confirmation",
                         "falsifier": None,
-                        "status": "confirmed",
+                        "status": "open",
                         "evidence_fact_ids": [fact_id],
                         "evidence_artifact_ids": [],
                         "evidence_run_ids": [],
@@ -8126,9 +9139,14 @@ class EngineTests(unittest.TestCase):
             if item.id == "H-unreferenced"
         )
         self.assertEqual(hypothesis.statement, "original statement")
-        self.assertIs(hypothesis.status, HypothesisStatus.REFUTED)
-        self.assertEqual(hypothesis.refuted_by, experiment_id)
-        self.assertIs(experiment.status, ExperimentStatus.DROPPED)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertIsNone(hypothesis.refuted_by)
+        self.assertIs(experiment.status, ExperimentStatus.INCONCLUSIVE)
+        admission = experiment.extra["semantic_evaluation_admission"]
+        self.assertEqual(admission["requested_status"], "dropped")
+        self.assertEqual(admission["applied_status"], "inconclusive")
+        self.assertIsNone(admission["contract_version"])
+        self.assertNotIn("H-existing", state.facts[-1].contradicts)
         self.assertEqual(
             unreferenced.statement,
             "unrelated open hypothesis",
@@ -10683,6 +11701,38 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(resumed.resume_status)
         self.assertIsNone(resumed.active_goal)
 
+    def test_explicit_resume_acknowledges_needs_human(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(self.identity, prompt="solve")
+        waiting = engine.transition(
+            self.identity,
+            ChallengeStatus.NEEDS_HUMAN,
+        )
+        self.assertIs(waiting.status, ChallengeStatus.NEEDS_HUMAN)
+
+        resumed = engine.resume(self.identity)
+
+        self.assertIs(resumed.status, ChallengeStatus.ACTIVE)
+        self.assertIsNone(resumed.resume_status)
+
+    def test_explicit_resume_acknowledges_stalled(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(self.identity, prompt="solve")
+        engine.transition(
+            self.identity,
+            ChallengeStatus.ACTIVE,
+        )
+        stalled = engine.transition(
+            self.identity,
+            ChallengeStatus.STALLED,
+        )
+        self.assertIs(stalled.status, ChallengeStatus.STALLED)
+
+        resumed = engine.resume(self.identity)
+
+        self.assertIs(resumed.status, ChallengeStatus.ACTIVE)
+        self.assertIsNone(resumed.resume_status)
+
     def test_session_boundary_recovers_orphaned_running_experiment(
         self,
     ) -> None:
@@ -12228,6 +13278,42 @@ class EngineTests(unittest.TestCase):
                 }
             ),
             1,
+        )
+
+    def test_wave_execution_timeout_starts_after_provider_admission(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                wave_deadline_s=10,
+            ),
+        )
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            budget_seconds=60,
+        )
+        started = time.monotonic()
+
+        outcome = engine.run_wave(self.identity, "discovery")
+
+        self.assertEqual(len(outcome.results), 3)
+        deadlines = {
+            result.invocation.deadline_monotonic_seconds
+            for result in outcome.results
+        }
+        self.assertEqual(len(deadlines), 1)
+        hard_deadline = deadlines.pop()
+        self.assertIsNotNone(hard_deadline)
+        assert hard_deadline is not None
+        self.assertGreater(hard_deadline - started, 50)
+        self.assertEqual(
+            {
+                result.invocation.timeout_seconds
+                for result in outcome.results
+            },
+            {10},
         )
 
     def test_batch_host_normalization_after_deadline_returns_failure(

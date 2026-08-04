@@ -122,6 +122,7 @@ class _TypedActionExecutor:
             payload["decision"] = {
                 "next_stage": "attack",
                 "reason": "route the typed deterministic category gate",
+                "selected_experiment": None,
             }
             payload["hypotheses"] = [
                 {

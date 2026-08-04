@@ -1087,6 +1087,18 @@ RUN set -eux; \
         grep -F 'QEMU emulator version' >/dev/null; \
     done
 
+# The engine runs challenge containers as the host uid. The global dotnet tool
+# shim installed below /root is otherwise present in the root-built manifest
+# but unreachable in production. Copy the complete tool store to a prefix
+# traversable by non-root users and prove the shim works as an unprivileged uid.
+RUN install -d -m 0755 /opt/dotnet-tools \
+ && cp -a /root/.dotnet/tools/. /opt/dotnet-tools/ \
+ && setpriv --reuid=65534 --regid=65534 --clear-groups \
+      env HOME=/tmp DOTNET_CLI_HOME=/tmp \
+      /opt/dotnet-tools/ilspycmd --version \
+      | grep -F "${ILSPYCMD_VER}"
+ENV PATH="/opt/dotnet-tools:${PATH}"
+
 # 래퍼·인덱스·잡 시스템 (별도 산출물)
 #   ctfwrap, ctf-bg, ctf-jobs, ctf-log, ctf-kill, ctf-idle, ctf-tools,
 #   ctf-flag, ctf-browser, ctf-web-probe, ctf-egress-proxy,
@@ -1117,10 +1129,11 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
       | jq -e '.found == true and .tool.available == true' >/dev/null \
  && /usr/local/bin/ctf-capabilities --json \
       | jq -e '.schema_version == 2 \
-          and (.capabilities | length == 34) \
+          and (.capabilities | length == 35) \
           and all(.capabilities[]; .available == true) \
           and ([.capabilities[] \
-              | select(.name == "pwn_crash_v1" \
+              | select(.name == "web_response_summary_v1" \
+                  or .name == "pwn_crash_v1" \
                   or .name == "pwn_runtime_snapshot_v1" \
                   or .name == "pwn_exploit_effect_v1" \
                   or .name == "pwn_interaction_v1" \
@@ -1130,7 +1143,7 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
                   or .name == "rev_runtime_exec_v1" \
                   or .name == "data_transcript_v1" \
                   or .name == "forensic_evidence_index_v1") \
-              | .attestation.schema_version] == [1, 1, 1, 1, 1, 1, 1, 1, 1, 1])' >/dev/null \
+              | .attestation.schema_version] == [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])' >/dev/null \
  && rm -f /tools/failed.txt
 
 # 실행 환경

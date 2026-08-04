@@ -50,6 +50,15 @@
       "module": "angr"
     },
     {
+      "name": "web_response_summary_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/web/request.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.web.response_summary",
+      "contract_version": 1,
+      "sha256": "861fb376828b218978d4853c34f17d44f8206fbb83f7f23b72e14decaebc3052"
+    },
+    {
       "name": "pwn_crash_v1",
       "kind": "file_sha256",
       "path": "/opt/ctf-templates/pwn/crash_oracle.py",

@@ -67,14 +67,14 @@ class ConfigTests(unittest.TestCase):
             config.runtime.storage_scan_max_bytes,
             256 * 1024 * 1024 * 1024,
         )
-        self.assertEqual(config.runtime.managed_wave_queue_reserve_s, 90.0)
+        self.assertEqual(config.runtime.managed_wave_queue_reserve_s, 900.0)
         self.assertEqual(
             config.runtime.managed_wave_role_call_reserve_s,
-            240.0,
+            1200.0,
         )
         self.assertEqual(
             config.runtime.managed_wave_action_commit_reserve_s,
-            180.0,
+            300.0,
         )
 
     def test_default_text_round_trips(self) -> None:
@@ -98,7 +98,16 @@ class ConfigTests(unittest.TestCase):
             "storage_scan_max_bytes = 274877906944",
             text,
         )
-        self.assertIn("managed_wave_queue_reserve_s = 90.0", text)
+        self.assertIn("managed_wave_queue_reserve_s = 900.0", text)
+        self.assertIn(
+            "managed_wave_role_call_reserve_s = 1200.0",
+            text,
+        )
+        self.assertIn(
+            "managed_wave_action_commit_reserve_s = 300.0",
+            text,
+        )
+        self.assertIn("fail-closed defaults are calibrated", text)
         self.assertIn(
             "Provider concurrency changes",
             text,

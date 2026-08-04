@@ -14,6 +14,9 @@ from collections.abc import Mapping
 MANAGED_WAVE_BUDGET_GUARD_KEY = "managed_wave_budget_guard_v1"
 MANAGED_WAVE_BUDGET_SCHEMA_VERSION = 1
 MANAGED_WAVE_BUDGET_PROTOCOL = "ctfos.managed_wave_budget.v1"
+MANAGED_WAVE_BUDGET_GUARD_V2_KEY = "managed_wave_budget_guard_v2"
+MANAGED_WAVE_BUDGET_V2_SCHEMA_VERSION = 2
+MANAGED_WAVE_BUDGET_V2_PROTOCOL = "ctfos.managed_wave_budget.v2"
 MANAGED_WAVE_LOGICAL_ROLE_COUNT = 3
 
 _WAVE_KINDS = frozenset({"discovery", "attack", "proof"})
@@ -37,6 +40,33 @@ _KEYS = frozenset(
         "provider_max_concurrent_calls",
         "provider_parallel_capacity",
         "serial_provider_batches",
+        "queue_reserve_ms",
+        "role_call_reserve_ms",
+        "action_commit_reserve_ms",
+        "minimum_required_ms",
+        "remaining_budget_ms",
+        "checked_state_revision",
+        "configuration_epoch",
+        "budget_mode",
+    }
+)
+_V2_KEYS = frozenset(
+    {
+        "schema_version",
+        "protocol",
+        "decision",
+        "reason_code",
+        "wave_kind",
+        "logical_role_count",
+        "provider_max_concurrent_calls",
+        "provider_snapshot_capacity",
+        "provider_snapshot_active",
+        "provider_snapshot_waiting",
+        "effective_provider_capacity",
+        "provider_parallel_capacity",
+        "serial_provider_batches",
+        "occupied_provider_batches",
+        "backlog_provider_batches",
         "queue_reserve_ms",
         "role_call_reserve_ms",
         "action_commit_reserve_ms",
@@ -98,6 +128,72 @@ def _remaining_seconds_to_ms(value: object) -> int | None:
     return math.floor(scaled)
 
 
+def _build_managed_wave_budget_guard_ms(
+    *,
+    wave_kind: str,
+    provider_max_concurrent_calls: int,
+    queue_reserve_ms: int,
+    role_call_reserve_ms: int,
+    action_commit_reserve_ms: int,
+    remaining_budget_ms: int | None,
+    checked_state_revision: int,
+    configuration_epoch: int,
+    budget_mode: str,
+) -> dict[str, object]:
+    """Build from already-canonical integer milliseconds."""
+
+    capacity = min(
+        provider_max_concurrent_calls,
+        MANAGED_WAVE_LOGICAL_ROLE_COUNT,
+    )
+    serial_batches = (
+        MANAGED_WAVE_LOGICAL_ROLE_COUNT + capacity - 1
+    ) // capacity
+    minimum_required_ms = (
+        queue_reserve_ms
+        + (serial_batches * role_call_reserve_ms)
+        + action_commit_reserve_ms
+    )
+
+    if remaining_budget_ms is None:
+        if budget_mode != "operator_unbounded":
+            raise ManagedWaveBudgetContractError(
+                "only operator_unbounded budget may omit remaining_seconds"
+            )
+        decision = "allow"
+        reason_code = "operator_unbounded"
+    elif budget_mode != "bounded":
+        raise ManagedWaveBudgetContractError(
+            "operator_unbounded budget cannot carry a finite remainder"
+        )
+    elif remaining_budget_ms >= minimum_required_ms:
+        decision = "allow"
+        reason_code = "sufficient_remaining_budget"
+    else:
+        decision = "pause"
+        reason_code = "insufficient_budget_for_wave"
+
+    return {
+        "schema_version": MANAGED_WAVE_BUDGET_SCHEMA_VERSION,
+        "protocol": MANAGED_WAVE_BUDGET_PROTOCOL,
+        "decision": decision,
+        "reason_code": reason_code,
+        "wave_kind": wave_kind,
+        "logical_role_count": MANAGED_WAVE_LOGICAL_ROLE_COUNT,
+        "provider_max_concurrent_calls": provider_max_concurrent_calls,
+        "provider_parallel_capacity": capacity,
+        "serial_provider_batches": serial_batches,
+        "queue_reserve_ms": queue_reserve_ms,
+        "role_call_reserve_ms": role_call_reserve_ms,
+        "action_commit_reserve_ms": action_commit_reserve_ms,
+        "minimum_required_ms": minimum_required_ms,
+        "remaining_budget_ms": remaining_budget_ms,
+        "checked_state_revision": checked_state_revision,
+        "configuration_epoch": configuration_epoch,
+        "budget_mode": budget_mode,
+    }
+
+
 def build_managed_wave_budget_guard(
     *,
     wave_kind: str,
@@ -148,20 +244,62 @@ def build_managed_wave_budget_guard(
         "action_commit_reserve_seconds",
     )
     remaining_ms = _remaining_seconds_to_ms(remaining_seconds)
-    capacity = min(
+    return _build_managed_wave_budget_guard_ms(
+        wave_kind=wave_kind,
+        provider_max_concurrent_calls=provider_max_concurrent_calls,
+        queue_reserve_ms=queue_ms,
+        role_call_reserve_ms=role_call_ms,
+        action_commit_reserve_ms=action_commit_ms,
+        remaining_budget_ms=remaining_ms,
+        checked_state_revision=checked_state_revision,
+        configuration_epoch=configuration_epoch,
+        budget_mode=budget_mode,
+    )
+
+
+def _build_managed_wave_budget_guard_v2_ms(
+    *,
+    wave_kind: str,
+    provider_max_concurrent_calls: int,
+    provider_snapshot_capacity: int,
+    provider_snapshot_active: int,
+    provider_snapshot_waiting: int,
+    queue_reserve_ms: int,
+    role_call_reserve_ms: int,
+    action_commit_reserve_ms: int,
+    remaining_budget_ms: int | None,
+    checked_state_revision: int,
+    configuration_epoch: int,
+    budget_mode: str,
+) -> dict[str, object]:
+    """Build a live-backlog-aware guard from canonical integer values."""
+
+    effective_capacity = min(
         provider_max_concurrent_calls,
+        provider_snapshot_capacity,
+    )
+    parallel_capacity = min(
+        effective_capacity,
         MANAGED_WAVE_LOGICAL_ROLE_COUNT,
     )
     serial_batches = (
-        MANAGED_WAVE_LOGICAL_ROLE_COUNT + capacity - 1
-    ) // capacity
+        MANAGED_WAVE_LOGICAL_ROLE_COUNT + effective_capacity - 1
+    ) // effective_capacity
+    occupied_batches = (
+        provider_snapshot_active
+        + provider_snapshot_waiting
+        + MANAGED_WAVE_LOGICAL_ROLE_COUNT
+        + effective_capacity
+        - 1
+    ) // effective_capacity
+    backlog_batches = occupied_batches - serial_batches
     minimum_required_ms = (
-        queue_ms
-        + (serial_batches * role_call_ms)
-        + action_commit_ms
+        queue_reserve_ms
+        + (occupied_batches * role_call_reserve_ms)
+        + action_commit_reserve_ms
     )
 
-    if remaining_ms is None:
+    if remaining_budget_ms is None:
         if budget_mode != "operator_unbounded":
             raise ManagedWaveBudgetContractError(
                 "only operator_unbounded budget may omit remaining_seconds"
@@ -172,7 +310,7 @@ def build_managed_wave_budget_guard(
         raise ManagedWaveBudgetContractError(
             "operator_unbounded budget cannot carry a finite remainder"
         )
-    elif remaining_ms >= minimum_required_ms:
+    elif remaining_budget_ms >= minimum_required_ms:
         decision = "allow"
         reason_code = "sufficient_remaining_budget"
     else:
@@ -180,26 +318,114 @@ def build_managed_wave_budget_guard(
         reason_code = "insufficient_budget_for_wave"
 
     return {
-        "schema_version": MANAGED_WAVE_BUDGET_SCHEMA_VERSION,
-        "protocol": MANAGED_WAVE_BUDGET_PROTOCOL,
+        "schema_version": MANAGED_WAVE_BUDGET_V2_SCHEMA_VERSION,
+        "protocol": MANAGED_WAVE_BUDGET_V2_PROTOCOL,
         "decision": decision,
         "reason_code": reason_code,
         "wave_kind": wave_kind,
         "logical_role_count": MANAGED_WAVE_LOGICAL_ROLE_COUNT,
-        "provider_max_concurrent_calls": (
-            provider_max_concurrent_calls
-        ),
-        "provider_parallel_capacity": capacity,
+        "provider_max_concurrent_calls": provider_max_concurrent_calls,
+        "provider_snapshot_capacity": provider_snapshot_capacity,
+        "provider_snapshot_active": provider_snapshot_active,
+        "provider_snapshot_waiting": provider_snapshot_waiting,
+        "effective_provider_capacity": effective_capacity,
+        "provider_parallel_capacity": parallel_capacity,
         "serial_provider_batches": serial_batches,
-        "queue_reserve_ms": queue_ms,
-        "role_call_reserve_ms": role_call_ms,
-        "action_commit_reserve_ms": action_commit_ms,
+        "occupied_provider_batches": occupied_batches,
+        "backlog_provider_batches": backlog_batches,
+        "queue_reserve_ms": queue_reserve_ms,
+        "role_call_reserve_ms": role_call_reserve_ms,
+        "action_commit_reserve_ms": action_commit_reserve_ms,
         "minimum_required_ms": minimum_required_ms,
-        "remaining_budget_ms": remaining_ms,
+        "remaining_budget_ms": remaining_budget_ms,
         "checked_state_revision": checked_state_revision,
         "configuration_epoch": configuration_epoch,
         "budget_mode": budget_mode,
     }
+
+
+def build_managed_wave_budget_guard_v2(
+    *,
+    wave_kind: str,
+    provider_max_concurrent_calls: int,
+    provider_snapshot_capacity: int,
+    provider_snapshot_active: int,
+    provider_snapshot_waiting: int,
+    queue_reserve_seconds: float,
+    role_call_reserve_seconds: float,
+    action_commit_reserve_seconds: float,
+    remaining_seconds: float | None,
+    checked_state_revision: int,
+    configuration_epoch: int,
+    budget_mode: str,
+) -> dict[str, object]:
+    """Build one conservative admission decision including live backlog."""
+
+    if wave_kind not in _WAVE_KINDS:
+        raise ManagedWaveBudgetContractError("wave_kind is unsupported")
+    if (
+        type(provider_max_concurrent_calls) is not int
+        or provider_max_concurrent_calls < 1
+    ):
+        raise ManagedWaveBudgetContractError(
+            "provider_max_concurrent_calls must be a positive integer"
+        )
+    if (
+        type(provider_snapshot_capacity) is not int
+        or provider_snapshot_capacity < 1
+    ):
+        raise ManagedWaveBudgetContractError(
+            "provider_snapshot_capacity must be a positive integer"
+        )
+    for value, label in (
+        (provider_snapshot_active, "provider_snapshot_active"),
+        (provider_snapshot_waiting, "provider_snapshot_waiting"),
+    ):
+        if type(value) is not int or value < 0:
+            raise ManagedWaveBudgetContractError(
+                f"{label} must be a non-negative integer"
+            )
+    if provider_snapshot_active > provider_snapshot_capacity:
+        raise ManagedWaveBudgetContractError(
+            "provider_snapshot_active exceeds provider_snapshot_capacity"
+        )
+    if (
+        type(checked_state_revision) is not int
+        or checked_state_revision < 0
+    ):
+        raise ManagedWaveBudgetContractError(
+            "checked_state_revision must be a non-negative integer"
+        )
+    if type(configuration_epoch) is not int or configuration_epoch < 0:
+        raise ManagedWaveBudgetContractError(
+            "configuration_epoch must be a non-negative integer"
+        )
+    if budget_mode not in _BUDGET_MODES:
+        raise ManagedWaveBudgetContractError("budget_mode is unsupported")
+
+    return _build_managed_wave_budget_guard_v2_ms(
+        wave_kind=wave_kind,
+        provider_max_concurrent_calls=provider_max_concurrent_calls,
+        provider_snapshot_capacity=provider_snapshot_capacity,
+        provider_snapshot_active=provider_snapshot_active,
+        provider_snapshot_waiting=provider_snapshot_waiting,
+        queue_reserve_ms=_positive_seconds_to_ms(
+            queue_reserve_seconds,
+            "queue_reserve_seconds",
+        ),
+        role_call_reserve_ms=_positive_seconds_to_ms(
+            role_call_reserve_seconds,
+            "role_call_reserve_seconds",
+        ),
+        action_commit_reserve_ms=_positive_seconds_to_ms(
+            action_commit_reserve_seconds,
+            "action_commit_reserve_seconds",
+        ),
+        remaining_budget_ms=_remaining_seconds_to_ms(remaining_seconds),
+        checked_state_revision=checked_state_revision,
+        configuration_epoch=configuration_epoch,
+        budget_mode=budget_mode,
+    )
 
 
 def managed_wave_budget_guard_errors(value: object) -> list[str]:
@@ -250,22 +476,18 @@ def managed_wave_budget_guard_errors(value: object) -> list[str]:
         return errors
 
     try:
-        expected = build_managed_wave_budget_guard(
+        expected = _build_managed_wave_budget_guard_ms(
             wave_kind=str(value["wave_kind"]),
             provider_max_concurrent_calls=int(
                 value["provider_max_concurrent_calls"]
             ),
-            queue_reserve_seconds=int(value["queue_reserve_ms"]) / 1000.0,
-            role_call_reserve_seconds=(
-                int(value["role_call_reserve_ms"]) / 1000.0
+            queue_reserve_ms=int(value["queue_reserve_ms"]),
+            role_call_reserve_ms=int(value["role_call_reserve_ms"]),
+            action_commit_reserve_ms=int(
+                value["action_commit_reserve_ms"]
             ),
-            action_commit_reserve_seconds=(
-                int(value["action_commit_reserve_ms"]) / 1000.0
-            ),
-            remaining_seconds=(
-                None
-                if remaining is None
-                else int(remaining) / 1000.0
+            remaining_budget_ms=(
+                None if remaining is None else int(remaining)
             ),
             checked_state_revision=int(value["checked_state_revision"]),
             configuration_epoch=int(value["configuration_epoch"]),
@@ -275,6 +497,106 @@ def managed_wave_budget_guard_errors(value: object) -> list[str]:
         return [str(error)]
     if dict(value) != expected:
         return ["managed wave budget guard math or decision is inconsistent"]
+    return []
+
+
+def managed_wave_budget_guard_v2_errors(value: object) -> list[str]:
+    """Return exact v2 errors, including the recorded backlog math."""
+
+    if not isinstance(value, Mapping):
+        return ["managed wave budget v2 guard must be an object"]
+    if set(value) != _V2_KEYS:
+        return ["managed wave budget v2 guard has unknown or missing fields"]
+    errors: list[str] = []
+    for field in (
+        "logical_role_count",
+        "provider_max_concurrent_calls",
+        "provider_snapshot_capacity",
+        "effective_provider_capacity",
+        "provider_parallel_capacity",
+        "serial_provider_batches",
+        "occupied_provider_batches",
+        "queue_reserve_ms",
+        "role_call_reserve_ms",
+        "action_commit_reserve_ms",
+        "minimum_required_ms",
+    ):
+        item = value.get(field)
+        if type(item) is not int or item < 1:
+            errors.append(f"{field} is invalid")
+    for field in (
+        "provider_snapshot_active",
+        "provider_snapshot_waiting",
+        "backlog_provider_batches",
+        "checked_state_revision",
+        "configuration_epoch",
+    ):
+        item = value.get(field)
+        if type(item) is not int or item < 0:
+            errors.append(f"{field} is invalid")
+    remaining = value.get("remaining_budget_ms")
+    if remaining is not None and (
+        type(remaining) is not int or remaining < 0
+    ):
+        errors.append("remaining_budget_ms is invalid")
+    if value.get("schema_version") != MANAGED_WAVE_BUDGET_V2_SCHEMA_VERSION:
+        errors.append("schema_version is invalid")
+    if value.get("protocol") != MANAGED_WAVE_BUDGET_V2_PROTOCOL:
+        errors.append("protocol is invalid")
+    if value.get("wave_kind") not in _WAVE_KINDS:
+        errors.append("wave_kind is invalid")
+    if value.get("budget_mode") not in _BUDGET_MODES:
+        errors.append("budget_mode is invalid")
+    if value.get("decision") not in _DECISIONS:
+        errors.append("decision is invalid")
+    if value.get("reason_code") not in _REASONS:
+        errors.append("reason_code is invalid")
+    active = value.get("provider_snapshot_active")
+    snapshot_capacity = value.get("provider_snapshot_capacity")
+    if (
+        type(active) is int
+        and type(snapshot_capacity) is int
+        and active > snapshot_capacity
+    ):
+        errors.append(
+            "provider_snapshot_active exceeds provider_snapshot_capacity"
+        )
+    if errors:
+        return errors
+
+    try:
+        expected = _build_managed_wave_budget_guard_v2_ms(
+            wave_kind=str(value["wave_kind"]),
+            provider_max_concurrent_calls=int(
+                value["provider_max_concurrent_calls"]
+            ),
+            provider_snapshot_capacity=int(
+                value["provider_snapshot_capacity"]
+            ),
+            provider_snapshot_active=int(
+                value["provider_snapshot_active"]
+            ),
+            provider_snapshot_waiting=int(
+                value["provider_snapshot_waiting"]
+            ),
+            queue_reserve_ms=int(value["queue_reserve_ms"]),
+            role_call_reserve_ms=int(value["role_call_reserve_ms"]),
+            action_commit_reserve_ms=int(
+                value["action_commit_reserve_ms"]
+            ),
+            remaining_budget_ms=(
+                None if remaining is None else int(remaining)
+            ),
+            checked_state_revision=int(value["checked_state_revision"]),
+            configuration_epoch=int(value["configuration_epoch"]),
+            budget_mode=str(value["budget_mode"]),
+        )
+    except ManagedWaveBudgetContractError as error:
+        return [str(error)]
+    if dict(value) != expected:
+        return [
+            "managed wave budget v2 guard math or decision is inconsistent"
+        ]
     return []
 
 
@@ -304,15 +626,26 @@ def managed_wave_budget_state_errors(state: object) -> list[str]:
     for cycle in cycles:
         cycle_id = getattr(cycle, "id", "")
         extra = getattr(cycle, "extra", {})
-        audit = (
-            extra.get(MANAGED_WAVE_BUDGET_GUARD_KEY)
-            if isinstance(extra, Mapping)
-            else None
-        )
-        if audit is None:
+        v1_audit = None
+        v2_audit = None
+        if isinstance(extra, Mapping):
+            v1_audit = extra.get(MANAGED_WAVE_BUDGET_GUARD_KEY)
+            v2_audit = extra.get(MANAGED_WAVE_BUDGET_GUARD_V2_KEY)
+        if v1_audit is None and v2_audit is None:
             continue
         guarded_cycle_ids.add(cycle_id)
-        issues = managed_wave_budget_guard_errors(audit)
+        if v1_audit is not None and v2_audit is not None:
+            errors.append(
+                f"cycle {cycle_id} has both v1 and v2 managed wave "
+                "budget guards"
+            )
+            continue
+        audit = v2_audit if v2_audit is not None else v1_audit
+        issues = (
+            managed_wave_budget_guard_v2_errors(audit)
+            if v2_audit is not None
+            else managed_wave_budget_guard_errors(audit)
+        )
         if issues:
             errors.append(
                 f"cycle {cycle_id} has invalid managed wave budget guard: "
@@ -456,11 +789,16 @@ def managed_wave_budget_state_errors(state: object) -> list[str]:
 
 __all__ = [
     "MANAGED_WAVE_BUDGET_GUARD_KEY",
+    "MANAGED_WAVE_BUDGET_GUARD_V2_KEY",
     "MANAGED_WAVE_BUDGET_PROTOCOL",
     "MANAGED_WAVE_BUDGET_SCHEMA_VERSION",
+    "MANAGED_WAVE_BUDGET_V2_PROTOCOL",
+    "MANAGED_WAVE_BUDGET_V2_SCHEMA_VERSION",
     "MANAGED_WAVE_LOGICAL_ROLE_COUNT",
     "ManagedWaveBudgetContractError",
     "build_managed_wave_budget_guard",
+    "build_managed_wave_budget_guard_v2",
     "managed_wave_budget_guard_errors",
+    "managed_wave_budget_guard_v2_errors",
     "managed_wave_budget_state_errors",
 ]

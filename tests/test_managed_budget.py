@@ -116,6 +116,67 @@ class ManagedWaveBudgetContractTests(unittest.TestCase):
                     managed_wave_budget_guard_errors(mutated)
                 )
 
+    def test_validator_uses_exact_canonical_milliseconds(self):
+        # 512.012 cannot be represented exactly as a binary float.  The
+        # conservative builder records 512011ms; converting that integer back
+        # through float seconds used to floor it again and reject its own
+        # output as inconsistent.
+        audit = self.build(remaining_seconds=512.012)
+        self.assertEqual(audit["remaining_budget_ms"], 512_011)
+        self.assertEqual(managed_wave_budget_guard_errors(audit), [])
+
+    def test_float_boundary_outputs_always_validate_exactly(self):
+        # Exhaust every millisecond residue at representative binary-float
+        # boundaries, including the live 512.012s failure region.  Probe both
+        # adjacent floats so required reserves (ceil) and remainder (floor)
+        # cannot acquire a second rounding step during validation.
+        for base_ms in (128_000, 512_000, 1_024_000, 1_799_000):
+            for offset_ms in range(1_000):
+                seconds = (base_ms + offset_ms) / 1000.0
+                for sample in (
+                    math.nextafter(seconds, -math.inf),
+                    seconds,
+                    math.nextafter(seconds, math.inf),
+                ):
+                    audit = self.build(remaining_seconds=sample)
+                    self.assertEqual(
+                        managed_wave_budget_guard_errors(audit),
+                        [],
+                        ("remaining_seconds", base_ms + offset_ms, sample),
+                    )
+
+        for field in (
+            "queue_reserve_seconds",
+            "role_call_reserve_seconds",
+            "action_commit_reserve_seconds",
+        ):
+            for offset_ms in range(1_000):
+                milliseconds = 128_000 + offset_ms
+                seconds = milliseconds / 1000.0
+                for sample in (
+                    math.nextafter(seconds, -math.inf),
+                    seconds,
+                    math.nextafter(seconds, math.inf),
+                ):
+                    kwargs = {
+                        "wave_kind": "attack",
+                        "provider_max_concurrent_calls": 3,
+                        "queue_reserve_seconds": 90.0,
+                        "role_call_reserve_seconds": 240.0,
+                        "action_commit_reserve_seconds": 180.0,
+                        "remaining_seconds": 2_000.0,
+                        "checked_state_revision": 17,
+                        "configuration_epoch": 4,
+                        "budget_mode": "bounded",
+                    }
+                    kwargs[field] = sample
+                    audit = build_managed_wave_budget_guard(**kwargs)
+                    self.assertEqual(
+                        managed_wave_budget_guard_errors(audit),
+                        [],
+                        (field, milliseconds, sample),
+                    )
+
     def test_unknown_fields_and_nonfinite_reserves_fail_closed(self):
         audit = self.build()
         audit["surprise"] = True

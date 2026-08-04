@@ -33,13 +33,21 @@ from ctf_os.engine.challenge import (
     SessionAlreadyRunning,
     _proof_argv_contains_credential_material,
 )
+from ctf_os.engine.checkpoint_projection import (
+    checkpoint_action_reference,
+    managed_registered_selection_binding,
+)
 from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.engine.resume_capsule import (
     ResumeCapsulePolicy,
     render_resume_capsule,
 )
 from ctf_os.lifecycle import close_challenge, create_checkpoint
-from ctf_os.managed import ManagedError, ManagedOrchestrator
+from ctf_os.managed import (
+    ManagedError,
+    ManagedOrchestrator,
+    ManagedRegisteredExperimentReferenceError,
+)
 from ctf_os.migration import (
     apply_migration,
     plan_migration,
@@ -53,16 +61,25 @@ from ctf_os.models import (
     Experiment,
     ExperimentKind,
     ExperimentStatus,
+    Fact,
     Falsifier,
     Hypothesis,
+    HypothesisStatus,
+    ManagedCycle,
+    ManagedWave,
     ModelValidationError,
+    Provenance,
     RunOrigin,
     RunReference,
     RunStatus,
     SessionStatus,
+    WaveKind,
 )
 from ctf_os.sandbox import SandboxResult
-from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.schema import (
+    RUN_ENVELOPE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+)
 from ctf_os.storage import (
     quarantine_unreachable,
     restore_quarantine,
@@ -80,6 +97,7 @@ from ctf_os.store.atomic import (
     read_json,
     strict_json_loads,
 )
+from ctf_os.store.files import sha256_file
 from ctf_os.workspace_publish import (
     publish_builder_file,
     reconcile_workspace_publishes,
@@ -95,6 +113,19 @@ from tests.test_engine import (
 
 
 IMAGE_DIGEST = "sha256:" + "b" * 64
+CANONICAL_REFERENCE_PAYLOAD = b"canonical managed evidence\n"
+CANONICAL_REFERENCE_ID = "A-existing-canonical-evidence"
+CANONICAL_REFERENCE_PATH = (
+    f"artifacts/snapshots/{CANONICAL_REFERENCE_ID}.log"
+)
+CANONICAL_REFERENCE_SHA256 = hashlib.sha256(
+    CANONICAL_REFERENCE_PAYLOAD
+).hexdigest()
+BUILDER_SOLVER_PAYLOAD = (
+    b"#!/usr/bin/env python3\n"
+    b"print('immutable builder solver reached')\n"
+)
+MUTATED_BUILDER_SOLVER_PAYLOAD = b"print('mutable source changed')\n"
 
 
 class ProbeRoleExecutor:
@@ -181,6 +212,7 @@ class ProbeRoleExecutor:
             if contract_version == 2:
                 payload["schema_version"] = 2
                 if role is Role.CAPTAIN:
+                    payload["decision"]["selected_experiment"] = None
                     hypothesis_count = (
                         len(self.captain_hypothesis_ids)
                         if self.captain_hypothesis_ids is not None
@@ -354,6 +386,101 @@ class ProbeRoleExecutor:
         finally:
             with self.lock:
                 self.active -= 1
+
+
+class CanonicalArtifactEchoExecutor(ProbeRoleExecutor):
+    """Have the Captain repeat one supplied artifact binding."""
+
+    def __init__(self, *, path: str, sha256: str) -> None:
+        super().__init__()
+        self.path = path
+        self.sha256 = sha256
+
+    def _prepare_output_payload(
+        self,
+        *,
+        command,
+        cwd,
+        role: Role,
+        payload: dict[str, object],
+    ) -> None:
+        del command, cwd
+        if role is Role.CAPTAIN:
+            payload["artifacts"] = [
+                {
+                    "path": self.path,
+                    "sha256": self.sha256,
+                    "purpose": "existing canonical evidence",
+                }
+            ]
+
+
+class BuilderPublicationExecutor(ProbeRoleExecutor):
+    """Publish one Builder solver and execute it as a generic action."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            command_by_role={Role.BUILDER: "python3 solver.py"},
+        )
+        self.solver_path: Path | None = None
+
+    def _prepare_output_payload(
+        self,
+        *,
+        command,
+        cwd,
+        role: Role,
+        payload: dict[str, object],
+    ) -> None:
+        del command
+        if role is not Role.BUILDER:
+            return
+        self.solver_path = Path(cwd) / "solver.py"
+        self.solver_path.write_bytes(BUILDER_SOLVER_PAYLOAD)
+        payload["artifacts"] = [
+            {
+                "path": "solver.py",
+                "sha256": hashlib.sha256(
+                    BUILDER_SOLVER_PAYLOAD
+                ).hexdigest(),
+                "purpose": "generic action solver",
+            }
+        ]
+
+
+class BuilderPublicationSandbox(FakeSandbox):
+    """Mutate the model workspace, then observe the isolated action input."""
+
+    def __init__(
+        self,
+        work: Path,
+        executor: BuilderPublicationExecutor,
+    ) -> None:
+        super().__init__(work)
+        self.executor = executor
+        self.observed_solver: bytes | None = None
+        self.builder_action_calls = 0
+
+    def initialize_workspace(self, *, deadline_monotonic_seconds=None):
+        super().initialize_workspace(
+            deadline_monotonic_seconds=deadline_monotonic_seconds
+        )
+        source = self.executor.solver_path
+        if source is not None:
+            source.write_bytes(MUTATED_BUILDER_SOLVER_PAYLOAD)
+
+    def run(self, spec):
+        if (
+            spec.argv[:2] == ("/bin/sh", "-lc")
+            and spec.argv[2]
+            in {"python3 solver.py", "python3 /work/solver.py"}
+        ):
+            self.builder_action_calls += 1
+            solver = self.work / "solver.py"
+            self.observed_solver = (
+                solver.read_bytes() if solver.is_file() else None
+            )
+        return super().run(spec)
 
 
 class ToolConcurrency:
@@ -753,6 +880,36 @@ class ManagedV2Tests(unittest.TestCase):
             prompt="solve this one challenge",
             state_schema_version=STATE_SCHEMA_VERSION,
         )
+
+    def seed_canonical_artifact(
+        self,
+        engine: ChallengeEngine,
+    ) -> ArtifactReference:
+        destination = (
+            engine.store.challenge_paths(self.identity).root
+            / CANONICAL_REFERENCE_PATH
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(CANONICAL_REFERENCE_PAYLOAD)
+        destination.chmod(0o400)
+        reference = ArtifactReference(
+            id=CANONICAL_REFERENCE_ID,
+            path=CANONICAL_REFERENCE_PATH,
+            sha256=CANONICAL_REFERENCE_SHA256,
+            size=len(CANONICAL_REFERENCE_PAYLOAD),
+            extra={"purpose": "existing canonical evidence"},
+        )
+        current = engine.store.load(self.identity)
+
+        def seed(state):
+            state.artifacts.append(copy.deepcopy(reference))
+
+        engine.store.update(
+            self.identity,
+            seed,
+            expected_revision=current.revision,
+        )
+        return reference
 
     def test_preflight_passes_category_requirements_to_production_probe(self):
         engine = self.engine(ProbeRoleExecutor())
@@ -2484,6 +2641,11 @@ class ManagedV2Tests(unittest.TestCase):
             "exactly one valid engine-bound replay recipe",
             state.checkpoints[-1].note or "",
         )
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(capsule.reason_code, "proof_recipe_invalid")
+        self.assertEqual(state.waves[-1].status, "invalid")
         self.assertEqual(state.status, ChallengeStatus.TRIAGING)
         self.assertIsNotNone(state.active_managed_session_id)
         self.assertEqual(state.sessions[-1].status, SessionStatus.RUNNING)
@@ -2881,6 +3043,102 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertEqual(session.status, SessionStatus.COMPLETED)
         self.assertIn("terminal challenge", session.stop_reason or "")
 
+    def test_managed_checkpoint_does_not_duplicate_large_command(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        large_argument = "M" * 16_000
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", large_argument),
+            expected_observation="a bounded observation",
+            keep_if="the observation advances the goal",
+            drop_if="the observation is absent",
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+
+        checkpointed = orchestrator._checkpoint(
+            self.identity,
+            session_id,
+            cycle.id,
+            note="bounded action projection",
+        )
+
+        experiment = next(
+            item
+            for item in checkpointed.experiments
+            if item.id == experiment_id
+        )
+        checkpoint = checkpointed.checkpoints[-1]
+        self.assertIn(
+            checkpoint_action_reference(experiment),
+            checkpoint.next_actions,
+        )
+        rendered = canonical_json_record(checkpoint.to_dict())
+        self.assertNotIn(large_argument, rendered)
+        self.assertLess(len(rendered.encode("ascii")), 2_000)
+
+    def test_reconcile_is_noop_for_idle_open_session_with_completed_cycle(
+        self,
+    ) -> None:
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        current = engine.store.load(self.identity)
+
+        def add_completed_cycle(state):
+            state.cycles.append(
+                ManagedCycle(
+                    id="MC-idle-completed",
+                    session_id=session_id,
+                    ordinal=1,
+                    phase="completed",
+                    configuration_epoch=state.configuration_epoch,
+                    completed_at="2026-08-03T00:00:00Z",
+                )
+            )
+
+        before = engine.store.update(
+            self.identity,
+            add_completed_cycle,
+            expected_revision=current.revision,
+        )
+
+        locked_before, recovered = orchestrator.reconcile_explicit(
+            self.identity
+        )
+
+        self.assertEqual(locked_before.to_dict(), before.to_dict())
+        self.assertEqual(recovered.to_dict(), before.to_dict())
+        self.assertEqual(recovered.revision, before.revision)
+        self.assertEqual(
+            recovered.active_managed_session_id,
+            session_id,
+        )
+        session = next(
+            item for item in recovered.sessions if item.id == session_id
+        )
+        self.assertIs(session.status, SessionStatus.RUNNING)
+        self.assertEqual(executor.roles, [])
+
     def test_managed_public_wrappers_refresh_empty_init_before_cartography(
         self,
     ) -> None:
@@ -3013,13 +3271,23 @@ class ManagedV2Tests(unittest.TestCase):
                 )
                 self.assertTrue(
                     any(
-                        argv and argv[0] == "objdump"
+                        (argv and argv[0] == "objdump")
+                        or (
+                            len(argv) >= 3
+                            and argv[:2] == ("/bin/sh", "-lc")
+                            and "/usr/bin/objdump -d --" in argv[2]
+                        )
                         for argv in pre_captain_argv
                     )
                 )
                 self.assertTrue(
                     any(
-                        argv and argv[0] == "ctfwrap"
+                        (argv and argv[0] == "ctfwrap")
+                        or (
+                            len(argv) >= 3
+                            and argv[:2] == ("/bin/sh", "-lc")
+                            and "ctfwrap --" in argv[2]
+                        )
                         for argv in pre_captain_argv
                     )
                 )
@@ -3057,7 +3325,7 @@ class ManagedV2Tests(unittest.TestCase):
             for experiment in state.experiments
             if experiment.extra.get("adapter_seed") is True
         ]
-        self.assertEqual(len(legacy_ids), 2)
+        self.assertEqual(len(legacy_ids), 3)
 
         def make_legacy_plan_stale(current):
             current.metadata["adapter_primary_source"] = "libc-2.23.so"
@@ -3110,7 +3378,7 @@ class ManagedV2Tests(unittest.TestCase):
                 and experiment.id not in legacy_ids
             )
         ]
-        self.assertEqual(len(bound), 2)
+        self.assertEqual(len(bound), 3)
         self.assertTrue(
             all(
                 experiment.status is ExperimentStatus.REGISTERED
@@ -3190,6 +3458,125 @@ class ManagedV2Tests(unittest.TestCase):
             )
         )
 
+    def test_managed_sync_replaces_legacy_nyu_metadata_primary_seeds(
+        self,
+    ) -> None:
+        engine = self.engine(ProbeRoleExecutor())
+        cases = (
+            ("crypto", "README.md"),
+            ("forensics", "qr_code.txt"),
+            ("misc", "output"),
+        )
+        for category, handout_name in cases:
+            with self.subTest(category=category):
+                identity = ChallengeIdentity(
+                    "Managed CTF",
+                    category,
+                    f"legacy-nyu-metadata-primary-{category}",
+                )
+                incoming = (
+                    self.root
+                    / "incoming"
+                    / identity.contest_id
+                    / identity.category
+                    / identity.challenge_id
+                )
+                incoming.mkdir(parents=True)
+                (incoming / "nyu_public_metadata.json").write_text(
+                    '{"case_id":"public-provenance"}\n',
+                    encoding="utf-8",
+                )
+                (incoming / handout_name).write_text(
+                    "public challenge handout\n",
+                    encoding="utf-8",
+                )
+                state = engine.add_challenge(
+                    identity,
+                    prompt="solve the selected challenge",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                legacy_ids = {
+                    experiment.id
+                    for experiment in state.experiments
+                    if experiment.extra.get("adapter_seed") is True
+                }
+                self.assertTrue(legacy_ids)
+                self.assertEqual(
+                    state.metadata["adapter_primary_source"],
+                    handout_name,
+                )
+
+                def restore_legacy_metadata_binding(current):
+                    current.metadata["adapter_primary_source"] = (
+                        "nyu_public_metadata.json"
+                    )
+                    for experiment in current.experiments:
+                        if experiment.id not in legacy_ids:
+                            continue
+                        experiment.command = experiment.command.replace(
+                            f"/challenge/{handout_name}",
+                            "/challenge/nyu_public_metadata.json",
+                        )
+
+                engine.store.update(
+                    identity,
+                    restore_legacy_metadata_binding,
+                )
+                orchestrator = ManagedOrchestrator(
+                    engine,
+                    capability_probe=self.capability,
+                )
+                _state, session_id = orchestrator._reserve_session(
+                    identity,
+                    f"S-rebind-public-handout-{category}",
+                )
+
+                synchronized = (
+                    engine.synchronize_managed_adapter_seed_plan(
+                        identity,
+                        session_id,
+                    )
+                )
+
+                old = [
+                    experiment
+                    for experiment in synchronized.experiments
+                    if experiment.id in legacy_ids
+                ]
+                self.assertTrue(
+                    all(
+                        experiment.status
+                        is ExperimentStatus.CANCELLED
+                        for experiment in old
+                    )
+                )
+                replacement = [
+                    experiment
+                    for experiment in synchronized.experiments
+                    if (
+                        experiment.extra.get("adapter_seed") is True
+                        and experiment.id not in legacy_ids
+                    )
+                ]
+                self.assertEqual(
+                    len(replacement),
+                    len(legacy_ids),
+                )
+                self.assertTrue(
+                    all(
+                        experiment.status
+                        is ExperimentStatus.REGISTERED
+                        and experiment.extra["source_binding"]["path"]
+                        == handout_name
+                        for experiment in replacement
+                    )
+                )
+                self.assertEqual(
+                    synchronized.metadata["adapter_primary_source"],
+                    handout_name,
+                )
+                self.assertFalse(synchronized.runs)
+
     def test_managed_model_commands_preserve_exact_posix_shell_scripts(
         self,
     ) -> None:
@@ -3252,6 +3639,10 @@ class ManagedV2Tests(unittest.TestCase):
                 == ("/bin/sh", "-lc")
                 and experiment.command
                 == shlex.join(tuple(shlex.split(experiment.command)))
+                and experiment.extra.get(
+                    "managed_semantic_evaluation_contract_version"
+                )
+                == 2
                 for experiment in managed_commands
             )
         )
@@ -3263,6 +3654,1183 @@ class ManagedV2Tests(unittest.TestCase):
         }
         self.assertIn(heredoc, executed_scripts)
         self.assertIn(multiline, executed_scripts)
+
+    def test_managed_builder_publication_is_staged_as_exact_action_input(
+        self,
+    ) -> None:
+        executor = BuilderPublicationExecutor()
+        sandboxes: list[BuilderPublicationSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = BuilderPublicationSandbox(work, executor)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        builder_run = next(
+            run
+            for run in state.runs
+            if run.role == Role.BUILDER.value
+            and run.origin is RunOrigin.MANAGED_MODEL
+        )
+        publication = next(
+            artifact
+            for artifact in state.artifacts
+            if artifact.source_run_id == builder_run.id
+            and artifact.extra.get("source_locator") == "solver.py"
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.source_run_id == builder_run.id
+            and item.extra.get("managed_action_input_binding") is not None
+        )
+        binding = experiment.extra["managed_action_input_binding"]
+        self.assertEqual(binding["protocol"], "same_run_publications_v1")
+        self.assertEqual(binding["source_run_id"], builder_run.id)
+        self.assertEqual(binding["total_bytes"], len(BUILDER_SOLVER_PAYLOAD))
+        self.assertEqual(
+            binding["artifacts"],
+            [
+                {
+                    "artifact_id": publication.id,
+                    "canonical_path": publication.path,
+                    "destination": "solver.py",
+                    "sha256": publication.sha256,
+                    "size_bytes": publication.size,
+                    "source_run_id": builder_run.id,
+                }
+            ],
+        )
+        self.assertIn(publication.id, experiment.artifact_ids)
+
+        action_sandbox = next(
+            sandbox
+            for sandbox in sandboxes
+            if sandbox.builder_action_calls
+        )
+        self.assertEqual(action_sandbox.initializations, 1)
+        self.assertEqual(
+            action_sandbox.observed_solver,
+            BUILDER_SOLVER_PAYLOAD,
+        )
+
+        self.assertEqual(
+            executor.solver_path.read_bytes(),
+            MUTATED_BUILDER_SOLVER_PAYLOAD,
+        )
+        paths = engine.store.challenge_paths(self.identity)
+        snapshot = paths.root / publication.path
+        self.assertEqual(snapshot.read_bytes(), BUILDER_SOLVER_PAYLOAD)
+        tool_run = next(
+            run
+            for run in state.runs
+            if run.extra.get("experiment_id") == experiment.id
+        )
+        self.assertEqual(
+            tool_run.extra["managed_action_input_binding"],
+            binding,
+        )
+        request = read_json(paths.root / str(tool_run.request_path))
+        self.assertEqual(request["managed_action_input_binding"], binding)
+
+        resolved = engine._resolve_managed_action_inputs(
+            state,
+            experiment,
+        )
+        tamper_work = paths.runtime / "test-managed-input-tamper"
+        tamper_work.mkdir(mode=0o700)
+        snapshot.chmod(0o600)
+        snapshot.write_bytes(b"X" * len(BUILDER_SOLVER_PAYLOAD))
+        snapshot.chmod(0o400)
+        try:
+            with self.assertRaisesRegex(
+                EngineError,
+                "could not be staged safely",
+            ):
+                engine._stage_managed_action_inputs(
+                    state,
+                    experiment,
+                    tamper_work,
+                    resolved,
+                )
+        finally:
+            snapshot.chmod(0o600)
+            snapshot.write_bytes(BUILDER_SOLVER_PAYLOAD)
+            snapshot.chmod(0o400)
+        self.assertFalse((tamper_work / "solver.py").exists())
+
+        collision_work = paths.runtime / "test-managed-input-collision"
+        collision_work.mkdir(mode=0o700)
+        collision = collision_work / "solver.py"
+        collision.write_bytes(b"initialized challenge owns this path")
+        with self.assertRaisesRegex(EngineError, "would overwrite"):
+            engine._stage_managed_action_inputs(
+                state,
+                experiment,
+                collision_work,
+                resolved,
+            )
+        self.assertEqual(
+            collision.read_bytes(),
+            b"initialized challenge owns this path",
+        )
+
+    def test_managed_absolute_work_input_requires_same_run_publication(
+        self,
+    ) -> None:
+        executor = ProbeRoleExecutor(
+            command_by_role={
+                Role.BUILDER: "python3 /work/prior-run-solver.py",
+            }
+        )
+        sandboxes: list[FakeSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = FakeSandbox(work)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        builder_run = next(
+            run
+            for run in state.runs
+            if run.role == Role.BUILDER.value
+            and run.origin is RunOrigin.MANAGED_MODEL
+        )
+        self.assertFalse(
+            any(
+                item.source_run_id == builder_run.id
+                and item.extra.get("managed_command_protocol")
+                == "posix_sh_lc_v1"
+                for item in state.experiments
+            )
+        )
+        self.assertTrue(
+            any(
+                "absolute /work input without a same-run publication binding"
+                in str(item.get("reason", ""))
+                for item in builder_run.extra.get("rejected_actions", [])
+            )
+        )
+        self.assertFalse(
+            any(
+                spec.argv[:2] == ("/bin/sh", "-lc")
+                and "/work/prior-run-solver.py" in spec.argv[2]
+                for sandbox in sandboxes
+                for spec in sandbox.specs
+            )
+        )
+
+    def test_managed_absolute_work_input_rejects_prior_run_publication(
+        self,
+    ) -> None:
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        payload = b"print('prior run must remain unavailable')\n"
+        prior_artifact = ArtifactReference(
+            id="A-prior-run-solver",
+            path="artifacts/snapshots/A-prior-run-solver.py",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            source_run_id="MR-prior-builder",
+            size=len(payload),
+            extra={"source_locator": "prior-run-solver.py"},
+        )
+        snapshot = (
+            engine.store.challenge_paths(self.identity).root
+            / prior_artifact.path
+        )
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_bytes(payload)
+        snapshot.chmod(0o400)
+
+        def seed_prior_publication(state):
+            state.runs.append(
+                RunReference(
+                    id="MR-prior-builder",
+                    base_revision=state.revision,
+                    status=RunStatus.CREATED,
+                    role=Role.BUILDER.value,
+                    origin=RunOrigin.MANAGED_MODEL,
+                    configuration_epoch=state.configuration_epoch,
+                )
+            )
+            state.artifacts.append(prior_artifact)
+
+        state = engine.store.update(
+            self.identity,
+            seed_prior_publication,
+        )
+        canonical_prior = next(
+            item for item in state.artifacts if item.id == prior_artifact.id
+        )
+
+        with self.assertRaisesRegex(
+            EngineError,
+            "not a bounded immutable same-run artifact",
+        ):
+            engine._managed_action_inputs(
+                "MR-current-builder",
+                (canonical_prior,),
+            )
+
+        after = engine.store.load(self.identity)
+        self.assertEqual(after.revision, state.revision)
+        self.assertEqual(after.artifacts, state.artifacts)
+
+    def test_managed_absolute_work_input_accepts_same_run_publication(
+        self,
+    ) -> None:
+        executor = BuilderPublicationExecutor()
+        executor.command_by_role[Role.BUILDER] = (
+            "python3 /work/solver.py"
+        )
+        sandboxes: list[BuilderPublicationSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = BuilderPublicationSandbox(work, executor)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        builder_run = next(
+            run
+            for run in state.runs
+            if run.role == Role.BUILDER.value
+            and run.origin is RunOrigin.MANAGED_MODEL
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.source_run_id == builder_run.id
+            and item.extra.get("managed_action_input_binding") is not None
+        )
+        self.assertEqual(
+            shlex.split(experiment.command)[2],
+            "python3 /work/solver.py",
+        )
+        action_sandbox = next(
+            sandbox
+            for sandbox in sandboxes
+            if sandbox.builder_action_calls
+        )
+        self.assertEqual(
+            action_sandbox.observed_solver,
+            BUILDER_SOLVER_PAYLOAD,
+        )
+
+    def test_bound_builder_action_precedes_timeout_tiebreak(self) -> None:
+        engine = self.engine(ProbeRoleExecutor())
+        state = self.add_v2(engine)
+        hypothesis_id = "H-action-priority"
+        state.hypotheses.append(
+            Hypothesis(
+                id=hypothesis_id,
+                statement="one shared strategic hypothesis",
+                falsifier=Falsifier(description="run a bounded check"),
+            )
+        )
+        cycle = ManagedCycle(
+            id="MC-action-priority",
+            session_id="S-action-priority",
+            ordinal=1,
+            phase="wave_reserved",
+            configuration_epoch=state.configuration_epoch,
+            captain_run_id="MR-captain",
+            wave_id="MW-action-priority",
+        )
+        wave = ManagedWave(
+            id="MW-action-priority",
+            session_id=cycle.session_id,
+            cycle_id=cycle.id,
+            kind=WaveKind.ATTACK,
+            role_run_ids={
+                Role.BUILDER.value: "MR-builder",
+                Role.FALSIFIER.value: "MR-falsifier",
+                Role.REPRODUCER.value: "MR-reproducer",
+            },
+            snapshot_revision=state.revision,
+            configuration_epoch=state.configuration_epoch,
+        )
+        state.cycles.append(cycle)
+        state.waves.append(wave)
+
+        def action(
+            experiment_id: str,
+            source_run_id: str,
+            timeout_seconds: int,
+            *,
+            extra: dict[str, object] | None = None,
+        ) -> Experiment:
+            return Experiment(
+                id=experiment_id,
+                hypothesis_ids=[hypothesis_id],
+                command=f"printf '%s\\n' {experiment_id}",
+                expected_observation="a bounded discriminating result",
+                keep_if="the result supports the hypothesis",
+                drop_if="the result refutes the hypothesis",
+                timeout_seconds=timeout_seconds,
+                source_run_id=source_run_id,
+                extra=dict(extra or {}),
+            )
+
+        builder = action(
+            "E-builder-bound",
+            "MR-builder",
+            300,
+            extra={
+                "managed_command_protocol": "posix_sh_lc_v1",
+                "managed_action_input_binding": {
+                    "schema_version": 1,
+                    "protocol": "same_run_publications_v1",
+                    "source_run_id": "MR-builder",
+                    "artifacts": [{"artifact_id": "A-builder-solver"}],
+                    "total_bytes": 1,
+                },
+            },
+        )
+        state.experiments.extend(
+            [
+                action("E-falsifier-fast", "MR-falsifier", 30),
+                action("E-captain", "MR-captain", 90),
+                action("E-reproducer", "MR-reproducer", 120),
+                builder,
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-builder-bound",
+                "E-falsifier-fast",
+                "E-captain",
+            ),
+        )
+
+        builder.extra.clear()
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-falsifier-fast",
+                "E-captain",
+                "E-reproducer",
+            ),
+        )
+
+    def _action_selection_fixture(
+        self,
+        kind: WaveKind,
+    ) -> tuple[ChallengeState, ManagedWave, dict[str, str]]:
+        engine = self.engine(ProbeRoleExecutor())
+        state = self.add_v2(engine)
+        role_run_ids = {
+            Role.BUILDER.value: "MR-selection-builder",
+            Role.FALSIFIER.value: "MR-selection-falsifier",
+            Role.REPRODUCER.value: "MR-selection-reproducer",
+        }
+        cycle = ManagedCycle(
+            id=f"MC-selection-{kind.value}",
+            session_id=f"S-selection-{kind.value}",
+            ordinal=1,
+            phase="wave_reserved",
+            configuration_epoch=state.configuration_epoch,
+            captain_run_id="MR-selection-captain",
+            wave_id=f"MW-selection-{kind.value}",
+        )
+        wave = ManagedWave(
+            id=str(cycle.wave_id),
+            session_id=cycle.session_id,
+            cycle_id=cycle.id,
+            kind=kind,
+            role_run_ids=dict(role_run_ids),
+            snapshot_revision=state.revision,
+            configuration_epoch=state.configuration_epoch,
+        )
+        state.cycles.append(cycle)
+        state.waves.append(wave)
+        state.runs.extend(
+            RunReference(
+                id=run_id,
+                base_revision=state.revision,
+                status=RunStatus.COMPLETED,
+                role=role,
+                origin=RunOrigin.MANAGED_MODEL,
+                session_id=cycle.session_id,
+                cycle_id=cycle.id,
+                wave_id=wave.id,
+                configuration_epoch=state.configuration_epoch,
+            )
+            for role, run_id in role_run_ids.items()
+        )
+        return state, wave, role_run_ids
+
+    @staticmethod
+    def _selection_probe(
+        experiment_id: str,
+        source_run_id: str,
+        *,
+        hypothesis_ids: tuple[str, ...] = (),
+        command: str = "/bin/sh -lc 'printf exact-discovery-probe'",
+        expected_observation: str = "the exact bounded probe completes",
+        keep_if: str = "the exact output is present",
+        drop_if: str = "the exact output is absent",
+        timeout_seconds: int = 30,
+        resource_class: str = "light",
+        kind: ExperimentKind = ExperimentKind.PROBE,
+        extra: dict[str, object] | None = None,
+    ) -> Experiment:
+        return Experiment(
+            id=experiment_id,
+            hypothesis_ids=list(hypothesis_ids),
+            command=command,
+            expected_observation=expected_observation,
+            keep_if=keep_if,
+            drop_if=drop_if,
+            timeout_seconds=timeout_seconds,
+            resource_class=resource_class,
+            kind=kind,
+            source_run_id=source_run_id,
+            extra=dict(extra or {}),
+        )
+
+    @staticmethod
+    def _seed_existing_managed_command(
+        engine: ChallengeEngine,
+        identity: ChallengeIdentity,
+        *,
+        experiment_id: str,
+        command_script: str,
+        expected_observation: str,
+        keep_if: str,
+        drop_if: str,
+    ) -> Experiment:
+        current = engine.store.load(identity)
+        source_run_id = f"MR-source-{experiment_id}"
+        seeded = Experiment(
+            id=experiment_id,
+            hypothesis_ids=[],
+            command=shlex.join(("/bin/sh", "-lc", command_script)),
+            expected_observation=expected_observation,
+            keep_if=keep_if,
+            drop_if=drop_if,
+            timeout_seconds=37,
+            resource_class="light",
+            kind=ExperimentKind.PROBE,
+            source_run_id=source_run_id,
+            extra={
+                "configuration_epoch": current.configuration_epoch,
+                "managed_contract_version": 2,
+                "managed_command_protocol": "posix_sh_lc_v1",
+            },
+        )
+
+        def apply(state):
+            state.runs.append(
+                RunReference(
+                    id=source_run_id,
+                    base_revision=state.revision,
+                    status=RunStatus.COMPLETED,
+                    request_path=f"runs/{source_run_id}/request.json",
+                    result_path=f"runs/{source_run_id}/result.json",
+                    validation_path=(
+                        f"runs/{source_run_id}/validation.json"
+                    ),
+                    role=Role.EXTRACTOR.value,
+                    origin=RunOrigin.MANAGED_MODEL,
+                    configuration_epoch=state.configuration_epoch,
+                    extra={
+                        "contract_version": 2,
+                        "semantic_merge": True,
+                    },
+                )
+            )
+            state.experiments.append(copy.deepcopy(seeded))
+
+        committed = engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+        return next(
+            item for item in committed.experiments if item.id == experiment_id
+        )
+
+    def test_captain_selects_existing_registered_command_by_exact_hashes(
+        self,
+    ) -> None:
+        class ExistingSelectionExecutor(ProbeRoleExecutor):
+            def __init__(self) -> None:
+                super().__init__(captain_stage="attack")
+                self.reference: dict[str, object] | None = None
+
+            def _prepare_output_payload(
+                self,
+                *,
+                command,
+                cwd,
+                role,
+                payload,
+            ) -> None:
+                del command, cwd
+                if role is Role.CAPTAIN:
+                    assert self.reference is not None
+                    payload["decision"]["selected_experiment"] = dict(
+                        self.reference
+                    )
+
+        executor = ExistingSelectionExecutor()
+        sandboxes: list[FakeSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = FakeSandbox(work)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(executor, sandbox_factory=sandbox_factory)
+        self.add_v2(engine)
+        command_canary = "existing-command-body-collision-canary"
+        selected = self._seed_existing_managed_command(
+            engine,
+            self.identity,
+            experiment_id="E-existing-collision",
+            command_script=f"printf '%s\\n' {command_canary}",
+            expected_observation="SELECTED_EXPECTED_EXACT_68",
+            keep_if="SELECTED_KEEP_EXACT_68",
+            drop_if="SELECTED_DROP_EXACT_68",
+        )
+        unrelated = self._seed_existing_managed_command(
+            engine,
+            self.identity,
+            experiment_id="E-unrelated-pending",
+            command_script="printf '%s\\n' unrelated-command-body-canary",
+            expected_observation="UNRELATED_EXPECTED_MUST_NOT_PROJECT",
+            keep_if="UNRELATED_KEEP_MUST_NOT_PROJECT",
+            drop_if="UNRELATED_DROP_MUST_NOT_PROJECT",
+        )
+        binding = managed_registered_selection_binding(selected)
+        executor.reference = {
+            key: binding[key]
+            for key in (
+                "experiment_id",
+                "command_sha256",
+                "contract_sha256",
+            )
+        }
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        cycle = state.cycles[-1]
+        self.assertIn(selected.id, cycle.selected_action_ids)
+        self.assertEqual(
+            cycle.extra["managed_registered_selection_v1"],
+            binding,
+        )
+        selected_after = next(
+            item for item in state.experiments if item.id == selected.id
+        )
+        unrelated_after = next(
+            item for item in state.experiments if item.id == unrelated.id
+        )
+        self.assertIsNot(
+            selected_after.status,
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertIs(
+            unrelated_after.status,
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertTrue(
+            any(
+                command_canary in " ".join(spec.argv)
+                for sandbox in sandboxes
+                for spec in sandbox.specs
+            )
+        )
+        worker_prompts = [
+            prompt
+            for role, prompt in executor.prompts
+            if role in {Role.BUILDER, Role.FALSIFIER, Role.REPRODUCER}
+        ]
+        self.assertEqual(len(worker_prompts), 3)
+        for prompt in worker_prompts:
+            self.assertIn("SELECTED_EXPECTED_EXACT_68", prompt)
+            self.assertIn("SELECTED_KEEP_EXACT_68", prompt)
+            self.assertIn("SELECTED_DROP_EXACT_68", prompt)
+            self.assertIn(str(binding["command_sha256"]), prompt)
+            self.assertIn(str(binding["contract_sha256"]), prompt)
+            self.assertIn('"timeout_seconds":37', prompt)
+            self.assertIn('"resource_class":"light"', prompt)
+            self.assertNotIn(command_canary, prompt)
+            self.assertNotIn("unrelated-command-body-canary", prompt)
+            self.assertNotIn("UNRELATED_EXPECTED_MUST_NOT_PROJECT", prompt)
+
+    def test_registered_reference_rejects_unknown_status_hash_and_type(
+        self,
+    ) -> None:
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        selected = self._seed_existing_managed_command(
+            engine,
+            self.identity,
+            experiment_id="E-existing-negative",
+            command_script="true",
+            expected_observation="expected",
+            keep_if="keep",
+            drop_if="drop",
+        )
+        state = engine.store.load(self.identity)
+        binding = managed_registered_selection_binding(selected)
+        reference = {
+            key: binding[key]
+            for key in (
+                "experiment_id",
+                "command_sha256",
+                "contract_sha256",
+            )
+        }
+        validated = ManagedOrchestrator._validate_registered_experiment_reference(
+            state,
+            reference,
+            next_stage="attack",
+        )
+        self.assertEqual(validated.id, selected.id)
+
+        invalid_references = []
+        unknown = dict(reference)
+        unknown["experiment_id"] = "E-unknown"
+        invalid_references.append(unknown)
+        command_mismatch = dict(reference)
+        command_mismatch["command_sha256"] = "0" * 64
+        invalid_references.append(command_mismatch)
+        contract_mismatch = dict(reference)
+        contract_mismatch["contract_sha256"] = "1" * 64
+        invalid_references.append(contract_mismatch)
+        for invalid in invalid_references:
+            with self.subTest(reference=invalid):
+                with self.assertRaises(
+                    ManagedRegisteredExperimentReferenceError
+                ):
+                    ManagedOrchestrator._validate_registered_experiment_reference(
+                        state,
+                        invalid,
+                        next_stage="attack",
+                    )
+
+        nonregistered = copy.deepcopy(state)
+        next(
+            item
+            for item in nonregistered.experiments
+            if item.id == selected.id
+        ).status = ExperimentStatus.CANCELLED
+        with self.assertRaises(ManagedRegisteredExperimentReferenceError):
+            ManagedOrchestrator._validate_registered_experiment_reference(
+                nonregistered,
+                reference,
+                next_stage="attack",
+            )
+
+        legacy = copy.deepcopy(state)
+        next(
+            item
+            for item in legacy.experiments
+            if item.id == selected.id
+        ).extra.pop("managed_command_protocol")
+        with self.assertRaises(ManagedRegisteredExperimentReferenceError):
+            ManagedOrchestrator._validate_registered_experiment_reference(
+                legacy,
+                reference,
+                next_stage="attack",
+            )
+
+        unmerged = copy.deepcopy(state)
+        next(
+            item
+            for item in unmerged.runs
+            if item.id == selected.source_run_id
+        ).extra["semantic_merge"] = False
+        with self.assertRaises(ManagedRegisteredExperimentReferenceError):
+            ManagedOrchestrator._validate_registered_experiment_reference(
+                unmerged,
+                reference,
+                next_stage="attack",
+            )
+
+        invalid_utf8 = copy.deepcopy(state)
+        next(
+            item
+            for item in invalid_utf8.experiments
+            if item.id == selected.id
+        ).expected_observation = "\ud800"
+        with self.assertRaises(ManagedRegisteredExperimentReferenceError):
+            ManagedOrchestrator._validate_registered_experiment_reference(
+                invalid_utf8,
+                reference,
+                next_stage="attack",
+            )
+
+    def test_discovery_preserves_roles_and_deduplicates_exact_workers(
+        self,
+    ) -> None:
+        executor = ProbeRoleExecutor(captain_stage="discover")
+        engine = self.engine(executor)
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        wave = state.waves[-1]
+        cycle = next(item for item in state.cycles if item.id == wave.cycle_id)
+        self.assertIs(wave.kind, WaveKind.DISCOVERY)
+        self.assertEqual(len(wave.role_run_ids), 3)
+        worker_runs = [
+            item
+            for item in state.runs
+            if item.id in wave.role_run_ids.values()
+        ]
+        self.assertEqual(len(worker_runs), 3)
+        self.assertEqual(
+            {item.role for item in worker_runs},
+            set(wave.role_run_ids),
+        )
+        self.assertEqual(
+            {item.status for item in worker_runs},
+            {RunStatus.COMPLETED},
+        )
+        wave_run_ids = {
+            cycle.captain_run_id,
+            *wave.role_run_ids.values(),
+        }
+        wave_experiments = [
+            item
+            for item in state.experiments
+            if item.source_run_id in wave_run_ids
+        ]
+        self.assertEqual(len(wave_experiments), 4)
+        selected_wave_action_ids = {
+            item.id
+            for item in wave_experiments
+            if item.id in cycle.selected_action_ids
+        }
+        selected_wave_actions = [
+            item
+            for item in wave_experiments
+            if item.id in selected_wave_action_ids
+        ]
+        self.assertEqual(len(selected_wave_action_ids), 2)
+        self.assertEqual(
+            sum(
+                item.kind is ExperimentKind.STRATEGIC
+                for item in selected_wave_actions
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                item.kind is ExperimentKind.PROBE
+                for item in selected_wave_actions
+            ),
+            1,
+        )
+
+    def test_discovery_does_not_merge_different_hypotheses(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        hypothesis_ids = ("H-discovery-first", "H-discovery-second")
+        state.hypotheses.extend(
+            Hypothesis(
+                id=hypothesis_id,
+                statement=f"distinct semantic claim {hypothesis_id}",
+                falsifier=Falsifier(description="run the bounded probe"),
+            )
+            for hypothesis_id in hypothesis_ids
+        )
+        state.experiments.extend(
+            [
+                self._selection_probe(
+                    "E-discovery-first-hypothesis",
+                    role_run_ids[Role.BUILDER.value],
+                    hypothesis_ids=(hypothesis_ids[0],),
+                    kind=ExperimentKind.STRATEGIC,
+                ),
+                self._selection_probe(
+                    "E-discovery-second-hypothesis",
+                    role_run_ids[Role.FALSIFIER.value],
+                    hypothesis_ids=(hypothesis_ids[1],),
+                    kind=ExperimentKind.STRATEGIC,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-discovery-first-hypothesis",
+                "E-discovery-second-hypothesis",
+            ),
+        )
+
+    def test_discovery_does_not_merge_oracle_differences(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        hypothesis_id = "H-discovery-shared"
+        state.hypotheses.append(
+            Hypothesis(
+                id=hypothesis_id,
+                statement="one shared semantic claim",
+                falsifier=Falsifier(description="run the bounded probe"),
+            )
+        )
+        base_values = {
+            "expected_observation": "the exact bounded probe completes",
+            "keep_if": "the exact output is present",
+            "drop_if": "the exact output is absent",
+        }
+        differences = {
+            "expected_observation": "a distinct observation is emitted",
+            "keep_if": "a distinct keep predicate is satisfied",
+            "drop_if": "a distinct drop predicate is satisfied",
+        }
+        for field, changed_value in differences.items():
+            with self.subTest(field=field):
+                state.experiments.clear()
+                first = self._selection_probe(
+                    f"E-discovery-{field}-base",
+                    role_run_ids[Role.BUILDER.value],
+                    hypothesis_ids=(hypothesis_id,),
+                    kind=ExperimentKind.STRATEGIC,
+                    **base_values,
+                )
+                changed = dict(base_values)
+                changed[field] = changed_value
+                second = self._selection_probe(
+                    f"E-discovery-{field}-changed",
+                    role_run_ids[Role.FALSIFIER.value],
+                    hypothesis_ids=(hypothesis_id,),
+                    kind=ExperimentKind.STRATEGIC,
+                    **changed,
+                )
+                state.experiments.extend((first, second))
+
+                self.assertEqual(
+                    ManagedOrchestrator._select_actions(state, wave),
+                    (first.id, second.id),
+                )
+
+    def test_discovery_merges_only_fully_identical_semantics(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        state.experiments.extend(
+            self._selection_probe(
+                f"E-discovery-identical-{role}",
+                run_id,
+            )
+            for role, run_id in role_run_ids.items()
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            ("E-discovery-identical-builder",),
+        )
+
+    def test_discovery_same_role_command_selects_one_oracle(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        source_run_id = role_run_ids[Role.BUILDER.value]
+        state.experiments.extend(
+            [
+                self._selection_probe(
+                    "E-discovery-same-approach-base",
+                    source_run_id,
+                ),
+                self._selection_probe(
+                    "E-discovery-same-approach-different-oracle",
+                    source_run_id,
+                    expected_observation="a distinct observation is emitted",
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            ("E-discovery-same-approach-base",),
+        )
+
+    def test_discovery_command_difference_is_not_merged(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        source_run_id = role_run_ids[Role.BUILDER.value]
+        state.experiments.extend(
+            [
+                self._selection_probe(
+                    "E-discovery-command-first",
+                    source_run_id,
+                    command="/bin/sh -lc 'printf first-probe'",
+                ),
+                self._selection_probe(
+                    "E-discovery-command-second",
+                    source_run_id,
+                    command="/bin/sh -lc 'printf second-probe'",
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-discovery-command-first",
+                "E-discovery-command-second",
+            ),
+        )
+
+    def test_discovery_duplicate_does_not_consume_role_approach(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        state.experiments.extend(
+            [
+                self._selection_probe(
+                    "E-discovery-builder-base",
+                    role_run_ids[Role.BUILDER.value],
+                ),
+                self._selection_probe(
+                    "E-discovery-falsifier-a-duplicate",
+                    role_run_ids[Role.FALSIFIER.value],
+                ),
+                self._selection_probe(
+                    "E-discovery-falsifier-b-distinct",
+                    role_run_ids[Role.FALSIFIER.value],
+                    expected_observation="a distinct observation is emitted",
+                ),
+                self._selection_probe(
+                    "E-discovery-reproducer-third",
+                    role_run_ids[Role.REPRODUCER.value],
+                    command="/bin/sh -lc 'printf third-probe'",
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-discovery-builder-base",
+                "E-discovery-falsifier-b-distinct",
+                "E-discovery-reproducer-third",
+            ),
+        )
+
+    def test_discovery_does_not_merge_target_or_input_differences(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        source_run_ids = tuple(role_run_ids.values())
+        binding_source_run_id = source_run_ids[0]
+
+        def execution_extra(
+            *,
+            generation: int,
+            artifact_sha256: str,
+        ) -> dict[str, object]:
+            return {
+                "configuration_epoch": state.configuration_epoch,
+                "managed_contract_version": 2,
+                "managed_command_protocol": "posix_sh_lc_v1",
+                "network_target": "https://selection.example:443",
+                "network_target_id": "T-selection",
+                "network_target_generation": generation,
+                "managed_action_input_binding": {
+                    "schema_version": 1,
+                    "protocol": "same_run_publications_v1",
+                    "source_run_id": binding_source_run_id,
+                    "artifacts": [
+                        {
+                            "artifact_id": f"A-{artifact_sha256[0]}",
+                            "canonical_path": (
+                                "artifacts/snapshots/selection-input"
+                            ),
+                            "destination": "solver.py",
+                            "sha256": artifact_sha256,
+                            "size_bytes": 1,
+                            "source_run_id": binding_source_run_id,
+                        }
+                    ],
+                    "total_bytes": 1,
+                },
+            }
+
+        state.experiments.extend(
+            [
+                self._selection_probe(
+                    "E-discovery-base-binding",
+                    source_run_ids[0],
+                    extra=execution_extra(
+                        generation=1,
+                        artifact_sha256="a" * 64,
+                    ),
+                ),
+                self._selection_probe(
+                    "E-discovery-new-generation",
+                    source_run_ids[1],
+                    extra=execution_extra(
+                        generation=2,
+                        artifact_sha256="a" * 64,
+                    ),
+                ),
+                self._selection_probe(
+                    "E-discovery-new-binding",
+                    source_run_ids[2],
+                    extra=execution_extra(
+                        generation=1,
+                        artifact_sha256="b" * 64,
+                    ),
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-discovery-base-binding",
+                "E-discovery-new-generation",
+                "E-discovery-new-binding",
+            ),
+        )
+
+    def test_discovery_does_not_merge_resource_or_timeout_differences(
+        self,
+    ) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.DISCOVERY
+        )
+        source_run_ids = tuple(role_run_ids.values())
+        state.experiments.extend(
+            [
+                self._selection_probe(
+                    "E-discovery-base-resources",
+                    source_run_ids[0],
+                ),
+                self._selection_probe(
+                    "E-discovery-heavy-resource",
+                    source_run_ids[1],
+                    resource_class="heavy",
+                ),
+                self._selection_probe(
+                    "E-discovery-longer-timeout",
+                    source_run_ids[2],
+                    timeout_seconds=31,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            ManagedOrchestrator._select_actions(state, wave),
+            (
+                "E-discovery-base-resources",
+                "E-discovery-heavy-resource",
+                "E-discovery-longer-timeout",
+            ),
+        )
+
+    def test_attack_keeps_cross_role_exact_executions_independent(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.ATTACK
+        )
+        shared_extra = {
+            "configuration_epoch": state.configuration_epoch,
+            "managed_contract_version": 2,
+            "managed_command_protocol": "posix_sh_lc_v1",
+        }
+        state.experiments.extend(
+            self._selection_probe(
+                f"E-attack-{role}",
+                run_id,
+                extra=shared_extra,
+            )
+            for role, run_id in role_run_ids.items()
+        )
+
+        with mock.patch.object(
+            ManagedOrchestrator,
+            "_discovery_execution_fingerprint",
+            side_effect=AssertionError("discovery dedup crossed into attack"),
+        ):
+            self.assertEqual(
+                ManagedOrchestrator._select_actions(state, wave),
+                (
+                    "E-attack-builder",
+                    "E-attack-falsifier",
+                    "E-attack-reproducer",
+                ),
+            )
+
+    def test_proof_selection_bypasses_discovery_dedup(self) -> None:
+        state, wave, role_run_ids = self._action_selection_fixture(
+            WaveKind.PROOF
+        )
+        state.experiments.append(
+            Experiment(
+                id="E-proof-strict-recipe",
+                hypothesis_ids=[],
+                command="proof replay is engine owned",
+                expected_observation="the exact candidate replay succeeds",
+                keep_if="the replay proves the candidate",
+                drop_if="the replay does not prove the candidate",
+                timeout_seconds=30,
+                kind=ExperimentKind.PROOF,
+                source_run_id=role_run_ids[Role.REPRODUCER.value],
+                proof_recipe=mock.sentinel.proof_recipe,
+            )
+        )
+
+        with mock.patch.object(
+            ManagedOrchestrator,
+            "_discovery_execution_fingerprint",
+            side_effect=AssertionError("discovery dedup crossed into proof"),
+        ):
+            self.assertEqual(
+                ManagedOrchestrator._select_actions(state, wave),
+                ("E-proof-strict-recipe",),
+            )
 
     def test_managed_model_background_script_is_rejected_before_registration(
         self,
@@ -3619,6 +5187,329 @@ class ManagedV2Tests(unittest.TestCase):
             [current_id, foreign_id],
         )
 
+    def test_late_wave_actions_accept_supported_frontier_only(self):
+        supported_id = "H-captain-supported"
+        confirmed_id = "H-captain-confirmed"
+        refuted_id = "H-captain-refuted"
+
+        class LateWaveExecutor(ProbeRoleExecutor):
+            def _prepare_output_payload(
+                self,
+                *,
+                command,
+                cwd,
+                role: Role,
+                payload: dict[str, object],
+            ) -> None:
+                del command, cwd
+                if role is Role.CAPTAIN:
+                    return
+                actions = payload["actions"]
+                assert isinstance(actions, list) and len(actions) == 1
+                template = actions[0]
+                assert isinstance(template, dict)
+                payload["actions"] = [
+                    {
+                        **copy.deepcopy(template),
+                        "hypothesis_ids": [hypothesis_id],
+                    }
+                    for hypothesis_id in (
+                        supported_id,
+                        confirmed_id,
+                        refuted_id,
+                        "H-missing",
+                    )
+                ]
+
+        engine = self.engine(LateWaveExecutor())
+        self.add_v2(engine)
+        evidence_payload = b"captain evaluation evidence\n"
+        evidence_run_id = "R-captain-evaluation"
+        evidence_artifact_id = "A-captain-evaluation"
+        evidence_fact_id = "F-captain-evaluation"
+        evidence_path = (
+            engine.store.challenge_paths(self.identity).artifacts
+            / "snapshots"
+            / f"{evidence_artifact_id}.log"
+        )
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_bytes(evidence_payload)
+        evidence_path.chmod(0o400)
+
+        def seed_evaluated_frontier(state):
+            state.runs.append(
+                RunReference(
+                    id=evidence_run_id,
+                    base_revision=state.revision,
+                    status=RunStatus.COMPLETED,
+                )
+            )
+            state.artifacts.append(
+                ArtifactReference(
+                    id=evidence_artifact_id,
+                    path=(
+                        "artifacts/snapshots/"
+                        f"{evidence_artifact_id}.log"
+                    ),
+                    sha256=hashlib.sha256(evidence_payload).hexdigest(),
+                    source_run_id=evidence_run_id,
+                    size=len(evidence_payload),
+                )
+            )
+            state.facts.append(
+                Fact(
+                    id=evidence_fact_id,
+                    statement="Captain evaluated the shared frontier",
+                    provenance=Provenance.EXECUTED,
+                    challenge_id=state.challenge_id,
+                    source_run_id=evidence_run_id,
+                    artifact_id=evidence_artifact_id,
+                    locator=(
+                        "artifacts/snapshots/"
+                        f"{evidence_artifact_id}.log"
+                    ),
+                    supports=[supported_id, confirmed_id],
+                    contradicts=[refuted_id],
+                )
+            )
+            state.hypotheses.extend(
+                [
+                    Hypothesis(
+                        id=supported_id,
+                        statement="the remote approach is supported",
+                        falsifier=Falsifier("repeat the bounded action"),
+                        status=HypothesisStatus.SUPPORTED,
+                        evidence_fact_ids=[evidence_fact_id],
+                    ),
+                    Hypothesis(
+                        id=confirmed_id,
+                        statement="a resolved control is confirmed",
+                        falsifier=Falsifier("invalidate the control"),
+                        status=HypothesisStatus.CONFIRMED,
+                        evidence_fact_ids=[evidence_fact_id],
+                    ),
+                    Hypothesis(
+                        id=refuted_id,
+                        statement="a discarded approach is refuted",
+                        falsifier=Falsifier("recover the discarded path"),
+                        status=HypothesisStatus.REFUTED,
+                        evidence_fact_ids=[evidence_fact_id],
+                        refuted_by=evidence_fact_id,
+                    ),
+                ]
+            )
+
+        engine.store.update(self.identity, seed_evaluated_frontier)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        _state, _wave, role_runs = orchestrator._reserve_wave(
+            self.identity,
+            session_id,
+            cycle.id,
+            "attack",
+        )
+        outcome = engine.run_wave(
+            self.identity,
+            "attack",
+            _session_owned=True,
+            _automated=True,
+            _reserved_run_ids=role_runs,
+            _semantic_barrier=True,
+            _managed_workspace=True,
+        )
+        state = engine.store.load(self.identity)
+        wave_run_ids = {
+            result.invocation.run_id for result in outcome.results
+        }
+        registered = [
+            experiment
+            for experiment in state.experiments
+            if experiment.source_run_id in wave_run_ids
+        ]
+
+        self.assertEqual(
+            len(registered),
+            3,
+            [
+                (
+                    run.id,
+                    run.status.value,
+                    run.extra.get("contract_errors"),
+                    run.extra.get("rejected_actions"),
+                )
+                for run in state.runs
+                if run.id in wave_run_ids
+            ],
+        )
+        self.assertTrue(
+            all(
+                experiment.hypothesis_ids == [supported_id]
+                for experiment in registered
+            )
+        )
+        for run in state.runs:
+            if run.id not in wave_run_ids:
+                continue
+            rejections = run.extra.get("rejected_actions", [])
+            self.assertEqual(
+                [item["action"] for item in rejections],
+                ["2", "3", "4"],
+            )
+            self.assertTrue(
+                all(
+                    str(item["reason"]).startswith(
+                        "unknown or inactive hypothesis ids:"
+                    )
+                    for item in rejections
+                )
+            )
+
+    def test_strategic_actions_cancel_if_frontier_terminalizes_before_start(
+        self,
+    ) -> None:
+        sandboxes: list[FakeSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = FakeSandbox(work)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            ProbeRoleExecutor(),
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        confirmed_id = "H-prestart-confirmed"
+        refuted_id = "H-prestart-refuted"
+        for hypothesis_id in (confirmed_id, refuted_id):
+            engine.manage_hypothesis(
+                self.identity,
+                action="create",
+                hypothesis_id=hypothesis_id,
+                statement=f"frontier claim for {hypothesis_id}",
+                falsifier=f"falsify {hypothesis_id}",
+            )
+        experiment_ids = []
+        for hypothesis_id in (confirmed_id, refuted_id):
+            _state, experiment_id = engine.register_experiment(
+                self.identity,
+                command=("python3", "-c", "print('must not run')"),
+                expected_observation="bounded output",
+                keep_if="output exists",
+                drop_if="output is absent",
+                hypothesis_ids=(hypothesis_id,),
+            )
+            experiment_ids.append(experiment_id)
+
+        evidence_payload = b"pre-start frontier evaluation\n"
+        evidence_run_id = "R-prestart-frontier-evaluation"
+        evidence_artifact_id = "A-prestart-frontier-evaluation"
+        evidence_fact_id = "F-prestart-frontier-evaluation"
+        evidence_locator = (
+            "artifacts/snapshots/"
+            f"{evidence_artifact_id}.log"
+        )
+        evidence_path = (
+            engine.store.challenge_paths(self.identity).root
+            / evidence_locator
+        )
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_bytes(evidence_payload)
+        evidence_path.chmod(0o400)
+
+        def terminalize_frontier(state):
+            state.runs.append(
+                RunReference(
+                    id=evidence_run_id,
+                    base_revision=state.revision,
+                    status=RunStatus.COMPLETED,
+                )
+            )
+            state.artifacts.append(
+                ArtifactReference(
+                    id=evidence_artifact_id,
+                    path=evidence_locator,
+                    sha256=hashlib.sha256(evidence_payload).hexdigest(),
+                    source_run_id=evidence_run_id,
+                    size=len(evidence_payload),
+                )
+            )
+            state.facts.append(
+                Fact(
+                    id=evidence_fact_id,
+                    statement="the frontier was resolved before tool start",
+                    provenance=Provenance.EXECUTED,
+                    challenge_id=state.challenge_id,
+                    source_run_id=evidence_run_id,
+                    artifact_id=evidence_artifact_id,
+                    locator=evidence_locator,
+                    supports=[confirmed_id],
+                    contradicts=[refuted_id],
+                )
+            )
+            hypotheses = {
+                item.id: item for item in state.hypotheses
+            }
+            confirmed = hypotheses[confirmed_id]
+            confirmed.status = HypothesisStatus.CONFIRMED
+            confirmed.evidence_fact_ids = [evidence_fact_id]
+            refuted = hypotheses[refuted_id]
+            refuted.status = HypothesisStatus.REFUTED
+            refuted.refuted_by = evidence_fact_id
+            refuted.evidence_fact_ids = [evidence_fact_id]
+
+        before = engine.store.update(
+            self.identity,
+            terminalize_frontier,
+        )
+        run_ids_before = [item.id for item in before.runs]
+
+        after = engine.execute_registered_experiments(
+            self.identity,
+            maximum=2,
+            experiment_ids=tuple(experiment_ids),
+        )
+
+        selected = {
+            item.id: item
+            for item in after.experiments
+            if item.id in experiment_ids
+        }
+        self.assertEqual(set(selected), set(experiment_ids))
+        for hypothesis_id, experiment_id in zip(
+            (confirmed_id, refuted_id),
+            experiment_ids,
+            strict=True,
+        ):
+            experiment = selected[experiment_id]
+            self.assertIs(
+                experiment.status,
+                ExperimentStatus.CANCELLED,
+            )
+            self.assertEqual(
+                experiment.extra["cancelled_reason"],
+                "inactive_strategic_hypothesis_before_execution",
+            )
+            rejection = experiment.extra["execution_rejection"]
+            self.assertEqual(
+                rejection["inactive_hypothesis_ids"],
+                [hypothesis_id],
+            )
+            self.assertFalse(rejection["missing_hypothesis_binding"])
+        self.assertEqual([item.id for item in after.runs], run_ids_before)
+        self.assertEqual(sandboxes, [])
+
     def test_managed_hypothesis_collisions_are_contained_per_item(self):
         executor = ProbeRoleExecutor(
             captain_hypothesis_ids=(
@@ -3693,6 +5584,19 @@ class ManagedV2Tests(unittest.TestCase):
             [item.id for item in state.hypotheses],
             [f"H-{run_id}-H-{run_id}-hyp-1"],
         )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.source_run_id == run_id
+        )
+        self.assertEqual(result.invocation.contract_version, 1)
+        self.assertNotIn("managed_command_protocol", experiment.extra)
+        self.assertEqual(
+            experiment.extra[
+                "managed_semantic_evaluation_contract_version"
+            ],
+            2,
+        )
 
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
         executor = ProbeRoleExecutor()
@@ -3758,9 +5662,19 @@ class ManagedV2Tests(unittest.TestCase):
         )
         paths = engine.store.challenge_paths(self.identity)
         for run in wave_runs:
-            self.assertTrue(
-                (paths.runs / run.id / "provider.json").is_file()
-            )
+            provider_path = paths.runs / run.id / "provider.json"
+            self.assertTrue(provider_path.is_file())
+            provider = read_json(provider_path)
+            self.assertEqual(provider["status"], "completed")
+            self.assertTrue(provider["provider_started"])
+            for field in (
+                "provider_wait_seconds",
+                "provider_process_span_seconds",
+                "model_call_wall_seconds",
+            ):
+                self.assertIs(type(provider[field]), float)
+                self.assertGreaterEqual(provider[field], 0.0)
+                self.assertEqual(run.extra[field], provider[field])
         wave_experiments = [
             item
             for item in state.experiments
@@ -3937,6 +5851,134 @@ class ManagedV2Tests(unittest.TestCase):
             )
         )
 
+    def test_managed_wave_defers_stall_until_selected_actions_commit(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        observed_receipt_counts: list[int] = []
+
+        def force_stall_after_bounded_evidence(state):
+            cycle = state.cycles[-1]
+            selected_ids = set(cycle.selected_action_ids)
+            selected = [
+                item
+                for item in state.experiments
+                if item.id in selected_ids
+            ]
+            # Three adapter seeds and all three selected role actions must be
+            # durable before the governor may stop managed execution.
+            self.assertEqual(len(state.receipts), 6)
+            self.assertEqual(len(selected), 6)
+            self.assertTrue(
+                all(
+                    item.status is not ExperimentStatus.REGISTERED
+                    for item in selected
+                )
+            )
+            observed_receipt_counts.append(len(state.receipts))
+
+            def apply(current):
+                current.status = ChallengeStatus.STALLED
+
+            return engine.store.update(
+                self.identity,
+                apply,
+                expected_revision=state.revision,
+            )
+
+        with mock.patch.object(
+            engine,
+            "_record_stall_if_needed",
+            side_effect=force_stall_after_bounded_evidence,
+        ) as record_stall:
+            state = orchestrator.run_cycle(self.identity)
+
+        record_stall.assert_called_once()
+        self.assertEqual(observed_receipt_counts, [6])
+        self.assertIs(state.status, ChallengeStatus.STALLED)
+        self.assertIsNone(state.active_managed_session_id)
+        self.assertIs(state.sessions[-1].status, SessionStatus.PAUSED)
+        self.assertEqual(state.cycles[-1].phase, "completed")
+        self.assertEqual(state.waves[-1].status, "completed")
+
+    def test_managed_empty_selection_evaluates_stall_after_wave(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+
+        with (
+            mock.patch.object(
+                orchestrator,
+                "_select_actions",
+                return_value=(),
+            ),
+            mock.patch.object(
+                engine,
+                "_record_stall_if_needed",
+                wraps=engine._record_stall_if_needed,
+            ) as record_stall,
+        ):
+            state = orchestrator.run_cycle(self.identity)
+
+        record_stall.assert_called_once()
+        self.assertEqual(len(state.receipts), 3)
+        self.assertEqual(
+            len(state.cycles[-1].selected_action_ids),
+            3,
+        )
+        self.assertEqual(state.cycles[-1].phase, "completed")
+        self.assertEqual(state.waves[-1].status, "completed")
+
+    def test_worker_stop_with_empty_selection_closes_managed_session(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        original_run_wave = engine.run_wave
+
+        def run_wave_then_pause(*args, **kwargs):
+            outcome = original_run_wave(*args, **kwargs)
+            current = engine.store.load(self.identity)
+
+            def apply(state):
+                state.resume_status = state.status
+                state.status = ChallengeStatus.PAUSED
+
+            engine.store.update(
+                self.identity,
+                apply,
+                expected_revision=current.revision,
+            )
+            return outcome
+
+        with (
+            mock.patch.object(
+                engine,
+                "run_wave",
+                side_effect=run_wave_then_pause,
+            ),
+            mock.patch.object(
+                orchestrator,
+                "_select_actions",
+                return_value=(),
+            ),
+        ):
+            state = orchestrator.run_cycle(self.identity)
+
+        self.assertIs(state.status, ChallengeStatus.PAUSED)
+        self.assertIsNone(state.active_managed_session_id)
+        self.assertIs(state.sessions[-1].status, SessionStatus.PAUSED)
+        self.assertEqual(state.cycles[-1].phase, "completed")
+        self.assertEqual(state.waves[-1].status, "completed")
+
     def test_managed_receipt_evidence_reaches_first_captain_safely(
         self,
     ):
@@ -3980,6 +6022,8 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertTrue(
             all(
                 receipt.outcome.value == "succeeded"
+                and receipt.extra.get("semantic_authority") is False
+                and receipt.extra.get("semantic_witness_available") is False
                 for receipt in managed_receipts
             )
         )
@@ -4045,6 +6089,33 @@ class ManagedV2Tests(unittest.TestCase):
             self.assertTrue(
                 stdout["path"].startswith("artifacts/snapshots/")
             )
+
+        final_context = build_context_pack(
+            state,
+            get_adapter(state.category),
+            state_path=paths.state,
+            max_chars=65_536,
+        )
+        final_records = [
+            strict_json_loads(line)
+            for line in final_context.text.splitlines()
+            if line
+        ]
+        semantic_receipt_records = [
+            item
+            for item in final_records
+            if item.get("kind") == "recent_execution_receipt"
+            and "semantic_authority" in item
+        ]
+        self.assertTrue(semantic_receipt_records)
+        self.assertTrue(
+            all(
+                item["semantic_authority"] is False
+                and item["semantic_witness_available"] is False
+                and item["semantic_evaluation_contract_version"] == 2
+                for item in semantic_receipt_records
+            )
+        )
 
         receipt = state.receipts[0]
         self.assertEqual(
@@ -4331,6 +6402,247 @@ class ManagedV2Tests(unittest.TestCase):
         )
         self.assertEqual(captain.status, RunStatus.COMPLETED)
         self.assertIn("rejected_decisions", captain.extra)
+
+    def test_run_cycles_pauses_after_timed_out_captain_exhausts_budget(
+        self,
+    ) -> None:
+        class CaptainTimeoutExecutor(ProbeRoleExecutor):
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                outcome = super().run(
+                    command,
+                    cwd=cwd,
+                    timeout=timeout,
+                    on_stdout_line=on_stdout_line,
+                )
+                if _role_for(command) is Role.CAPTAIN:
+                    return replace(
+                        outcome,
+                        returncode=124,
+                        timed_out=True,
+                    )
+                return outcome
+
+        executor = CaptainTimeoutExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        engine.reset_budget(self.identity, 3_600)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        captain = engine.run_role(
+            self.identity,
+            Role.CAPTAIN,
+            prefix="managed-timeout-captain",
+            instruction="produce one bounded routing decision",
+            _session_owned=True,
+            _automated=True,
+            _reserved_run_id=cycle.captain_run_id,
+            _managed_workspace=True,
+        )
+        self.assertFalse(captain.completed)
+        checkpointed = orchestrator._checkpoint_invalid_cycle(
+            self.identity,
+            session_id,
+            cycle.id,
+            reason_code="captain_contract_invalid",
+            reason="Captain result was not contract-valid",
+            note=None,
+        )
+
+        def exhaust_budget(state):
+            state.budget.spent_seconds = state.budget.allocated_seconds
+
+        engine.store.update(
+            self.identity,
+            exhaust_budget,
+            expected_revision=checkpointed.revision,
+        )
+        state = orchestrator.run_cycles(
+            self.identity,
+            max_cycles=1,
+            session_id=session_id,
+        )
+
+        self.assertIs(state.status, ChallengeStatus.PAUSED)
+        self.assertIsNone(state.active_managed_session_id)
+        self.assertEqual(len(state.cycles), 1)
+        self.assertEqual(len(state.checkpoints), 1)
+        timed_out_captain = next(
+            item
+            for item in state.runs
+            if item.id == cycle.captain_run_id
+        )
+        self.assertIs(timed_out_captain.status, RunStatus.TIMED_OUT)
+        self.assertIsNotNone(timed_out_captain.result_path)
+        self.assertIsNotNone(timed_out_captain.validation_path)
+        self.assertTrue(
+            (
+                engine.store.challenge_paths(self.identity).root
+                / str(timed_out_captain.result_path)
+            ).is_file()
+        )
+        self.assertTrue(
+            (
+                engine.store.challenge_paths(self.identity).root
+                / str(timed_out_captain.validation_path)
+            ).is_file()
+        )
+        session = state.sessions[-1]
+        self.assertIs(session.status, SessionStatus.PAUSED)
+        self.assertIn(
+            "challenge wall-clock budget is exhausted",
+            session.stop_reason or "",
+        )
+        self.assertEqual(state.submissions, [])
+        state.validate()
+
+    def test_run_cycle_checkpoints_captain_timeout_before_contract_error(
+        self,
+    ) -> None:
+        class CaptainTimeoutExecutor(ProbeRoleExecutor):
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                outcome = super().run(
+                    command,
+                    cwd=cwd,
+                    timeout=timeout,
+                    on_stdout_line=on_stdout_line,
+                )
+                if _role_for(command) is Role.CAPTAIN:
+                    return replace(
+                        outcome,
+                        returncode=124,
+                        timed_out=True,
+                    )
+                return outcome
+
+        engine = self.engine(CaptainTimeoutExecutor())
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        captain = next(
+            run for run in state.runs if run.role == Role.CAPTAIN.value
+        )
+        self.assertIs(captain.status, RunStatus.TIMED_OUT)
+        self.assertEqual(len(state.waves), 0)
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(capsule.reason_code, "captain_timed_out")
+        self.assertNotEqual(
+            capsule.reason_code,
+            "captain_contract_invalid",
+        )
+        self.assertIn("timed out", state.checkpoints[-1].note or "")
+        state.validate()
+
+    def test_run_cycle_prioritizes_challenge_budget_expiry_for_captain(
+        self,
+    ) -> None:
+        class CaptainTimeoutExecutor(ProbeRoleExecutor):
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                outcome = super().run(
+                    command,
+                    cwd=cwd,
+                    timeout=timeout,
+                    on_stdout_line=on_stdout_line,
+                )
+                if _role_for(command) is Role.CAPTAIN:
+                    return replace(
+                        outcome,
+                        returncode=124,
+                        timed_out=True,
+                    )
+                return outcome
+
+        engine = self.engine(CaptainTimeoutExecutor())
+        self.add_v2(engine)
+        real_run = engine.batch_runner.run
+
+        def inject_budget_expiry(invocation, **kwargs):
+            result = real_run(invocation, **kwargs)
+            if invocation.role is not Role.CAPTAIN:
+                return result
+            self.assertTrue(result.failures)
+            return replace(
+                result,
+                failures=(
+                    *result.failures,
+                    replace(
+                        result.failures[-1],
+                        kind="challenge_budget_expired",
+                        message=(
+                            "challenge wall-clock budget expired during "
+                            "the provider call"
+                        ),
+                        retryable=False,
+                    ),
+                ),
+            )
+
+        with mock.patch.object(
+            engine.batch_runner,
+            "run",
+            side_effect=inject_budget_expiry,
+        ):
+            state = ManagedOrchestrator(
+                engine,
+                capability_probe=self.capability,
+            ).run_cycle(self.identity)
+
+        captain = next(
+            run for run in state.runs if run.role == Role.CAPTAIN.value
+        )
+        self.assertIs(captain.status, RunStatus.TIMED_OUT)
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(
+            capsule.reason_code,
+            "challenge_budget_expired",
+        )
+        self.assertNotEqual(
+            capsule.reason_code,
+            "captain_contract_invalid",
+        )
+        self.assertIn(
+            "wall-clock budget expired",
+            state.checkpoints[-1].note or "",
+        )
+        state.validate()
 
     def test_invalid_role_preserves_valid_sibling_evidence_without_full_merge(
         self,
@@ -4769,6 +7081,916 @@ class ManagedV2Tests(unittest.TestCase):
             )
         )
 
+    def test_managed_exact_canonical_artifact_reference_is_non_owning(
+        self,
+    ):
+        executor = CanonicalArtifactEchoExecutor(
+            path=CANONICAL_REFERENCE_PATH,
+            sha256=CANONICAL_REFERENCE_SHA256,
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        reference = self.seed_canonical_artifact(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        captain = next(
+            run
+            for run in state.runs
+            if run.role == Role.CAPTAIN.value
+        )
+        self.assertEqual(captain.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            captain.extra["source_references"],
+            [
+                {
+                    "artifact_id": reference.id,
+                    "path": reference.path,
+                    "sha256": reference.sha256,
+                    "size": reference.size,
+                    "source_run_id": None,
+                    "purpose": "existing canonical evidence",
+                    "kind": "canonical_artifact",
+                }
+            ],
+        )
+        self.assertEqual(
+            [
+                artifact.id
+                for artifact in state.artifacts
+                if artifact.path == reference.path
+            ],
+            [reference.id],
+        )
+        self.assertFalse(
+            any(
+                artifact.source_run_id == captain.id
+                for artifact in state.artifacts
+            )
+        )
+        self.assertEqual(len(state.waves), 1)
+
+    def test_managed_mismatched_canonical_artifact_reference_checkpoints_captain(
+        self,
+    ):
+        executor = CanonicalArtifactEchoExecutor(
+            path=CANONICAL_REFERENCE_PATH,
+            sha256="0" * 64,
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        self.seed_canonical_artifact(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        captain = next(
+            run
+            for run in state.runs
+            if run.role == Role.CAPTAIN.value
+        )
+        self.assertEqual(captain.status, RunStatus.INVALID)
+        self.assertFalse(captain.extra["contract_valid"])
+        self.assertIn(
+            "outside the captain workspace",
+            str(captain.extra["normalization_error"]),
+        )
+        self.assertEqual(len(state.waves), 0)
+        self.assertNotEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
+        self.assertEqual(state.sessions[-1].status, SessionStatus.RUNNING)
+        self.assertIsNotNone(state.cycles[-1].checkpoint_id)
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(
+            capsule.reason_code,
+            "captain_contract_invalid",
+        )
+
+    def test_deadline_expiry_recomputes_provisional_contract_valid(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        invocation = engine._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="captain",
+            instruction="return one contract-valid managed result",
+            deadline_monotonic_seconds=time.monotonic() + 60,
+            deadline_epoch_seconds=time.time() + 60,
+            run_id=cycle.captain_run_id,
+            managed_workspace=True,
+        )
+        result = engine.batch_runner.run(invocation)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.validation.valid)
+        expired = replace(
+            result,
+            deadline_monotonic_seconds=time.monotonic() - 1,
+        )
+
+        provisional = engine._persist_reserved_run_terminal(
+            self.identity,
+            expired,
+        )
+        provisional_run = next(
+            run
+            for run in provisional.runs
+            if run.id == cycle.captain_run_id
+        )
+        self.assertTrue(provisional_run.extra["contract_valid"])
+
+        committed = engine._commit_batch_results(
+            provisional,
+            (expired,),
+            semantic_barrier=True,
+        )
+        final_run = next(
+            run
+            for run in committed.runs
+            if run.id == cycle.captain_run_id
+        )
+        self.assertIs(final_run.status, RunStatus.TIMED_OUT)
+        self.assertFalse(final_run.extra["contract_valid"])
+        validation = read_json(
+            engine.store.challenge_paths(self.identity).root
+            / str(final_run.validation_path)
+        )
+        self.assertFalse(validation["ok"])
+        challenge_root = engine.store.challenge_paths(self.identity).root
+        self.assertEqual(
+            final_run.extra["result_sha256"],
+            sha256_file(challenge_root / str(final_run.result_path)),
+        )
+        self.assertEqual(
+            final_run.extra["validation_sha256"],
+            sha256_file(challenge_root / str(final_run.validation_path)),
+        )
+
+    def test_terminal_provider_retry_preserves_not_started_marker(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        invocation = engine._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="captain",
+            instruction="return one contract-valid managed result",
+            deadline_monotonic_seconds=time.monotonic() + 60,
+            deadline_epoch_seconds=time.time() + 60,
+            run_id=cycle.captain_run_id,
+            managed_workspace=True,
+        )
+        result = engine.batch_runner.run(invocation)
+        provider_path = (
+            engine.store.run_paths(
+                self.identity,
+                run_id=cycle.captain_run_id,
+            ).root
+            / "provider.json"
+        )
+        run_paths = engine.store.run_paths(
+            self.identity,
+            run_id=cycle.captain_run_id,
+        )
+        with (
+            mock.patch(
+                "ctf_os.engine.challenge.utc_now",
+                return_value="2026-08-03T00:00:00Z",
+            ),
+            mock.patch(
+                "ctf_os.store.files.utc_now",
+                return_value="2026-08-03T00:00:00Z",
+            ),
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=RevisionConflict(1, 2),
+            ),
+            self.assertRaises(RevisionConflict),
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        first_provider = read_json(provider_path)
+        first_hashes = {
+            "result": sha256_file(run_paths.result),
+            "validation": sha256_file(run_paths.validation),
+        }
+        first_result = read_json(run_paths.result)
+        corrupt_result = dict(first_result)
+        corrupt_result["schema_version"] = True
+        atomic_write_json(run_paths.result, corrupt_result)
+        with self.assertRaisesRegex(
+            EngineError,
+            "provisional result retry mismatch",
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+        atomic_write_json(run_paths.result, first_result)
+        with (
+            mock.patch(
+                "ctf_os.engine.challenge.utc_now",
+                return_value="2026-08-03T00:00:01Z",
+            ),
+            mock.patch(
+                "ctf_os.store.files.utc_now",
+                return_value="2026-08-03T00:00:01Z",
+            ),
+        ):
+            committed = engine._persist_reserved_run_terminal(
+                self.identity,
+                result,
+            )
+
+        provider = read_json(provider_path)
+        self.assertFalse(provider["provider_started"])
+        self.assertEqual(provider["status"], "completed")
+        self.assertEqual(
+            provider["finished_at"],
+            first_provider["finished_at"],
+        )
+        self.assertEqual(
+            sha256_file(run_paths.result),
+            first_hashes["result"],
+        )
+        self.assertEqual(
+            sha256_file(run_paths.validation),
+            first_hashes["validation"],
+        )
+        terminal_run = next(
+            item
+            for item in committed.runs
+            if item.id == cycle.captain_run_id
+        )
+        self.assertEqual(
+            terminal_run.extra["provider_completed_at"],
+            first_provider["finished_at"],
+        )
+
+    def test_terminal_provider_rejects_corrupt_identity_and_start_marker(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        invocation = engine._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="captain",
+            instruction="return one contract-valid managed result",
+            deadline_monotonic_seconds=time.monotonic() + 60,
+            deadline_epoch_seconds=time.time() + 60,
+            run_id=cycle.captain_run_id,
+            managed_workspace=True,
+        )
+        result = engine.batch_runner.run(invocation)
+        run_paths = engine.store.run_paths(
+            self.identity,
+            run_id=cycle.captain_run_id,
+        )
+        provider_path = run_paths.root / "provider.json"
+
+        request_record = read_json(run_paths.request)
+        corrupted_request = dict(request_record)
+        corrupted_request["contest_id"] = "EVIL"
+        corrupted_request["base_revision"] = (
+            state.revision + 999
+        )
+        atomic_write_json(run_paths.request, corrupted_request)
+        with self.assertRaisesRegex(
+            EngineError,
+            "request record binding mismatch",
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+        atomic_write_json(run_paths.request, request_record)
+
+        atomic_write_json(
+            provider_path,
+            {
+                "schema_version": True,
+                "status": "running",
+                "run_id": cycle.captain_run_id,
+                "configuration_epoch": state.configuration_epoch,
+                "started_at": "2026-08-03T00:00:00Z",
+            },
+        )
+        with self.assertRaisesRegex(EngineError, "schema version is invalid"):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        atomic_write_json(
+            provider_path,
+            {
+                "status": "running",
+                "run_id": "MR-WRONG",
+                "configuration_epoch": state.configuration_epoch,
+                "started_at": "2026-08-03T00:00:00Z",
+            },
+        )
+        with self.assertRaisesRegex(EngineError, "run id mismatch"):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        atomic_write_json(
+            provider_path,
+            {
+                "status": "running",
+                "run_id": cycle.captain_run_id,
+                "configuration_epoch": state.configuration_epoch + 1,
+                "started_at": "2026-08-03T00:00:00Z",
+            },
+        )
+        with self.assertRaisesRegex(
+            EngineError,
+            "configuration epoch mismatch",
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        atomic_write_json(
+            provider_path,
+            {
+                "schema_version": 1,
+                "status": "running",
+                "run_id": cycle.captain_run_id,
+                "configuration_epoch": state.configuration_epoch,
+                "started_at": None,
+                "provider_started": True,
+            },
+        )
+        with self.assertRaisesRegex(EngineError, "start binding is invalid"):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        atomic_write_json(
+            provider_path,
+            {
+                "status": "running",
+                "run_id": cycle.captain_run_id,
+                "configuration_epoch": state.configuration_epoch,
+                "started_at": "2026-08-03T00:00:00Z",
+                "provider_started": "false",
+            },
+        )
+        with self.assertRaisesRegex(EngineError, "start marker is invalid"):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        current = engine.store.load(self.identity)
+        run = next(
+            item
+            for item in current.runs
+            if item.id == cycle.captain_run_id
+        )
+        self.assertIs(run.status, RunStatus.CREATED)
+
+    def test_terminal_provider_sidecar_binds_stale_reserved_epoch(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        invocation = engine._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="captain",
+            instruction="return one contract-valid managed result",
+            deadline_monotonic_seconds=time.monotonic() + 60,
+            deadline_epoch_seconds=time.time() + 60,
+            run_id=cycle.captain_run_id,
+            managed_workspace=True,
+        )
+        result = engine.batch_runner.run(invocation)
+        engine.add_network_target(
+            self.identity,
+            "https://managed-epoch-bump.example:443",
+            docker_network="ctfos-test-proxy",
+            enforcement="proxy",
+        )
+        with (
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=RevisionConflict(1, 2),
+            ),
+            self.assertRaises(RevisionConflict),
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        provider_path = (
+            engine.store.run_paths(
+                self.identity,
+                run_id=cycle.captain_run_id,
+            ).root
+            / "provider.json"
+        )
+        provider = read_json(provider_path)
+        self.assertEqual(
+            provider["configuration_epoch"],
+            state.configuration_epoch,
+        )
+        recovered = orchestrator.reconcile(self.identity)
+        run = next(
+            item
+            for item in recovered.runs
+            if item.id == cycle.captain_run_id
+        )
+        self.assertIs(run.status, RunStatus.INTERRUPTED)
+
+    def test_all_terminal_wave_runs_become_ready_to_reduce(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        state, wave, role_runs = orchestrator._reserve_wave(
+            self.identity,
+            session_id,
+            cycle.id,
+            "discovery",
+        )
+        invocations = [
+            engine._make_invocation(
+                state,
+                Role(role_name),
+                prefix=role_name,
+                instruction="return one contract-valid managed result",
+                deadline_monotonic_seconds=time.monotonic() + 60,
+                deadline_epoch_seconds=time.time() + 60,
+                run_id=run_id,
+                managed_workspace=True,
+            )
+            for role_name, run_id in role_runs.items()
+        ]
+        for invocation in invocations:
+            result = engine.batch_runner.run(invocation)
+            state = engine._persist_reserved_run_terminal(
+                self.identity,
+                result,
+            )
+
+        terminal_wave = next(
+            item for item in state.waves if item.id == wave.id
+        )
+        self.assertEqual(terminal_wave.status, "ready_to_reduce")
+
+    def test_reconcile_terminalizes_running_provider_without_result(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        engine._mark_reserved_run_running(
+            self.identity,
+            cycle.captain_run_id,
+        )
+
+        recovered = orchestrator.reconcile(self.identity)
+
+        run = next(
+            item
+            for item in recovered.runs
+            if item.id == cycle.captain_run_id
+        )
+        provider_path = (
+            engine.store.run_paths(self.identity, run_id=run.id).root
+            / "provider.json"
+        )
+        provider = read_json(provider_path)
+        self.assertIs(run.status, RunStatus.INTERRUPTED)
+        self.assertEqual(provider["status"], "interrupted")
+        self.assertTrue(provider["provider_started"])
+        self.assertEqual(provider["recovered_by"], "managed_reconcile")
+        self.assertEqual(
+            run.extra["provider_outcome_status"],
+            "interrupted",
+        )
+        self.assertEqual(
+            run.extra["provider_completed_at"],
+            provider["finished_at"],
+        )
+        root = engine.store.challenge_paths(self.identity).root
+        self.assertEqual(
+            run.extra["request_sha256"],
+            sha256_file(root / str(run.request_path)),
+        )
+        self.assertEqual(
+            run.extra["result_sha256"],
+            sha256_file(root / str(run.result_path)),
+        )
+        self.assertEqual(
+            run.extra["validation_sha256"],
+            sha256_file(root / str(run.validation_path)),
+        )
+
+    def test_reconcile_imports_terminal_provider_timing_after_state_crash(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        invocation = engine._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="captain",
+            instruction="return one contract-valid managed result",
+            deadline_monotonic_seconds=time.monotonic() + 60,
+            deadline_epoch_seconds=time.time() + 60,
+            run_id=cycle.captain_run_id,
+            managed_workspace=True,
+        )
+        result = engine.batch_runner.run(
+            invocation,
+            before_provider_start=lambda: engine._mark_reserved_run_running(
+                self.identity,
+                cycle.captain_run_id,
+            ),
+        )
+        with (
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=RevisionConflict(1, 2),
+            ),
+            self.assertRaises(RevisionConflict),
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        provider_path = (
+            engine.store.run_paths(
+                self.identity,
+                run_id=cycle.captain_run_id,
+            ).root
+            / "provider.json"
+        )
+        durable_provider = read_json(provider_path)
+        recovered = orchestrator.reconcile(self.identity)
+        run = next(
+            item
+            for item in recovered.runs
+            if item.id == cycle.captain_run_id
+        )
+        recovered_provider = read_json(provider_path)
+
+        self.assertIs(run.status, RunStatus.COMPLETED)
+        self.assertTrue(run.extra["recovered_from_durable_result"])
+        self.assertTrue(run.extra["provider_started"])
+        self.assertEqual(recovered_provider["status"], "completed")
+        self.assertEqual(
+            recovered_provider["recovered_by"],
+            "managed_reconcile",
+        )
+        for field in (
+            "provider_wait_seconds",
+            "provider_process_span_seconds",
+            "model_call_wall_seconds",
+            "attempt_count",
+        ):
+            self.assertEqual(
+                recovered_provider[field],
+                durable_provider[field],
+            )
+            self.assertEqual(run.extra[field], durable_provider[field])
+        self.assertEqual(
+            run.extra["provider_completed_at"],
+            durable_provider["finished_at"],
+        )
+        root = engine.store.challenge_paths(self.identity).root
+        self.assertEqual(
+            run.extra["request_sha256"],
+            sha256_file(root / str(run.request_path)),
+        )
+        self.assertEqual(
+            run.extra["result_sha256"],
+            sha256_file(root / str(run.result_path)),
+        )
+        self.assertEqual(
+            run.extra["validation_sha256"],
+            sha256_file(root / str(run.validation_path)),
+        )
+
+    def test_reconcile_rejects_unbound_durable_documents(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        run = next(
+            item
+            for item in state.runs
+            if item.id == cycle.captain_run_id
+        )
+        paths = engine.store.run_paths(self.identity, run_id=run.id)
+        malicious_identity = {
+            "contest_id": "EVIL",
+            "category": "x",
+            "challenge_id": "y",
+        }
+        atomic_write_json(
+            paths.request,
+            {
+                # JSON booleans must not compare equal to integer protocol
+                # versions (True == 1 in ordinary Python equality).
+                "schema_version": True,
+                **malicious_identity,
+                "run_id": run.id,
+                "base_revision": run.base_revision + 999,
+                "configuration_epoch": run.configuration_epoch,
+                "kind": "model",
+                "role": run.role,
+                "model": run.model,
+                "state_revision": run.base_revision,
+                "contract_version": run.extra["contract_version"],
+                "thread_continuity_v1": copy.deepcopy(
+                    run.extra["thread_continuity_v1"]
+                ),
+            },
+        )
+        atomic_write_json(
+            paths.result,
+            {
+                "schema_version": True,
+                **malicious_identity,
+                "run_id": run.id,
+                "base_revision": run.base_revision + 999,
+                "status": RunStatus.COMPLETED.value,
+                "provisional_managed_result": True,
+                "artifacts": [],
+            },
+        )
+        atomic_write_json(
+            paths.validation,
+            {
+                "run_id": run.id,
+                "base_revision": run.base_revision + 999,
+                "ok": True,
+                "validated_at": "2026-08-03T00:00:00Z",
+                "provisional_managed_result": True,
+            },
+        )
+
+        recovered = orchestrator.reconcile(self.identity)
+        recovered_run = next(
+            item for item in recovered.runs if item.id == run.id
+        )
+        self.assertIs(recovered_run.status, RunStatus.INTERRUPTED)
+        self.assertFalse(
+            recovered_run.extra["recovered_from_durable_result"]
+        )
+        errors = recovered_run.extra[
+            "recovery_document_validation_errors"
+        ]
+        self.assertIn("request.contest_id_mismatch", errors)
+        self.assertIn("request.schema_version_mismatch", errors)
+        self.assertIn("request.base_revision_mismatch", errors)
+        self.assertIn("result.contest_id_mismatch", errors)
+        self.assertIn("result.schema_version_mismatch", errors)
+        self.assertIn("result.base_revision_mismatch", errors)
+        self.assertIn("validation.base_revision_mismatch", errors)
+
+    def test_reconcile_quarantines_missing_request_and_corrupt_provider(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        invocation = engine._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="captain",
+            instruction="return one contract-valid managed result",
+            deadline_monotonic_seconds=time.monotonic() + 60,
+            deadline_epoch_seconds=time.time() + 60,
+            run_id=cycle.captain_run_id,
+            managed_workspace=True,
+        )
+        result = engine.batch_runner.run(
+            invocation,
+            before_provider_start=lambda: engine._mark_reserved_run_running(
+                self.identity,
+                cycle.captain_run_id,
+            ),
+        )
+        with (
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=RevisionConflict(1, 2),
+            ),
+            self.assertRaises(RevisionConflict),
+        ):
+            engine._persist_reserved_run_terminal(self.identity, result)
+
+        paths = engine.store.run_paths(
+            self.identity,
+            run_id=cycle.captain_run_id,
+        )
+        paths.request.unlink()
+        provider_path = paths.root / "provider.json"
+        provider = read_json(provider_path)
+        provider["status"] = True
+        provider["provider_started"] = True
+        provider["started_at"] = None
+        provider["attempt_count"] += 999
+        atomic_write_json(provider_path, provider)
+
+        recovered = orchestrator.reconcile(self.identity)
+        recovered_run = next(
+            item
+            for item in recovered.runs
+            if item.id == cycle.captain_run_id
+        )
+        self.assertIs(recovered_run.status, RunStatus.INTERRUPTED)
+        self.assertFalse(
+            recovered_run.extra["recovered_from_durable_result"]
+        )
+        errors = recovered_run.extra[
+            "recovery_document_validation_errors"
+        ]
+        self.assertIn("request.missing", errors)
+        self.assertIn("provider.status_invalid", errors)
+        self.assertIn("provider.start_binding_invalid", errors)
+        self.assertIn(
+            "provider.result_attempt_count_mismatch",
+            errors,
+        )
+        self.assertNotIn("attempt_count", recovered_run.extra)
+        recovered_provider = read_json(provider_path)
+        self.assertEqual(recovered_provider["status"], "interrupted")
+        self.assertFalse(recovered_provider["provider_started"])
+        self.assertIsNone(recovered_provider["started_at"])
+        self.assertIsNone(recovered_provider["attempt_count"])
+
+    def test_reconcile_rejects_result_validation_status_mismatch(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        assert cycle.captain_run_id is not None
+        run = next(
+            item
+            for item in state.runs
+            if item.id == cycle.captain_run_id
+        )
+        paths = engine.store.run_paths(self.identity, run_id=run.id)
+        atomic_write_json(
+            paths.request,
+            {
+                "schema_version": RUN_ENVELOPE_SCHEMA_VERSION,
+                "contest_id": self.identity.contest_id,
+                "category": self.identity.category,
+                "challenge_id": self.identity.challenge_id,
+                "run_id": run.id,
+                "base_revision": run.base_revision,
+                "configuration_epoch": run.configuration_epoch,
+                "kind": "model",
+                "role": run.role,
+                "model": run.model,
+                "state_revision": run.base_revision,
+                "contract_version": run.extra["contract_version"],
+                "thread_continuity_v1": copy.deepcopy(
+                    run.extra["thread_continuity_v1"]
+                ),
+            },
+        )
+        engine.store.write_run_result(
+            self.identity,
+            run.id,
+            {
+                "base_revision": run.base_revision,
+                "status": RunStatus.COMPLETED.value,
+                "provisional_managed_result": True,
+                "artifacts": [],
+            },
+        )
+        engine.store.write_run_validation(
+            self.identity,
+            run.id,
+            {
+                "run_id": run.id,
+                "base_revision": run.base_revision,
+                "ok": False,
+                "provisional_managed_result": True,
+            },
+        )
+
+        recovered = orchestrator.reconcile(self.identity)
+        recovered_run = next(
+            item for item in recovered.runs if item.id == run.id
+        )
+        self.assertIs(recovered_run.status, RunStatus.INTERRUPTED)
+        self.assertFalse(
+            recovered_run.extra["recovered_from_durable_result"]
+        )
+        self.assertIn(
+            "validation.result_status_mismatch",
+            recovered_run.extra[
+                "recovery_document_validation_errors"
+            ],
+        )
+
     def test_reconciler_recovers_two_terminal_and_one_durable_created_run(
         self,
     ):
@@ -4799,7 +8021,15 @@ class ManagedV2Tests(unittest.TestCase):
                     request={
                         "kind": "model",
                         "role": run.role,
+                        "model": run.model,
+                        "state_revision": run.base_revision,
                         "configuration_epoch": run.configuration_epoch,
+                        "contract_version": run.extra[
+                            "contract_version"
+                        ],
+                        "thread_continuity_v1": copy.deepcopy(
+                            run.extra["thread_continuity_v1"]
+                        ),
                     },
                     base_revision=run.base_revision,
                 )
@@ -5041,6 +8271,133 @@ class ManagedV2Tests(unittest.TestCase):
         )
         self.assertIn("cancelled_at", retired.extra)
         self.assertIn(Role.CAPTAIN, executor.roles)
+
+    def test_operator_cancels_only_exact_stale_registered_remote(self):
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        endpoint = "https://operator-cancel.example:443"
+        _target_id, stale_id = self.seed_managed_remote_action(
+            engine,
+            endpoint,
+        )
+        _state, local_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", "print('local')"),
+            expected_observation="local output",
+            keep_if="output exists",
+            drop_if="output is absent",
+        )
+        engine.add_network_target(
+            self.identity,
+            "https://epoch-bump.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        _state, current_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", "print('current remote')"),
+            expected_observation="remote output",
+            keep_if="output exists",
+            drop_if="output is absent",
+            network_target=endpoint,
+        )
+        before = engine.store.load(self.identity)
+
+        def stall(state):
+            state.status = ChallengeStatus.STALLED
+            state.resume_status = None
+
+        before = engine.store.update(
+            self.identity,
+            stall,
+            expected_revision=before.revision,
+        )
+        run_ids = [run.id for run in before.runs]
+
+        state, cancelled_ids = engine.cancel_stale_registered_experiments(
+            self.identity,
+            (stale_id,),
+            reason="configuration epoch changed after operator recovery",
+        )
+
+        self.assertEqual(cancelled_ids, (stale_id,))
+        self.assertIs(state.status, ChallengeStatus.STALLED)
+        self.assertEqual([run.id for run in state.runs], run_ids)
+        self.assertEqual(executor.roles, [])
+        by_id = {item.id: item for item in state.experiments}
+        self.assertIs(
+            by_id[stale_id].status,
+            ExperimentStatus.CANCELLED,
+        )
+        self.assertIs(
+            by_id[local_id].status,
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertIs(
+            by_id[current_id].status,
+            ExperimentStatus.REGISTERED,
+        )
+        cancellation = by_id[stale_id].extra["operator_cancellation"]
+        self.assertEqual(cancellation["kind"], "stale_remote_binding")
+        self.assertEqual(
+            cancellation["reason"],
+            "configuration epoch changed after operator recovery",
+        )
+        self.assertEqual(
+            cancellation["source_state_revision"],
+            before.revision,
+        )
+        self.assertNotEqual(
+            cancellation["stale_binding"],
+            cancellation["selected_binding"],
+        )
+        self.assertEqual(state.candidates, before.candidates)
+        self.assertEqual(state.submissions, before.submissions)
+
+    def test_operator_stale_cancellation_rejects_mixed_set_atomically(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        _target_id, stale_id = self.seed_managed_remote_action(
+            engine,
+            "https://atomic-cancel.example:443",
+        )
+        _state, local_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="success",
+            keep_if="success",
+            drop_if="failure",
+        )
+        engine.add_network_target(
+            self.identity,
+            "https://atomic-epoch-bump.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        before = engine.store.load(self.identity)
+
+        with self.assertRaisesRegex(EngineError, "not remote-bound"):
+            engine.cancel_stale_registered_experiments(
+                self.identity,
+                (stale_id, local_id),
+                reason="must reject the complete mixed set",
+            )
+
+        after = engine.store.load(self.identity)
+        self.assertEqual(after.revision, before.revision)
+        selected = {
+            item.id: item.status
+            for item in after.experiments
+            if item.id in {stale_id, local_id}
+        }
+        self.assertEqual(
+            selected,
+            {
+                stale_id: ExperimentStatus.REGISTERED,
+                local_id: ExperimentStatus.REGISTERED,
+            },
+        )
 
     def test_cycle_does_not_retire_stale_operator_remote(self):
         executor = ProbeRoleExecutor()
@@ -5529,6 +8886,7 @@ class ManagedTypedGateTests(unittest.TestCase):
         wave_name: str = "attack",
         report_all_paths: bool = True,
         builder_predates_preissue: bool = False,
+        active_remote_target: bool = False,
     ):
         identity = ChallengeIdentity(
             "Managed Typed Gates",
@@ -5602,6 +8960,15 @@ class ManagedTypedGateTests(unittest.TestCase):
                         )
                     )
             action["oracle_preissue_id"] = record["preissue_id"]
+
+        if active_remote_target:
+            state = engine.add_network_target(
+                identity,
+                "tcp://managed-pwn.example:31337",
+                docker_network="ctfos-test-proxy",
+                enforcement="proxy",
+            )
+            engine.select_network_target(identity, state.targets[-1].id)
 
         orchestrator = ManagedOrchestrator(
             engine,
@@ -5762,6 +9129,99 @@ class ManagedTypedGateTests(unittest.TestCase):
             publish,
             registration,
         )
+
+    def test_remote_pwn_local_gates_fail_admission_without_losing_artifact(
+        self,
+    ) -> None:
+        cases = (
+            {
+                "kind": "prove_pwn_exploit_effect",
+                "description": "invalid remote use of the local effect gate",
+                "parent_experiment_id": "placeholder",
+                "payload_artifact_path": "pwn/remote-exploit.py",
+                "timeout_seconds": 300,
+            },
+            {
+                "kind": "prove_pwn_interaction",
+                "description": "invalid remote use of the local interaction gate",
+                "parent_experiment_id": "placeholder",
+                "recipe_artifact_path": "pwn/remote-interaction.json",
+                "timeout_seconds": 300,
+            },
+        )
+        for ordinal, action in enumerate(cases, start=1):
+            with self.subTest(kind=action["kind"]):
+                (
+                    engine,
+                    orchestrator,
+                    identity,
+                    _session_id,
+                    _cycle,
+                    wave,
+                    result,
+                    publication,
+                    registration,
+                ) = self.fixture(
+                    suffix=f"remote-local-gate-{ordinal}",
+                    category="pwn",
+                    action=copy.deepcopy(action),
+                    active_remote_target=True,
+                )
+                self.assertEqual(publication.published_count, 1)
+                self.assertEqual(registration.experiment_ids, ())
+                self.assertEqual(
+                    registration.rejection_code,
+                    "typed_gate_pwn_local_only_with_remote_target",
+                )
+
+                state = engine.store.load(identity)
+                self.assertEqual(
+                    orchestrator._select_actions(state, wave),
+                    (),
+                )
+                self.assertFalse(
+                    any(
+                        item.extra.get("engine_executor")
+                        == "managed_typed_gate_v1"
+                        for item in state.experiments
+                    )
+                )
+                builder_run = next(
+                    item
+                    for item in state.runs
+                    if item.id == result.invocation.run_id
+                )
+                self.assertEqual(
+                    builder_run.extra["rejected_actions"],
+                    [
+                        {
+                            "action": "1",
+                            "reason": (
+                                "typed_gate_pwn_local_only_with_remote_target"
+                            ),
+                        }
+                    ],
+                )
+                locator = next(
+                    value
+                    for key, value in action.items()
+                    if key.endswith("_artifact_path")
+                )
+                self.assertTrue(
+                    any(
+                        item.run_id == result.invocation.run_id
+                        and item.destination == locator
+                        and item.status == "published"
+                        for item in state.workspace_publishes
+                    )
+                )
+                self.assertTrue(
+                    (
+                        engine.store.challenge_paths(identity).artifacts
+                        / "workspace"
+                        / str(locator)
+                    ).is_file()
+                )
 
     def test_oracle_preissue_must_predate_builder_registration(self):
         action = {
@@ -6396,6 +9856,7 @@ class ManagedTypedGateTests(unittest.TestCase):
                     payload["decision"] = {
                         "next_stage": "attack",
                         "reason": "exercise the typed forensic gate",
+                        "selected_experiment": None,
                     }
                     payload["hypotheses"] = [
                         {

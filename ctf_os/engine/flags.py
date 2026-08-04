@@ -21,6 +21,7 @@ from ctf_os.candidates import (
     candidate_value_is_valid,
     flag_notification_error,
     looks_like_generic_code_noise,
+    looks_like_printf_template_candidate,
 )
 from ctf_os.terminal import terminal_safe
 
@@ -82,26 +83,45 @@ class FlagDetector:
         overlap: int = 1024,
         candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
         candidate_chars_limit: int = DEFAULT_CANDIDATE_CHARS_LIMIT,
+        notice_limit: int = DEFAULT_CANDIDATE_LIMIT,
+        notice_chars_limit: int = DEFAULT_CANDIDATE_CHARS_LIMIT,
         suppress_generic_code_noise: bool = False,
+        notice_callback: Callable[[DetectedFlag], None] | None = None,
     ) -> None:
         compiled = tuple(re.compile(pattern) for pattern in patterns)
         if not compiled:
             raise ValueError("at least one flag pattern is required")
         if overlap < 1:
             raise ValueError("overlap must be positive")
-        if candidate_limit < 0 or candidate_chars_limit < 0:
+        if (
+            candidate_limit < 0
+            or candidate_chars_limit < 0
+            or notice_limit < 0
+            or notice_chars_limit < 0
+        ):
             raise ValueError("candidate bounds must not be negative")
         self._patterns = compiled
         self._callback = callback
+        self._notice_callback = (
+            print_flag_candidate
+            if notice_callback is None
+            else notice_callback
+        )
         self._overlap = overlap
         self._candidate_limit = candidate_limit
         self._candidate_chars_limit = candidate_chars_limit
+        self._notice_limit = notice_limit
+        self._notice_chars_limit = notice_chars_limit
         self._suppress_generic_code_noise = suppress_generic_code_noise
         self._tails: dict[str, str] = {}
         self._seen: set[str] = set()
+        self._notice_seen: set[str] = set()
         self._accepted_chars = 0
+        self._notice_chars = 0
         self._suppressed_matches = 0
+        self._notice_suppressed_matches = 0
         self._code_noise_suppressed_matches = 0
+        self._template_suppressed_matches = 0
         self._lock = threading.Lock()
 
     @property
@@ -118,6 +138,34 @@ class FlagDetector:
     def code_noise_suppressed_matches(self) -> int:
         with self._lock:
             return self._code_noise_suppressed_matches
+
+    @property
+    def template_suppressed_matches(self) -> int:
+        with self._lock:
+            return self._template_suppressed_matches
+
+    @property
+    def notice_count(self) -> int:
+        with self._lock:
+            return len(self._notice_seen)
+
+    @property
+    def notice_limit(self) -> int:
+        return self._notice_limit
+
+    @property
+    def notice_chars_limit(self) -> int:
+        return self._notice_chars_limit
+
+    @property
+    def notice_chars(self) -> int:
+        with self._lock:
+            return self._notice_chars
+
+    @property
+    def notice_suppressed_matches(self) -> int:
+        with self._lock:
+            return self._notice_suppressed_matches
 
     def _accept_locked(
         self, value: str, *, source: str
@@ -141,6 +189,28 @@ class FlagDetector:
             observed_at=datetime.now(UTC).isoformat(),
         )
 
+    def _notice_locked(
+        self, value: str, *, source: str
+    ) -> DetectedFlag | None:
+        if not candidate_value_is_valid(value):
+            return None
+        if value in self._notice_seen or value in self._seen:
+            return None
+        if (
+            len(self._notice_seen) >= self._notice_limit
+            or self._notice_chars + len(value)
+            > self._notice_chars_limit
+        ):
+            self._notice_suppressed_matches += 1
+            return None
+        self._notice_seen.add(value)
+        self._notice_chars += len(value)
+        return DetectedFlag(
+            value=value,
+            source=source,
+            observed_at=datetime.now(UTC).isoformat(),
+        )
+
     def _release_unnotified_locked(
         self,
         candidates: Iterable[DetectedFlag],
@@ -151,6 +221,16 @@ class FlagDetector:
             self._seen.remove(candidate.value)
             self._accepted_chars -= len(candidate.value)
 
+    def _release_unnotified_notices_locked(
+        self,
+        candidates: Iterable[DetectedFlag],
+    ) -> None:
+        for candidate in candidates:
+            if candidate.value not in self._notice_seen:
+                continue
+            self._notice_seen.remove(candidate.value)
+            self._notice_chars -= len(candidate.value)
+
     def feed(self, text: str, *, source: str) -> tuple[DetectedFlag, ...]:
         """Scan a text chunk and notify once for each distinct candidate."""
 
@@ -160,8 +240,23 @@ class FlagDetector:
             prefix = self._tails.get(source, "")
             combined = prefix + text
             found: list[DetectedFlag] = []
+            pending: list[tuple[DetectedFlag, bool]] = []
             for pattern in self._patterns:
                 for match in pattern.finditer(combined):
+                    if (
+                        self._suppress_generic_code_noise
+                        and looks_like_printf_template_candidate(
+                            match.group(0)
+                        )
+                    ):
+                        self._template_suppressed_matches += 1
+                        self._code_noise_suppressed_matches += 1
+                        notice = self._notice_locked(
+                            match.group(0), source=source
+                        )
+                        if notice is not None:
+                            pending.append((notice, True))
+                        continue
                     if (
                         self._suppress_generic_code_noise
                         and looks_like_generic_code_noise(
@@ -173,24 +268,45 @@ class FlagDetector:
                     ):
                         self._suppressed_matches += 1
                         self._code_noise_suppressed_matches += 1
+                        notice = self._notice_locked(
+                            match.group(0), source=source
+                        )
+                        if notice is not None:
+                            pending.append((notice, True))
                         continue
                     candidate = self._accept_locked(
                         match.group(0), source=source
                     )
                     if candidate is not None:
                         found.append(candidate)
+                        pending.append((candidate, False))
             self._tails[source] = combined[-self._overlap :]
 
         # Never run an arbitrary callback while holding the detector lock.
-        for index, candidate in enumerate(found):
+        for index, (candidate, notification_only) in enumerate(pending):
             try:
-                self._callback(candidate)
+                callback = (
+                    self._notice_callback
+                    if notification_only
+                    else self._callback
+                )
+                callback(candidate)
             except BaseException as error:
                 # `_seen` means the callback accepted the candidate. Release
                 # the failing candidate and every callback not yet attempted
                 # so a later observation can retry durable notification.
                 with self._lock:
-                    self._release_unnotified_locked(found[index:])
+                    remaining = pending[index:]
+                    self._release_unnotified_locked(
+                        candidate
+                        for candidate, is_notice in remaining
+                        if not is_notice
+                    )
+                    self._release_unnotified_notices_locked(
+                        candidate
+                        for candidate, is_notice in remaining
+                        if is_notice
+                    )
                 if not isinstance(error, Exception):
                     raise
                 if isinstance(error, FlagNotificationError):

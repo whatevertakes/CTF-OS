@@ -216,15 +216,23 @@ class ManagedThreadContinuityTests(unittest.TestCase):
             capability_probe=self.capability,
         )
 
-        first = orchestrator.run_cycle(
-            self.identity,
-            thread_continuity_policy="role_lane",
-        )
-        executor.invalid_role = None
-        second = orchestrator.run_cycle(
-            self.identity,
-            thread_continuity_policy="role_lane",
-        )
+        # This test isolates thread-lane reuse.  Its synthetic tool receipts do
+        # not advance semantic evidence, so the production stall governor would
+        # otherwise pause the session before the second continuity cycle.
+        with mock.patch.object(
+            engine,
+            "_record_stall_if_needed",
+            side_effect=lambda state: state,
+        ):
+            first = orchestrator.run_cycle(
+                self.identity,
+                thread_continuity_policy="role_lane",
+            )
+            executor.invalid_role = None
+            second = orchestrator.run_cycle(
+                self.identity,
+                thread_continuity_policy="role_lane",
+            )
         self.assertEqual(
             first.active_managed_session_id,
             second.active_managed_session_id,
@@ -449,10 +457,17 @@ class ManagedThreadContinuityTests(unittest.TestCase):
             engine,
             capability_probe=self.capability,
         )
-        first = orchestrator.run_cycle(
-            self.identity,
-            thread_continuity_policy="role_lane",
-        )
+        # Keep this continuity-integrity test independent of the stall policy;
+        # the fake provider intentionally emits no semantic evaluation.
+        with mock.patch.object(
+            engine,
+            "_record_stall_if_needed",
+            side_effect=lambda state: state,
+        ):
+            first = orchestrator.run_cycle(
+                self.identity,
+                thread_continuity_policy="role_lane",
+            )
         with self.assertRaisesRegex(ManagedError, "pinned"):
             orchestrator._reserve_session(
                 self.identity,

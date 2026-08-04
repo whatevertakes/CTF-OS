@@ -24,6 +24,7 @@ python3 /work/pwn-template/solve.py /challenge/chall
 ```bash
 python3 /opt/ctf-templates/web/request.py \
   'http://target:8080/' --header 'Accept: application/json' \
+  --observe-text 'harmless-runtime-marker' \
   --session attacker --timeout 15 --max-bytes 16777216 \
   --max-request-bytes 16777216
 ctf-browser 'http://target:8080/' --session attacker \
@@ -82,6 +83,11 @@ KVM은 이 스크립트에서 켤 수 없고 engine의 명시적 KVM lease가 �
 
 `web/request.py --timeout`은 단일 socket read timeout이 아니라 연결부터
 drip-feed 응답 수신까지 포함하는 monotonic 전체 deadline이다.
+`--observe-text`는 응답 본문과 marker 원문을 stdout에 출력하지 않고 HTTP status,
+저장 byte 수, 본문/marker SHA-256, marker 존재 여부만 canonical summary로 남긴다.
+본문 판별에 의존하는 managed remote Web action은 이 summary가 없거나 stdout capture가
+불완전하면 process exit 0이어도 실패로 처리된다. marker에는 flag·credential 대신
+비밀이 아닌 고유 nonce만 사용한다.
 `--session attacker|user|admin`은 역할별 쿠키 jar를 격리하고 request와 browser
 실행을 role 표시가 있는 `/work/web/timeline.json`의 한 타임라인으로 묶는다.
 쿠키·Authorization·CSRF/JWT 값은 private jar에만 두며 타임라인과 응답

@@ -135,6 +135,35 @@ class GovernorTests(unittest.TestCase):
         )
         self.assertEqual(decision.repeated_failure_label, "wrong_tool")
 
+    def test_recent_unlabeled_successes_break_old_failure_repetition(
+        self,
+    ) -> None:
+        for number in range(1, 4):
+            run = self._run(
+                number,
+                failure_label="challenge_budget_expired",
+            )
+            self.state.runs.append(run)
+            self._fact_for(run)
+        for number in range(4, 7):
+            run = self._run(number)
+            run.status = RunStatus.COMPLETED
+            self.state.runs.append(run)
+            self._fact_for(run)
+
+        decision = evaluate_stall(self.state)
+
+        self.assertFalse(decision.stalled)
+        self.assertNotIn(
+            StallSignal.REPEATED_FAILURE_LABEL,
+            decision.signals,
+        )
+        self.assertIsNone(decision.repeated_failure_label)
+        self.assertEqual(
+            decision.inspected_run_ids,
+            ("R-4", "R-5", "R-6"),
+        )
+
     def test_known_evaluation_reason_can_supply_failure_label(self) -> None:
         self.state.metadata["failure_labels"] = ["wrong_tool"]
         for number in range(1, 4):

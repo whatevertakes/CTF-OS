@@ -92,6 +92,8 @@ MAX_RECEIPT_SAMPLE_BYTES = 1024
 MAX_RECEIPT_EXCERPT_JSON_CHARS = 512
 MAX_RECEIPT_STRUCTURE_JSON_BYTES = 1536
 MAX_RECEIPT_STRUCTURE_ITEMS = 16
+MAX_RECEIPT_SALIENT_LINES = 4
+MAX_RECEIPT_SALIENT_LINE_JSON_CHARS = 240
 MAX_PROOF_RECIPE_INPUTS = 256
 MAX_PROOF_ATTEMPTS = 11
 MAX_PROOF_POLICY_STRING_BYTES = 256
@@ -3124,9 +3126,11 @@ def _receipt_stream_evidence_errors(
             kind = structured.get("kind")
             scope = structured.get("scope")
             details_omitted = structured.get("details_omitted")
+            structured_version = structured.get("version")
             if (
-                isinstance(structured.get("version"), bool)
-                or structured.get("version") != 1
+                type(structured_version) is not int
+                or structured_version not in (1, 2)
+                or (structured_version == 2 and kind != "text")
             ):
                 errors.append(
                     f"{structured_label} has an invalid version"
@@ -3321,6 +3325,13 @@ def _receipt_stream_evidence_errors(
                         "nonempty_line_count",
                     }
                 )
+                if structured_version == 2:
+                    expected_structure_keys.update(
+                        {
+                            "salient_lines",
+                            "salient_lines_omitted",
+                        }
+                    )
                 line_count = structured.get("line_count")
                 nonempty_line_count = structured.get(
                     "nonempty_line_count"
@@ -3342,6 +3353,58 @@ def _receipt_stream_evidence_errors(
                     errors.append(
                         f"{structured_label} has invalid text shape"
                     )
+                if structured_version == 2:
+                    salient_lines = structured.get("salient_lines")
+                    salient_lines_omitted = structured.get(
+                        "salient_lines_omitted"
+                    )
+                    marker = re.compile(
+                        r"^(?:SUMMARY|ORACLE|RESULT|RECORD|REC|ERROR|"
+                        r"FLAG_CANDIDATE)(?::| )"
+                    )
+                    if (
+                        not isinstance(salient_lines, list)
+                        or not 1 <= len(salient_lines) <= (
+                            MAX_RECEIPT_SALIENT_LINES
+                        )
+                        or any(
+                            not isinstance(line, str)
+                            for line in (
+                                salient_lines
+                                if isinstance(salient_lines, list)
+                                else []
+                            )
+                        )
+                        or len(salient_lines) != len(set(salient_lines))
+                        or any(
+                            not line.isascii()
+                            or marker.match(line) is None
+                            or any(
+                                character != "\t"
+                                and not 0x20 <= ord(character) <= 0x7E
+                                for character in line
+                            )
+                            or len(
+                                json.dumps(
+                                    line,
+                                    ensure_ascii=True,
+                                    separators=(",", ":"),
+                                )
+                            )
+                            > MAX_RECEIPT_SALIENT_LINE_JSON_CHARS
+                            for line in (
+                                salient_lines
+                                if isinstance(salient_lines, list)
+                                else []
+                            )
+                        )
+                        or not valid_nonnegative_integer(
+                            salient_lines_omitted
+                        )
+                    ):
+                        errors.append(
+                            f"{structured_label} has invalid salient lines"
+                        )
             if set(structured) != expected_structure_keys:
                 errors.append(
                     f"{structured_label} has an invalid schema"
@@ -4915,7 +4978,6 @@ def _has_rev_inventory_oracle_id_marker(value: object) -> bool:
 class _RevInventoryLinkIndex:
     linked_run_ids_by_experiment: Mapping[str, frozenset[str]]
     marked_run_or_receipt_experiment_ids: frozenset[str]
-    marked_fact_ids: frozenset[str]
     marked_fact_source_run_ids: frozenset[str]
     oracle_copy_fact_source_run_ids: frozenset[str]
     oracle_copy_experiment_ids: frozenset[str]
@@ -4978,7 +5040,6 @@ def _rev_inventory_link_index(
         if outcome is not None:
             oracle_copy_experiment_ids.add(experiment_id)
 
-    marked_fact_ids: set[str] = set()
     marked_fact_source_run_ids: set[str] = set()
     oracle_copy_fact_source_run_ids: set[str] = set()
     for fact in state.facts:
@@ -4987,7 +5048,6 @@ def _rev_inventory_link_index(
             oracle_copy_fact_source_run_ids.add(fact.source_run_id)
         if not _has_rev_inventory_outcome_marker(outcome):
             continue
-        marked_fact_ids.add(fact.id)
         if isinstance(fact.source_run_id, str):
             marked_fact_source_run_ids.add(fact.source_run_id)
 
@@ -4999,7 +5059,6 @@ def _rev_inventory_link_index(
         marked_run_or_receipt_experiment_ids=frozenset(
             marked_run_or_receipt_experiment_ids
         ),
-        marked_fact_ids=frozenset(marked_fact_ids),
         marked_fact_source_run_ids=frozenset(
             marked_fact_source_run_ids
         ),
@@ -5073,14 +5132,14 @@ def _rev_inventory_state_errors(
             _has_rev_inventory_outcome_marker(experiment_outcome)
             or experiment.id
             in link_index.marked_run_or_receipt_experiment_ids
-            or any(
-                fact_id in link_index.marked_fact_ids
-                for fact_id in experiment.evidence_fact_ids
-            )
             or not linked_run_ids.isdisjoint(
                 link_index.marked_fact_source_run_ids
             )
         )
+        # A typed inventory Fact may legitimately support a later strategic
+        # experiment.  Evidence references do not transfer ownership of the
+        # oracle graph: only the seed identity, descriptor, result, or a
+        # directly linked run/receipt/fact can identify that graph.
         linked_has_oracle_copy = (
             experiment.id in link_index.oracle_copy_experiment_ids
             or not linked_run_ids.isdisjoint(
@@ -11564,10 +11623,6 @@ def _forensic_index_seed_binding_errors(
         or not _forensic_index_sha256(
             source_binding.get("adapter_plan_sha256")
         )
-        or state.metadata.get("adapter_seed_source_binding")
-        != source_binding
-        or state.metadata.get("adapter_seed_plan_sha256")
-        != source_binding.get("adapter_plan_sha256")
         or (
             source_binding.get("path") is not None
             and type(source_binding.get("path")) is not str
@@ -11588,6 +11643,11 @@ def _forensic_index_seed_binding_errors(
     ):
         errors.append(f"{label} seed/source binding is invalid")
         return errors
+    # This function validates a durable terminal execution graph.  The
+    # singleton metadata binding denotes the *current* adapter plan and may
+    # advance when a newly pinned runtime image creates a replacement seed.
+    # Historical executions remain bound by their immutable experiment/run
+    # copies and the canonical source manifest/inventory checks below.
     primary_path = source_binding.get("path")
     if state.source_inventory:
         matching = [
@@ -11791,6 +11851,11 @@ def _forensic_index_execution_state_errors(
                 if type(stream_evidence) is dict
                 else None
             )
+            # A terminal graph keeps the epoch pinned when the mutable
+            # challenge configuration later advances (for example, on a
+            # budget reset).  The exact evaluation copies above bind the
+            # experiment and receipt to this same run/envelope graph.
+            graph_configuration_epoch = run.configuration_epoch
             if (
                 run.status is not expected_run_status
                 or run.role != "tool"
@@ -11799,8 +11864,10 @@ def _forensic_index_execution_state_errors(
                     RunOrigin.MANAGED_TOOL,
                     RunOrigin.OPERATOR_TOOL,
                 }
-                or type(run.configuration_epoch) is not int
-                or run.configuration_epoch != state.configuration_epoch
+                or type(graph_configuration_epoch) is not int
+                or not 0 <= graph_configuration_epoch <= (
+                    state.configuration_epoch
+                )
                 or receipt.experiment_id != experiment.id
                 or receipt.run_id != run.id
                 or receipt.outcome is not expected_receipt_outcome
@@ -11963,7 +12030,7 @@ def _forensic_index_execution_state_errors(
                     or envelope.challenge_id != state.challenge_id
                     or envelope.experiment_id != experiment.id
                     or envelope.configuration_epoch
-                    != state.configuration_epoch
+                    != graph_configuration_epoch
                     or envelope.run_id != run.id
                     or envelope.run_origin != run.origin.value
                     or envelope.request_path != run.request_path

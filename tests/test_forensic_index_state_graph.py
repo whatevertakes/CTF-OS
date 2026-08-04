@@ -235,6 +235,67 @@ class ForensicIndexStateGraphTests(unittest.TestCase):
                 validate_forensic_index_execution_state_graph(state)
                 state.validate()
 
+    def test_terminal_graphs_remain_valid_at_later_configuration_epoch(
+        self,
+    ) -> None:
+        for label, original in (
+            ("confirmed", self.confirmed),
+            ("early rejected", self.rejected),
+            ("semantic rejected", self.semantic_rejected),
+        ):
+            with self.subTest(label=label):
+                state = copy.deepcopy(original)
+                _experiment, run, receipt, *_ = _graph_records(state)
+                pinned_epoch = run.configuration_epoch
+                pinned_receipt = copy.deepcopy(receipt.to_dict())
+                pinned_payloads = copy.deepcopy(
+                    _execution_payloads(state)
+                )
+
+                state.configuration_epoch += 1
+
+                validate_forensic_index_execution_state_graph(state)
+                self.assertEqual(run.configuration_epoch, pinned_epoch)
+                self.assertEqual(receipt.to_dict(), pinned_receipt)
+                self.assertEqual(
+                    _execution_payloads(state),
+                    pinned_payloads,
+                )
+
+    def test_terminal_graphs_survive_current_seed_plan_rotation(
+        self,
+    ) -> None:
+        for label, original in (
+            ("confirmed", self.confirmed),
+            ("early rejected", self.rejected),
+            ("semantic rejected", self.semantic_rejected),
+        ):
+            with self.subTest(label=label):
+                state = copy.deepcopy(original)
+                experiment = _execution_experiment(state)
+                historical_binding = copy.deepcopy(
+                    experiment.extra["source_binding"]
+                )
+                replacement_binding = copy.deepcopy(
+                    historical_binding
+                )
+                replacement_binding["adapter_plan_sha256"] = "f" * 64
+                self.assertNotEqual(
+                    replacement_binding,
+                    historical_binding,
+                )
+                state.metadata["adapter_seed_plan_sha256"] = "f" * 64
+                state.metadata["adapter_seed_source_binding"] = (
+                    replacement_binding
+                )
+
+                validate_forensic_index_execution_state_graph(state)
+                state.validate()
+                self.assertEqual(
+                    experiment.extra["source_binding"],
+                    historical_binding,
+                )
+
     def test_orphan_evaluation_fact_progress_run_and_receipt_rejected(
         self,
     ) -> None:
@@ -371,6 +432,7 @@ class ForensicIndexStateGraphTests(unittest.TestCase):
             state.metadata["source_manifest_sha256"] = "0" * 64
 
         def wrong_config(state):
+            state.configuration_epoch += 2
             _graph_records(state)[1].configuration_epoch += 1
 
         def wrong_image(state):

@@ -82,9 +82,9 @@ class RuntimeConfig:
     storage_scan_max_bytes: int = 256 * 1024 * 1024 * 1024
     command_timeout_s: int = 900
     wave_deadline_s: float = 1800.0
-    managed_wave_queue_reserve_s: float = 90.0
-    managed_wave_role_call_reserve_s: float = 240.0
-    managed_wave_action_commit_reserve_s: float = 180.0
+    managed_wave_queue_reserve_s: float = 900.0
+    managed_wave_role_call_reserve_s: float = 1200.0
+    managed_wave_action_commit_reserve_s: float = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +364,8 @@ wave_width_proof = 3
 # Calls wait here when the account/provider limit is reached. Roles are not
 # removed and waves are not narrowed.
 provider_max_concurrent_calls = 4
+# Fallback admission timeout for invocations without a challenge hard deadline.
+# Bounded challenges wait until their immutable challenge deadline or cancel.
 provider_wait_timeout_s = 900.0
 tool_cpu_budget = 8
 tool_memory_gib = 18
@@ -403,9 +405,11 @@ wave_deadline_s = 1800.0
 # reserves one provider-admission interval, one call interval per provider
 # batch, and deterministic action/checkpoint time. Provider concurrency changes
 # only the number of batches; it never narrows the logical wave.
-managed_wave_queue_reserve_s = 90.0
-managed_wave_role_call_reserve_s = 240.0
-managed_wave_action_commit_reserve_s = 180.0
+# These fail-closed defaults are calibrated from completed managed-run provider
+# waits, role-call wall times, and post-role action/checkpoint latency.
+managed_wave_queue_reserve_s = 900.0
+managed_wave_role_call_reserve_s = 1200.0
+managed_wave_action_commit_reserve_s = 300.0
 """
 
 

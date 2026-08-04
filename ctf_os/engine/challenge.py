@@ -329,6 +329,9 @@ from ctf_os.engine.receipt_summary import (
     build_receipt_preview,
     summarize_stream_snapshot,
 )
+from ctf_os.engine.web_response_summary import (
+    evaluate_web_response_stdout,
+)
 from ctf_os.engine.state_machine import TransitionEvidence, validate_transition
 from ctf_os.governor import (
     GOVERNOR_METADATA_KEY,
@@ -345,6 +348,7 @@ from ctf_os.live_broker import (
     allocated_live_broker_directory,
 )
 from ctf_os.models import (
+    ACTIVE_HYPOTHESIS_STATUSES,
     ArtifactReference,
     Budget,
     BudgetMode,
@@ -477,6 +481,44 @@ class EngineError(RuntimeError):
     """An expected, operator-facing engine failure."""
 
 
+def managed_request_binding_errors(
+    record: object,
+    *,
+    identity: ChallengeIdentity,
+    run: RunReference,
+) -> tuple[str, ...]:
+    """Validate the immutable request envelope for one reserved model run."""
+
+    if not isinstance(record, Mapping):
+        return ("request.not_an_object",)
+    expected: dict[str, Any] = {
+        "schema_version": RUN_ENVELOPE_SCHEMA_VERSION,
+        "contest_id": identity.contest_id,
+        "category": identity.category,
+        "challenge_id": identity.challenge_id,
+        "run_id": run.id,
+        "base_revision": run.base_revision,
+        "state_revision": run.base_revision,
+        "configuration_epoch": run.configuration_epoch,
+        "kind": "model",
+        "role": run.role,
+    }
+    if isinstance(run.model, str) and run.model:
+        expected["model"] = run.model
+    contract_version = run.extra.get("contract_version")
+    if type(contract_version) is int:
+        expected["contract_version"] = contract_version
+    continuity_audit = run.extra.get(THREAD_CONTINUITY_RUN_KEY)
+    if continuity_audit is not None:
+        expected[THREAD_CONTINUITY_RUN_KEY] = continuity_audit
+    return tuple(
+        f"request.{field}_mismatch"
+        for field, value in expected.items()
+        if canonical_json_bytes(record.get(field))
+        != canonical_json_bytes(value)
+    )
+
+
 class SessionAlreadyRunning(EngineError):
     pass
 
@@ -563,6 +605,194 @@ class _ManagedToolBatchStorageAdmission:
     experiment_ids: frozenset[str]
     base_revision: int
     requested_bytes: int
+
+
+_MANAGED_ACTION_INPUT_BINDING_KEY = "managed_action_input_binding"
+_MANAGED_ACTION_INPUT_PROTOCOL = "same_run_publications_v1"
+_MAX_MANAGED_ACTION_INPUTS = 8
+_MANAGED_SEMANTIC_EVALUATION_CONTRACT_KEY = (
+    "managed_semantic_evaluation_contract_version"
+)
+_MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION = 2
+_MANAGED_SEMANTIC_WITNESS_LINE = re.compile(
+    r"(?:REC|RECORD):[ \t]*[!-~](?:[\x20-\x7e\t]*)"
+)
+
+
+def _managed_generic_semantic_evaluation(
+    experiment: Experiment,
+) -> bool:
+    """Return whether a generic managed command uses the witness gate."""
+
+    return (
+        experiment.extra.get(_MANAGED_SEMANTIC_EVALUATION_CONTRACT_KEY)
+        == _MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION
+        and experiment.kind in {
+            ExperimentKind.PROBE,
+            ExperimentKind.STRATEGIC,
+        }
+        and experiment.proof_recipe is None
+        and experiment.extra.get("engine_executor") is None
+        and experiment.extra.get("partial_oracle") is None
+    )
+
+
+def _engine_owned_semantic_evaluation(experiment: Experiment) -> bool:
+    """Return whether only an engine-owned typed path may set semantics."""
+
+    return (
+        experiment.kind is ExperimentKind.PROOF
+        or experiment.proof_recipe is not None
+        or experiment.extra.get("adapter_seed") is True
+        or "engine_executor" in experiment.extra
+        or "managed_action_kind" in experiment.extra
+        or "partial_oracle" in experiment.extra
+    )
+
+
+def _generic_semantic_evaluation(experiment: Experiment) -> bool:
+    """Return whether an experiment has only free-form model semantics."""
+
+    return (
+        experiment.kind
+        in {ExperimentKind.PROBE, ExperimentKind.STRATEGIC}
+        and not _engine_owned_semantic_evaluation(experiment)
+    )
+
+
+def _managed_semantic_witness_available(
+    stdout_evidence: object,
+    *,
+    artifact: ArtifactReference | None,
+    run_id: str,
+    expected_stdout_bytes: int | None = None,
+) -> bool:
+    """Recognize one bounded raw witness projected from complete stdout.
+
+    The receipt summarizer has already hash/size verified the immutable stream.
+    This check deliberately grants no meaning to ``SUMMARY`` or ``oracle=``;
+    it only admits an anchored raw record for later semantic reconciliation.
+    """
+
+    if (
+        not isinstance(stdout_evidence, Mapping)
+        or artifact is None
+        or artifact.source_run_id != run_id
+        or artifact.size is None
+        or stdout_evidence.get("stream") != "stdout"
+        or stdout_evidence.get("artifact_id") != artifact.id
+        or stdout_evidence.get("path") != artifact.path
+        or stdout_evidence.get("sha256") != artifact.sha256
+        or stdout_evidence.get("coverage") != "complete_stream"
+        or stdout_evidence.get("capture_complete") is not True
+        or stdout_evidence.get("truncation_known") is not True
+        or stdout_evidence.get("truncated") is not False
+        or stdout_evidence.get("stream_error_present") is not False
+        or stdout_evidence.get("capture_error_present") is not False
+        or stdout_evidence.get("stored_bytes") != artifact.size
+        or stdout_evidence.get("drained_bytes") != artifact.size
+        or (
+            expected_stdout_bytes is not None
+            and expected_stdout_bytes != artifact.size
+        )
+    ):
+        return False
+    summary = stdout_evidence.get("structured_summary")
+    if (
+        not isinstance(summary, Mapping)
+        or summary.get("version") != 2
+        or summary.get("kind") != "text"
+        or summary.get("scope") != "complete_stream"
+        or summary.get("bytes_analyzed") != artifact.size
+        or summary.get("details_omitted") is not False
+        or summary.get("line_count_exact") is not True
+    ):
+        return False
+    salient_lines = summary.get("salient_lines")
+    if not isinstance(salient_lines, list):
+        return False
+    candidates = {
+        line
+        for line in salient_lines
+        if (
+            isinstance(line, str)
+            and len(line) <= 200
+            and not line.endswith("...")
+            and _MANAGED_SEMANTIC_WITNESS_LINE.fullmatch(line) is not None
+        )
+    }
+    if not candidates or stdout_evidence.get("redaction_count") != 0:
+        return False
+
+    def sample_text(name: str) -> tuple[Mapping[str, object], str] | None:
+        sample = stdout_evidence.get(name)
+        if (
+            not isinstance(sample, Mapping)
+            or sample.get("encoding") != "utf-8"
+            or sample.get("text_truncated") is not False
+            or not isinstance(sample.get("text"), str)
+        ):
+            return None
+        return sample, str(sample["text"])
+
+    edge_lines: set[str] = set()
+    head_value = sample_text("head")
+    if head_value is not None:
+        head, head_text = head_value
+        if head.get("byte_start") == 0:
+            head_lines = head_text.splitlines()
+            if (
+                head_lines
+                and head.get("byte_end") == artifact.size
+            ):
+                edge_lines.add(head_lines[0])
+                edge_lines.add(head_lines[-1])
+            if head.get("byte_end") != artifact.size:
+                first_with_ending = head_text.splitlines(keepends=True)
+                if (
+                    first_with_ending
+                    and first_with_ending[0].endswith(("\n", "\r"))
+                ):
+                    edge_lines.add(first_with_ending[0].rstrip("\r\n"))
+
+    tail_value = sample_text("tail")
+    if tail_value is not None:
+        tail, tail_text = tail_value
+        if tail.get("byte_end") == artifact.size:
+            trimmed_tail = tail_text.rstrip("\r\n")
+            tail_lines = trimmed_tail.splitlines()
+            if tail_lines:
+                last_line = tail_lines[-1]
+                line_start = len(trimmed_tail) - len(last_line)
+                if (
+                    tail.get("byte_start") == 0
+                    or (
+                        line_start > 0
+                        and trimmed_tail[line_start - 1] in "\r\n"
+                    )
+                ):
+                    edge_lines.add(last_line)
+    return not candidates.isdisjoint(edge_lines)
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedActionInput:
+    artifact_id: str
+    canonical_path: str
+    destination: str
+    sha256: str
+    size_bytes: int
+    source_run_id: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "artifact_id": self.artifact_id,
+            "canonical_path": self.canonical_path,
+            "destination": self.destination,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "source_run_id": self.source_run_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -720,6 +950,15 @@ _PRIMARY_SOURCE_SUFFIXES = (
     ".sage",
     ".sh",
     ".ts",
+)
+_PRIMARY_SOURCE_EXCLUDED_BASENAMES = frozenset(
+    {
+        # Operator-generated provenance is part of the immutable input
+        # manifest, but it is not challenge evidence.  Letting its .json
+        # suffix win category scoring can bind adapter seeds to metadata
+        # instead of the public handout.
+        "nyu_public_metadata.json",
+    }
 )
 
 
@@ -1101,13 +1340,19 @@ def _select_adapter_primary_source(
         normalized_category = "forensics"
     elif normalized_category == "web-security":
         normalized_category = "web"
+    eligible_sources = [
+        source
+        for source in sources
+        if PurePosixPath(source.path.casefold()).name
+        not in _PRIMARY_SOURCE_EXCLUDED_BASENAMES
+    ]
     probes = [
         (
             _classify_primary_source(source_root, source)
             if normalized_category in {"pwn", "reversing"}
             else _PrimarySourceProbe(source)
         )
-        for source in sources
+        for source in eligible_sources
     ]
     if normalized_category in {"pwn", "reversing"}:
         probes = [probe for probe in probes if probe.inspected]
@@ -1493,6 +1738,70 @@ def _managed_shell_argv(script: str) -> tuple[str, str, str]:
     argv = (*MANAGED_SHELL_ARGV_PREFIX, script)
     CommandSpec.create(argv)
     return argv
+
+
+def _managed_shell_absolute_work_references(
+    script: str,
+) -> tuple[str, ...]:
+    """Return direct absolute ``/work`` path arguments in one shell script.
+
+    Generic managed actions execute with ``/work`` as their current directory.
+    Action-created output should therefore use relative paths.  A direct
+    absolute ``/work/FILE`` argument is treated as an immutable input request
+    and must be backed by the same run's publication manifest.
+
+    This intentionally inspects shell words rather than arbitrary here-doc
+    payload text.  It catches executable/input arguments such as
+    ``python3 /work/solver.py`` without mistaking an inline program's string
+    literals for shell-level dependencies.
+    """
+
+    try:
+        words = shlex.split(script, comments=True, posix=True)
+    except ValueError as error:
+        raise EngineError(
+            "managed shell script cannot be tokenized for /work binding"
+        ) from error
+    references: set[str] = set()
+    for word in words:
+        candidate = word
+        if candidate.startswith("</work/"):
+            candidate = candidate[1:]
+        if not candidate.startswith("/work/"):
+            continue
+        # POSIX control punctuation can remain attached when shlex.split is
+        # used without punctuation mode.  It is not part of the path.
+        relative = candidate.removeprefix("/work/").rstrip(";&|)")
+        try:
+            normalized = normalize_locator(relative)
+        except SafeFileError as error:
+            raise EngineError(
+                "managed command contains an unsafe absolute /work path"
+            ) from error
+        if normalized.split("/", 1)[0] in {".ctf", ".ctfos"}:
+            raise EngineError(
+                "managed command may not name reserved /work metadata"
+            )
+        references.add(normalized)
+    return tuple(sorted(references))
+
+
+def _require_managed_shell_work_inputs_bound(
+    script: str,
+    bindings: Sequence[_ManagedActionInput],
+) -> None:
+    """Reject shell-level ``/work`` inputs absent from same-run bindings."""
+
+    references = _managed_shell_absolute_work_references(script)
+    destinations = {item.destination for item in bindings}
+    missing = [item for item in references if item not in destinations]
+    if missing:
+        rendered = ", ".join(json.dumps(item) for item in missing[:4])
+        suffix = " ..." if len(missing) > 4 else ""
+        raise EngineError(
+            "managed command references absolute /work input without a "
+            f"same-run publication binding: {rendered}{suffix}"
+        )
 
 
 _ADAPTER_SEED_RUN_METADATA_KEYS = (
@@ -4104,6 +4413,77 @@ class ChallengeEngine:
 
         run_paths = self.store.run_paths(identity, run_id=reserved.id)
         challenge_root = self.store.challenge_paths(identity).root
+        try:
+            request_record = read_json(run_paths.request)
+        except (OSError, StrictJSONError) as error:
+            raise EngineError(
+                f"managed request record is invalid: {reserved.id}"
+            ) from error
+        request_binding_errors = managed_request_binding_errors(
+            request_record,
+            identity=identity,
+            run=reserved,
+        )
+        if request_binding_errors:
+            raise EngineError(
+                "managed request record binding mismatch: "
+                f"{reserved.id}: "
+                + "; ".join(request_binding_errors)
+            )
+        provider_path = run_paths.root / "provider.json"
+        provider_record: dict[str, Any]
+        provider_record_existed = provider_path.is_file()
+        if provider_record_existed:
+            loaded_provider_record = read_json(provider_path)
+            if not isinstance(loaded_provider_record, dict):
+                raise EngineError(
+                    f"managed provider record is invalid: {reserved.id}"
+                )
+            provider_record = dict(loaded_provider_record)
+            recorded_schema_version = provider_record.get(
+                "schema_version"
+            )
+            if recorded_schema_version is not None and (
+                type(recorded_schema_version) is not int
+                or recorded_schema_version != 1
+            ):
+                raise EngineError(
+                    "managed provider record schema version is invalid: "
+                    f"{reserved.id}"
+                )
+            recorded_run_id = provider_record.get("run_id")
+            if (
+                recorded_run_id is not None
+                and (
+                    type(recorded_run_id) is not str
+                    or recorded_run_id != reserved.id
+                )
+            ):
+                raise EngineError(
+                    "managed provider record run id mismatch: "
+                    f"{reserved.id}"
+                )
+            recorded_configuration_epoch = provider_record.get(
+                "configuration_epoch"
+            )
+            if (
+                recorded_configuration_epoch is not None
+                and (
+                    type(recorded_configuration_epoch) is not int
+                    or recorded_configuration_epoch
+                    != reserved.configuration_epoch
+                )
+            ):
+                raise EngineError(
+                    "managed provider record configuration epoch mismatch: "
+                    f"{reserved.id}"
+                )
+        else:
+            provider_record = {
+                "configuration_epoch": reserved.configuration_epoch,
+                "run_id": reserved.id,
+                "started_at": None,
+            }
         status = self._batch_result_run_status(result)
         produced_thread_digest: str | None = None
         thread_secret_pointer: str | None = None
@@ -4131,40 +4511,171 @@ class ChallengeEngine:
                 ).as_posix()
             except ValueError:
                 attempt_pointer = None
-        self.store.write_run_result(
-            identity,
-            reserved.id,
-            {
-                "base_revision": reserved.base_revision,
-                "status": status.value,
-                "provisional_managed_result": True,
-                "attempt_output_path": attempt_pointer,
-                "attempt_count": len(result.attempts),
-                "artifacts": [],
-                "flag_candidate_count": len(result.flag_candidates),
-                "failure_kinds": [
-                    failure.kind for failure in result.failures
-                ],
-            },
-        )
-        self.store.write_run_validation(
-            identity,
-            reserved.id,
-            {
-                "ok": (
-                    result.completed
-                    and result.validation.valid
-                ),
-                "base_revision": reserved.base_revision,
-                "errors": list(result.validation.errors),
-                "provisional_managed_result": True,
-            },
-        )
+        provisional_result = {
+            "base_revision": reserved.base_revision,
+            "status": status.value,
+            "provisional_managed_result": True,
+            "attempt_output_path": attempt_pointer,
+            "attempt_count": len(result.attempts),
+            "artifacts": [],
+            "flag_candidate_count": len(result.flag_candidates),
+            "failure_kinds": [
+                failure.kind for failure in result.failures
+            ],
+        }
+        expected_result_document = {
+            "schema_version": WORKER_RESULT_SCHEMA_VERSION,
+            "contest_id": identity.contest_id,
+            "category": identity.category,
+            "challenge_id": identity.challenge_id,
+            "run_id": reserved.id,
+            **provisional_result,
+        }
+        if run_paths.result.is_file():
+            existing_result = read_json(run_paths.result)
+            if canonical_json_bytes(
+                existing_result
+            ) != canonical_json_bytes(expected_result_document):
+                raise EngineError(
+                    "managed provisional result retry mismatch: "
+                    f"{reserved.id}"
+                )
+        else:
+            self.store.write_run_result(
+                identity,
+                reserved.id,
+                provisional_result,
+            )
+
+        provisional_validation = {
+            "ok": (
+                result.completed
+                and result.validation.valid
+            ),
+            "base_revision": reserved.base_revision,
+            "errors": list(result.validation.errors),
+            "provisional_managed_result": True,
+        }
+        if run_paths.validation.is_file():
+            existing_validation = read_json(run_paths.validation)
+            if not isinstance(existing_validation, dict):
+                raise EngineError(
+                    "managed provisional validation retry is invalid: "
+                    f"{reserved.id}"
+                )
+            validated_at = existing_validation.get("validated_at")
+            comparable_validation = dict(existing_validation)
+            comparable_validation.pop("validated_at", None)
+            if (
+                not isinstance(validated_at, str)
+                or not validated_at
+                or canonical_json_bytes(comparable_validation)
+                != canonical_json_bytes(
+                    {
+                        "run_id": reserved.id,
+                        **provisional_validation,
+                    }
+                )
+            ):
+                raise EngineError(
+                    "managed provisional validation retry mismatch: "
+                    f"{reserved.id}"
+                )
+        else:
+            self.store.write_run_validation(
+                identity,
+                reserved.id,
+                provisional_validation,
+            )
         managed_request_sha256 = sha256_file(run_paths.request)
         managed_result_sha256 = sha256_file(run_paths.result)
         managed_validation_sha256 = sha256_file(
             run_paths.validation
         )
+
+        provider_started = False
+        if provider_record_existed:
+            if "provider_started" in provider_record:
+                recorded_provider_started = provider_record[
+                    "provider_started"
+                ]
+                if type(recorded_provider_started) is not bool:
+                    raise EngineError(
+                        "managed provider record start marker is invalid: "
+                        f"{reserved.id}"
+                    )
+                provider_started = recorded_provider_started
+            else:
+                # Backward-compatible running sidecars predate the explicit
+                # marker.  Only an actual running record with a start time may
+                # use that fallback; a present non-boolean marker is corrupt.
+                provider_started = (
+                    provider_record.get("status") == "running"
+                    and isinstance(provider_record.get("started_at"), str)
+                    and bool(provider_record["started_at"])
+                )
+            started_at = provider_record.get("started_at")
+            if (
+                provider_started
+                and (
+                    not isinstance(started_at, str)
+                    or not started_at
+                )
+            ) or (not provider_started and started_at is not None):
+                raise EngineError(
+                    "managed provider start binding is invalid: "
+                    f"{reserved.id}"
+                )
+
+        expected_provider_fields = {
+            "schema_version": 1,
+            "status": status.value,
+            "run_id": reserved.id,
+            "configuration_epoch": reserved.configuration_epoch,
+            "provider_started": provider_started,
+            "provider_wait_seconds": result.timing.provider_wait_seconds,
+            "provider_process_span_seconds": (
+                result.timing.provider_process_span_seconds
+            ),
+            "model_call_wall_seconds": result.timing.model_call_wall_seconds,
+            "attempt_count": len(result.attempts),
+        }
+        prior_provider_status = provider_record.get("status")
+        if provider_record_existed and (
+            type(prior_provider_status) is not str
+            or prior_provider_status not in {
+                "running",
+                status.value,
+            }
+        ):
+            raise EngineError(
+                "managed provider terminal retry status mismatch: "
+                f"{reserved.id}"
+            )
+        if provider_record_existed and prior_provider_status == status.value:
+            provider_completed_at = provider_record.get("finished_at")
+            if (
+                not isinstance(provider_completed_at, str)
+                or not provider_completed_at
+                or any(
+                    type(provider_record.get(field)) is not type(expected)
+                    or provider_record.get(field) != expected
+                    for field, expected in expected_provider_fields.items()
+                )
+            ):
+                raise EngineError(
+                    "managed provider terminal retry record mismatch: "
+                    f"{reserved.id}"
+                )
+        else:
+            provider_completed_at = utc_now()
+        provider_record.update(
+            {
+                **expected_provider_fields,
+                "finished_at": provider_completed_at,
+            }
+        )
+        atomic_write_json(provider_path, provider_record)
 
         current = self.store.load(identity)
 
@@ -4212,6 +4723,14 @@ class ChallengeEngine:
                     "provider_wait_seconds": (
                         result.timing.provider_wait_seconds
                     ),
+                    "provider_started": provider_started,
+                    "provider_outcome_status": status.value,
+                    "provider_process_span_seconds": (
+                        result.timing.provider_process_span_seconds
+                    ),
+                    "model_call_wall_seconds": (
+                        result.timing.model_call_wall_seconds
+                    ),
                     "attempt_count": len(result.attempts),
                     "request_sha256": managed_request_sha256,
                     "result_sha256": managed_result_sha256,
@@ -4234,7 +4753,7 @@ class ChallengeEngine:
                     "provisional_managed_terminal": True,
                     "semantic_merge": False,
                     "stale_managed_result": stale,
-                    "provider_completed_at": utc_now(),
+                    "provider_completed_at": provider_completed_at,
                 }
             )
             if run.wave_id is not None:
@@ -4243,11 +4762,11 @@ class ChallengeEngine:
                     for item in latest.waves
                     if item.id == run.wave_id
                 )
-                statuses = {
+                statuses = [
                     item.status
                     for item in latest.runs
                     if item.id in wave.role_run_ids.values()
-                }
+                ]
                 terminal = {
                     RunStatus.COMPLETED,
                     RunStatus.INVALID,
@@ -4258,7 +4777,8 @@ class ChallengeEngine:
                 }
                 wave.status = (
                     "ready_to_reduce"
-                    if len(statuses) == 3 and statuses <= terminal
+                    if len(statuses) == len(wave.role_run_ids) == 3
+                    and all(item in terminal for item in statuses)
                     else "running"
                 )
 
@@ -4335,6 +4855,25 @@ class ChallengeEngine:
         if window <= 0:
             raise EngineError("challenge wall-clock budget is exhausted")
         return now_monotonic + window, now_epoch + window
+
+    @classmethod
+    def _challenge_budget_deadline_pair(
+        cls,
+        state: ChallengeState,
+    ) -> tuple[float | None, float | None]:
+        """Anchor only the challenge wall-clock bound, if one exists."""
+
+        now_monotonic = time.monotonic()
+        now_epoch = time.time()
+        remaining = cls._remaining_budget_seconds(
+            state,
+            now_epoch=now_epoch,
+        )
+        if remaining is None:
+            return None, None
+        if remaining <= 0:
+            raise EngineError("challenge wall-clock budget is exhausted")
+        return now_monotonic + remaining, now_epoch + remaining
 
     @staticmethod
     def _require_before_hard_deadline(
@@ -4477,19 +5016,32 @@ class ChallengeEngine:
         self.refresh_ingest(identity)
 
         def apply(state: ChallengeState) -> None:
-            if state.status is not ChallengeStatus.PAUSED:
-                raise EngineError("challenge is not paused")
-            target = state.resume_status or ChallengeStatus.ACTIVE
-            validate_transition(
-                state.status,
-                target,
-                evidence=TransitionEvidence(
+            if state.status is ChallengeStatus.PAUSED:
+                target = state.resume_status or ChallengeStatus.ACTIVE
+                evidence = TransitionEvidence(
                     proof_passed=(
                         target is ChallengeStatus.READY_TO_SUBMIT
                     ),
                     pause_resume_target=target.value,
-                ),
-            )
+                )
+            elif state.status in {
+                ChallengeStatus.NEEDS_HUMAN,
+                ChallengeStatus.STALLED,
+            }:
+                # ``resume`` is an explicit operator action.  A failed or
+                # budget-exhausted managed session can intentionally leave a
+                # challenge in NEEDS_HUMAN, while the deterministic governor
+                # can leave it STALLED.  The operator needs one canonical
+                # store-mediated way to acknowledge either stop and continue.
+                # Automated solve paths still treat both as stop statuses and
+                # never call this transition implicitly.
+                target = ChallengeStatus.ACTIVE
+                evidence = TransitionEvidence()
+            else:
+                raise EngineError(
+                    "challenge is not paused or awaiting operator action"
+                )
+            validate_transition(state.status, target, evidence=evidence)
             state.status = target
             state.resume_status = None
 
@@ -6408,6 +6960,235 @@ class ChallengeEngine:
         work.mkdir(parents=True, exist_ok=True, mode=0o700)
         return work
 
+    def _managed_action_inputs(
+        self,
+        source_run_id: str,
+        artifacts: Sequence[ArtifactReference],
+    ) -> tuple[_ManagedActionInput, ...]:
+        """Bind bounded same-run publications to their original destinations."""
+
+        if len(artifacts) > _MAX_MANAGED_ACTION_INPUTS:
+            raise EngineError(
+                "managed command has more than eight published inputs"
+            )
+        maximum_bytes = min(
+            DEFAULT_SNAPSHOT_MAX_BYTES,
+            self.config.runtime.work_tree_max_bytes,
+            self.store.max_artifact_bytes,
+        )
+        artifact_ids: set[str] = set()
+        destinations: set[str] = set()
+        total_bytes = 0
+        bindings: list[_ManagedActionInput] = []
+        for artifact in artifacts:
+            source_locator = artifact.extra.get("source_locator")
+            try:
+                destination = normalize_locator(source_locator)
+            except (SafeFileError, TypeError) as error:
+                raise EngineError(
+                    "managed command publication lacks a safe engine-owned "
+                    f"destination: {artifact.id}"
+                ) from error
+            first_component = destination.split("/", 1)[0]
+            if first_component in {".ctf", ".ctfos"}:
+                raise EngineError(
+                    "managed command publication targets reserved workspace "
+                    f"metadata: {artifact.id}"
+                )
+            if (
+                artifact.id in artifact_ids
+                or destination in destinations
+            ):
+                raise EngineError(
+                    "managed command publications must have unique ids and "
+                    "destinations"
+                )
+            if (
+                artifact.source_run_id != source_run_id
+                or not isinstance(artifact.sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", artifact.sha256) is None
+                or isinstance(artifact.size, bool)
+                or not isinstance(artifact.size, int)
+                or artifact.size < 0
+                or artifact.size > maximum_bytes
+            ):
+                raise EngineError(
+                    "managed command publication is not a bounded immutable "
+                    f"same-run artifact: {artifact.id}"
+                )
+            total_bytes += artifact.size
+            if total_bytes > maximum_bytes:
+                raise EngineError(
+                    "managed command publications exceed the action work-tree "
+                    "bound"
+                )
+            artifact_ids.add(artifact.id)
+            destinations.add(destination)
+            bindings.append(
+                _ManagedActionInput(
+                    artifact_id=artifact.id,
+                    canonical_path=artifact.path,
+                    destination=destination,
+                    sha256=artifact.sha256,
+                    size_bytes=artifact.size,
+                    source_run_id=source_run_id,
+                )
+            )
+        return tuple(bindings)
+
+    @staticmethod
+    def _managed_action_input_manifest(
+        source_run_id: str,
+        bindings: Sequence[_ManagedActionInput],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "protocol": _MANAGED_ACTION_INPUT_PROTOCOL,
+            "source_run_id": source_run_id,
+            "artifacts": [item.to_dict() for item in bindings],
+            "total_bytes": sum(item.size_bytes for item in bindings),
+        }
+
+    def _resolve_managed_action_inputs(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> tuple[_ManagedActionInput, ...]:
+        raw_binding = experiment.extra.get(
+            _MANAGED_ACTION_INPUT_BINDING_KEY
+        )
+        if raw_binding is None:
+            return ()
+        if (
+            experiment.extra.get("managed_command_protocol")
+            != MANAGED_SHELL_COMMAND_PROTOCOL
+            or not isinstance(experiment.source_run_id, str)
+            or not isinstance(raw_binding, Mapping)
+            or not isinstance(raw_binding.get("artifacts"), list)
+        ):
+            raise EngineError("managed action input binding is invalid")
+        artifacts_by_id = {
+            artifact.id: artifact for artifact in state.artifacts
+        }
+        raw_artifacts = raw_binding["artifacts"]
+        artifact_ids = [
+            item.get("artifact_id")
+            for item in raw_artifacts
+            if isinstance(item, Mapping)
+        ]
+        if (
+            len(artifact_ids) != len(raw_artifacts)
+            or any(not isinstance(item, str) for item in artifact_ids)
+            or any(item not in artifacts_by_id for item in artifact_ids)
+            or any(
+                item not in experiment.artifact_ids
+                for item in artifact_ids
+            )
+        ):
+            raise EngineError(
+                "managed action input binding references unavailable artifacts"
+            )
+        canonical_artifacts = [
+            artifacts_by_id[str(artifact_id)]
+            for artifact_id in artifact_ids
+        ]
+        bindings = self._managed_action_inputs(
+            experiment.source_run_id,
+            canonical_artifacts,
+        )
+        expected = self._managed_action_input_manifest(
+            experiment.source_run_id,
+            bindings,
+        )
+        if dict(raw_binding) != expected:
+            raise EngineError(
+                "managed action input binding changed after registration"
+            )
+        return bindings
+
+    def _stage_managed_action_inputs(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+        workspace: Path,
+        bindings: Sequence[_ManagedActionInput],
+    ) -> None:
+        """Copy exact immutable publications into an initialized action work."""
+
+        if not bindings:
+            return
+        current_bindings = self._resolve_managed_action_inputs(
+            state,
+            experiment,
+        )
+        if tuple(bindings) != current_bindings:
+            raise EngineError(
+                "managed action input binding changed before staging"
+            )
+        maximum_bytes = min(
+            DEFAULT_SNAPSHOT_MAX_BYTES,
+            self.config.runtime.work_tree_max_bytes,
+            self.store.max_artifact_bytes,
+        )
+        paths = self.store.challenge_paths(state.identity)
+        work = ensure_private_directory(workspace)
+        usage = measure_work_tree(work, maximum_bytes=maximum_bytes)
+        admitted_bytes = usage.accounted_bytes
+        artifacts_by_id = {
+            artifact.id: artifact for artifact in state.artifacts
+        }
+        for binding in bindings:
+            artifact = artifacts_by_id[binding.artifact_id]
+            try:
+                validate_artifact(paths.root, artifact)
+                destination_parts = binding.destination.split("/")
+                destination_parent = ensure_relative_directory(
+                    work,
+                    "/".join(destination_parts[:-1]),
+                )
+                destination = destination_parent / destination_parts[-1]
+                try:
+                    os.lstat(destination)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise EngineError(
+                        "managed action input would overwrite an initialized "
+                        f"challenge file: {binding.destination}"
+                    )
+
+                def admit_source(size: int) -> None:
+                    nonlocal admitted_bytes
+                    if admitted_bytes + size > maximum_bytes:
+                        raise SafeFileError(
+                            "managed action inputs exceed the work-tree bound"
+                        )
+                    admitted_bytes += size
+
+                copy_bounded_regular(
+                    paths.root,
+                    binding.canonical_path,
+                    destination,
+                    maximum_bytes=maximum_bytes,
+                    expected_sha256=binding.sha256,
+                    expected_size=binding.size_bytes,
+                    source_size_admission=admit_source,
+                    mode=0o500,
+                )
+            except EngineError:
+                raise
+            except (
+                ArtifactValidationError,
+                OSError,
+                SafeFileError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "managed action input could not be staged safely: "
+                    f"{binding.artifact_id}"
+                ) from error
+        measure_work_tree(work, maximum_bytes=maximum_bytes)
+
     def _quarantine_managed_action_stage(
         self,
         state: ChallengeState,
@@ -7184,6 +7965,10 @@ class ChallengeEngine:
                 identity,
                 candidate,
             ),
+            on_flag_notice=lambda candidate: self._print_codex_flag_notice(
+                identity,
+                candidate,
+            ),
             before_provider_start=lambda: self._before_provider_start(
                 identity,
             ),
@@ -7493,18 +8278,12 @@ class ChallengeEngine:
         )
         if policy.source != "runtime" and not policy.matches(value):
             return
-        print_key = (
-            identity.contest_id,
-            identity.category,
-            identity.challenge_id,
-            value,
-        )
-        with self._flag_lock:
-            if print_key in self._printed_flags:
-                return
-            # Batch callbacks run before the wave's one canonical state commit.
-            # A separate fsynced intent preserves immediate notification
-            # without changing the wave's base revision or writer width.
+        # Batch callbacks run before the wave's one canonical state commit.
+        # A separate fsynced intent preserves immediate notification without
+        # changing the wave's base revision or writer width. Record it even
+        # when an earlier notification-only observation already printed the
+        # same value; the store deduplicates intents by exact candidate value.
+        if not any(item.value == value for item in state.candidates):
             self.store.record_candidate_intent(
                 identity,
                 value=value,
@@ -7513,10 +8292,33 @@ class ChallengeEngine:
                 tier=policy.tier_for(value),
                 format_epoch=policy.configuration_epoch,
             )
-            print_flag_candidate(
-                DetectedFlag(value, source, observed_at)
-            )
-            self._printed_flags.add(print_key)
+        self._on_tool_flag(
+            identity,
+            DetectedFlag(value, source, observed_at),
+        )
+
+    def _print_codex_flag_notice(
+        self,
+        identity: ChallengeIdentity,
+        candidate: Any,
+    ) -> None:
+        """Print filtered code-shaped evidence without promoting it."""
+
+        value = str(candidate.value)
+        if not candidate_value_is_valid(value):
+            return
+        source = str(candidate.source)
+        state = self.store.load(identity)
+        policy = resolve_flag_format(
+            state,
+            self.config.runtime.flag_patterns,
+        )
+        if policy.source != "runtime" and not policy.matches(value):
+            return
+        self._on_tool_flag(
+            identity,
+            DetectedFlag(value, source, utc_now()),
+        )
 
     def _validated_managed_continuity_audit(
         self,
@@ -7738,8 +8540,8 @@ class ChallengeEngine:
         *,
         prefix: str,
         instruction: str,
-        deadline_monotonic_seconds: float,
-        deadline_epoch_seconds: float,
+        deadline_monotonic_seconds: float | None,
+        deadline_epoch_seconds: float | None,
         run_id: str | None = None,
         managed_workspace: bool = False,
         resume_thread_id: str | None = None,
@@ -7833,8 +8635,8 @@ class ChallengeEngine:
         *,
         run_id: str,
         instruction: str,
-        deadline_monotonic_seconds: float,
-        deadline_epoch_seconds: float,
+        deadline_monotonic_seconds: float | None,
+        deadline_epoch_seconds: float | None,
         managed_workspace: bool,
         resume_thread_id: str | None,
         contract_version: int,
@@ -7974,10 +8776,7 @@ class ChallengeEngine:
         (
             deadline_monotonic_seconds,
             deadline_epoch_seconds,
-        ) = self._budget_deadline_pair(
-            state,
-            self.config.runtime.wave_deadline_s,
-        )
+        ) = self._challenge_budget_deadline_pair(state)
         invocation = self._make_invocation(
             state,
             role,
@@ -8003,6 +8802,10 @@ class ChallengeEngine:
         result = self.batch_runner.run(
             invocation,
             on_flag=lambda candidate: self._print_codex_flag(
+                identity,
+                candidate,
+            ),
+            on_flag_notice=lambda candidate: self._print_codex_flag_notice(
                 identity,
                 candidate,
             ),
@@ -8045,6 +8848,7 @@ class ChallengeEngine:
         _semantic_barrier: bool = False,
         _managed_workspace: bool = False,
         _resume_thread_ids: Mapping[Role, str | None] | None = None,
+        _record_stall: bool = True,
     ) -> WaveOutcome:
         if not _session_owned:
             paths = self.store.challenge_paths(identity)
@@ -8064,6 +8868,7 @@ class ChallengeEngine:
                         _semantic_barrier=_semantic_barrier,
                         _managed_workspace=_managed_workspace,
                         _resume_thread_ids=_resume_thread_ids,
+                        _record_stall=_record_stall,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
@@ -8100,10 +8905,7 @@ class ChallengeEngine:
         (
             deadline_monotonic_seconds,
             deadline_epoch_seconds,
-        ) = self._budget_deadline_pair(
-            state,
-            self.config.runtime.wave_deadline_s,
-        )
+        ) = self._challenge_budget_deadline_pair(state)
         self._require_solving_prompt(state)
         invocations = tuple(
             self._make_invocation(
@@ -8148,6 +8950,10 @@ class ChallengeEngine:
         raw_results = BatchWaveRunner(self.batch_runner).run(
             logical_wave,
             on_flag=lambda candidate: self._print_codex_flag(
+                identity,
+                candidate,
+            ),
+            on_flag_notice=lambda candidate: self._print_codex_flag_notice(
                 identity,
                 candidate,
             ),
@@ -8242,7 +9048,7 @@ class ChallengeEngine:
         # independent no-progress cycles merely because it retained three
         # logical roles. The managed orchestrator checkpoints its diagnostics
         # and exposes them to the next Captain.
-        if not semantic_barrier_failed:
+        if not semantic_barrier_failed and _record_stall:
             committed = self._record_stall_if_needed(committed)
         committed_candidate_values = {
             candidate.value for candidate in committed.candidates
@@ -8433,6 +9239,30 @@ class ChallengeEngine:
                                 "size": source_reference.size,
                                 "purpose": str(item.get("purpose", "")),
                                 "kind": "immutable_challenge_input",
+                            }
+                        )
+                        continue
+                    canonical_reference = next(
+                        (
+                            artifact
+                            for artifact in state.artifacts
+                            if artifact.path == reported_locator
+                            and artifact.sha256 == claimed.lower()
+                        ),
+                        None,
+                    )
+                    if canonical_reference is not None:
+                        source_references.append(
+                            {
+                                "artifact_id": canonical_reference.id,
+                                "path": canonical_reference.path,
+                                "sha256": canonical_reference.sha256,
+                                "size": canonical_reference.size,
+                                "source_run_id": (
+                                    canonical_reference.source_run_id
+                                ),
+                                "purpose": str(item.get("purpose", "")),
+                                "kind": "canonical_artifact",
                             }
                         )
                         continue
@@ -8919,6 +9749,18 @@ class ChallengeEngine:
                 )
                 if stale_managed_run:
                     run_status = RunStatus.INTERRUPTED
+                final_managed_file_hashes: dict[str, str] = {}
+                if (
+                    existing_run is not None
+                    and existing_run.origin is RunOrigin.MANAGED_MODEL
+                ):
+                    final_managed_file_hashes = {
+                        "request_sha256": sha256_file(run_paths.request),
+                        "result_sha256": sha256_file(run_paths.result),
+                        "validation_sha256": sha256_file(
+                            run_paths.validation
+                        ),
+                    }
                 result_semantics_valid = (
                     result.completed
                     and result.validation.valid
@@ -8991,6 +9833,12 @@ class ChallengeEngine:
                         "provider_wait_seconds": (
                             result.timing.provider_wait_seconds
                         ),
+                        "provider_process_span_seconds": (
+                            result.timing.provider_process_span_seconds
+                        ),
+                        "model_call_wall_seconds": (
+                            result.timing.model_call_wall_seconds
+                        ),
                         "usage": {
                             "input_tokens": result.usage.input_tokens,
                             "cached_input_tokens": (
@@ -9008,6 +9856,10 @@ class ChallengeEngine:
                             else None
                         ),
                         "normalization_error": normalization_error,
+                        "contract_valid": (
+                            result.validation.valid
+                            and normalization_error is None
+                        ),
                         "source_references": output.get(
                             "source_references", []
                         ),
@@ -9027,6 +9879,7 @@ class ChallengeEngine:
                             partial_semantic_merge
                         ),
                         "stale_managed_result": stale_managed_run,
+                        **final_managed_file_hashes,
                     },
                 )
                 if managed_rejection is not None:
@@ -9949,11 +10802,11 @@ class ChallengeEngine:
                                     "hypothesis_ids is not an array",
                                 )
                                 continue
-                            open_hypotheses = {
+                            active_hypotheses = {
                                 item.id
                                 for item in state.hypotheses
                                 if item.status
-                                is HypothesisStatus.OPEN
+                                in ACTIVE_HYPOTHESIS_STATUSES
                             }
                             resolved_hypotheses = list(
                                 dict.fromkeys(
@@ -9965,14 +10818,14 @@ class ChallengeEngine:
                             )
                             unknown_hypotheses = sorted(
                                 set(resolved_hypotheses)
-                                - open_hypotheses
+                                - active_hypotheses
                             )
                             if unknown_hypotheses:
                                 reject_model_item(
                                     "rejected_actions",
                                     "action",
                                     index,
-                                    "unknown or non-open hypothesis ids: "
+                                    "unknown or inactive hypothesis ids: "
                                     + ", ".join(unknown_hypotheses),
                                 )
                                 continue
@@ -10027,6 +10880,9 @@ class ChallengeEngine:
                                 ),
                                 "managed_contract_version": (
                                     MANAGED_ROLE_RESULT_SCHEMA_VERSION
+                                ),
+                                _MANAGED_SEMANTIC_EVALUATION_CONTRACT_KEY: (
+                                    _MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION
                                 ),
                             }
                             if target_id is not None:
@@ -10104,10 +10960,44 @@ class ChallengeEngine:
                                 managed_model_script
                             )
                             action_extra = {}
+                        if state.schema_version >= STATE_SCHEMA_VERSION:
+                            action_extra.setdefault(
+                                _MANAGED_SEMANTIC_EVALUATION_CONTRACT_KEY,
+                                _MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION,
+                            )
+                        managed_input_bindings: tuple[
+                            _ManagedActionInput, ...
+                        ] = ()
                         if managed_model_command:
+                            try:
+                                managed_input_bindings = (
+                                    self._managed_action_inputs(
+                                        run_id,
+                                        artifacts,
+                                    )
+                                )
+                                _require_managed_shell_work_inputs_bound(
+                                    managed_model_script,
+                                    managed_input_bindings,
+                                )
+                            except EngineError as error:
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    f"invalid managed command inputs: {error}",
+                                )
+                                continue
                             action_extra["managed_command_protocol"] = (
                                 MANAGED_SHELL_COMMAND_PROTOCOL
                             )
+                            if managed_input_bindings:
+                                action_extra[
+                                    _MANAGED_ACTION_INPUT_BINDING_KEY
+                                ] = self._managed_action_input_manifest(
+                                    run_id,
+                                    managed_input_bindings,
+                                )
                         state.experiments.append(
                             Experiment(
                                 id=_record_id("E", run_id, str(index)),
@@ -10127,6 +11017,10 @@ class ChallengeEngine:
                                 ),
                                 status=ExperimentStatus.REGISTERED,
                                 source_run_id=run_id,
+                                artifact_ids=[
+                                    item.artifact_id
+                                    for item in managed_input_bindings
+                                ],
                                 extra=action_extra,
                             )
                         )
@@ -10364,6 +11258,7 @@ class ChallengeEngine:
                                             "refute_hypothesis_ids"
                                         ]
                                     ),
+                                    _model_authored=True,
                                 )
                             except EngineError as error:
                                 state.hypotheses = hypotheses_before
@@ -11990,6 +12885,10 @@ class ChallengeEngine:
         detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_diagnostic_flag,
+            notice_callback=lambda detected: self._on_tool_flag(
+                identity,
+                detected,
+            ),
             suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         try:
@@ -12787,12 +13686,48 @@ class ChallengeEngine:
         committed: ChallengeState,
         results: Sequence[BatchResult],
     ) -> tuple[BatchResult, ...]:
-        """Mirror deadline failure committed under the state lock to callers."""
+        """Mirror commit-time invalidation back to the result callers see."""
 
         runs = {run.id: run for run in committed.runs}
         effective: list[BatchResult] = []
         for result in results:
             run = runs.get(result.invocation.run_id)
+            normalization_error = (
+                run.extra.get("normalization_error")
+                if run is not None
+                else None
+            )
+            if (
+                run is not None
+                and run.status is RunStatus.INVALID
+                and isinstance(normalization_error, str)
+                and normalization_error
+                and result.completed
+                and result.validation.valid
+            ):
+                validation = ContractValidation(
+                    False,
+                    ("$: result normalization failed",),
+                    None,
+                )
+                attempts = result.attempts
+                if attempts:
+                    attempts = (
+                        *attempts[:-1],
+                        replace(
+                            attempts[-1],
+                            validation=validation,
+                        ),
+                    )
+                effective.append(
+                    replace(
+                        result,
+                        attempts=attempts,
+                        output=None,
+                        validation=validation,
+                    )
+                )
+                continue
             deadline_message: str | None = None
             if run is not None:
                 failures = run.extra.get("failures", [])
@@ -15147,6 +16082,10 @@ class ChallengeEngine:
         detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_diagnostic_flag,
+            notice_callback=lambda detected: self._on_tool_flag(
+                identity,
+                detected,
+            ),
             suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         try:
@@ -16346,6 +17285,10 @@ class ChallengeEngine:
         snapshot_flag_detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_snapshot_flag,
+            notice_callback=lambda detected: self._on_tool_flag(
+                identity,
+                detected,
+            ),
             suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         try:
@@ -17113,6 +18056,10 @@ class ChallengeEngine:
         pwn_flag_detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_pwn_flag,
+            notice_callback=lambda detected: self._on_tool_flag(
+                identity,
+                detected,
+            ),
             suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         source_staging = None
@@ -18450,6 +19397,10 @@ class ChallengeEngine:
         detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_tool_flag,
+            notice_callback=lambda detected: self._on_tool_flag(
+                identity,
+                detected,
+            ),
             suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         for experiment in pending:
@@ -18670,6 +19621,46 @@ class ChallengeEngine:
                     raise EngineError(
                         f"experiment is no longer registered: {item.id}"
                     )
+                if item.kind is ExperimentKind.STRATEGIC:
+                    hypotheses = {
+                        hypothesis.id: hypothesis
+                        for hypothesis in current.hypotheses
+                    }
+                    inactive_hypothesis_ids = list(
+                        dict.fromkeys(
+                            hypothesis_id
+                            for hypothesis_id in item.hypothesis_ids
+                            if (
+                                hypothesis_id not in hypotheses
+                                or hypotheses[hypothesis_id].status
+                                not in ACTIVE_HYPOTHESIS_STATUSES
+                            )
+                        )
+                    )
+                    missing_hypothesis_binding = not item.hypothesis_ids
+                    # Legacy/operator-authored strategic experiments may be
+                    # deliberately hypothesis-less.  Revalidate every parent
+                    # that is actually bound, but preserve that established
+                    # execution path when there is no binding to race with.
+                    if inactive_hypothesis_ids:
+                        cancelled_at = utc_now()
+                        item.status = ExperimentStatus.CANCELLED
+                        item.extra["cancelled_at"] = cancelled_at
+                        item.extra["cancelled_reason"] = (
+                            "inactive_strategic_hypothesis_before_execution"
+                        )
+                        item.extra["execution_rejection"] = {
+                            "schema_version": 1,
+                            "kind": "inactive_strategic_hypothesis",
+                            "cancelled_at": cancelled_at,
+                            "missing_hypothesis_binding": (
+                                missing_hypothesis_binding
+                            ),
+                            "inactive_hypothesis_ids": (
+                                inactive_hypothesis_ids
+                            ),
+                        }
+                        return
                 self._require_experiment_target_current(current, item)
                 self._require_adapter_seed_source_binding_current(
                     current,
@@ -18696,6 +19687,13 @@ class ChallengeEngine:
                 for item in running.experiments
                 if item.id == experiment.id
             )
+            if (
+                experiment.status is ExperimentStatus.CANCELLED
+                and experiment.extra.get("cancelled_reason")
+                == "inactive_strategic_hypothesis_before_execution"
+            ):
+                state = running
+                continue
             try:
                 argv = tuple(shlex.split(experiment.command))
             except ValueError as error:
@@ -18725,6 +19723,20 @@ class ChallengeEngine:
                 )
                 continue
             try:
+                managed_action_inputs = (
+                    self._resolve_managed_action_inputs(
+                        running,
+                        experiment,
+                    )
+                )
+                if (
+                    experiment.extra.get("managed_command_protocol")
+                    == MANAGED_SHELL_COMMAND_PROTOCOL
+                ):
+                    _require_managed_shell_work_inputs_bound(
+                        argv[2],
+                        managed_action_inputs,
+                    )
                 prepared_snapshot = (
                     self._prepare_rev_adapter_source_snapshot(
                         running,
@@ -18819,6 +19831,13 @@ class ChallengeEngine:
             engine_run_id = _run_id(f"tool-{experiment.id}")
             active_tool_run_id = engine_run_id
             seed_run_metadata = _adapter_seed_run_metadata(experiment)
+            if managed_action_inputs:
+                seed_run_metadata[
+                    _MANAGED_ACTION_INPUT_BINDING_KEY
+                ] = self._managed_action_input_manifest(
+                    str(experiment.source_run_id),
+                    managed_action_inputs,
+                )
             if source_snapshot_execution_binding is not None:
                 seed_run_metadata[
                     "source_snapshot_execution_binding"
@@ -18921,6 +19940,28 @@ class ChallengeEngine:
                     latest_for_run.budget.deadline_utc
                 )
                 started = time.monotonic()
+                if managed_action_inputs:
+                    client.initialize_workspace(
+                        deadline_monotonic_seconds=(
+                            command_deadline_monotonic
+                        )
+                    )
+                    latest_for_inputs = self.store.load(identity)
+                    current_experiment = next(
+                        item
+                        for item in latest_for_inputs.experiments
+                        if item.id == experiment.id
+                    )
+                    self._stage_managed_action_inputs(
+                        latest_for_inputs,
+                        current_experiment,
+                        execution_workspace,
+                        managed_action_inputs,
+                    )
+                    self._require_before_hard_deadline(
+                        command_deadline_monotonic,
+                        "managed action input staging",
+                    )
                 with FlagLogTailer(
                     execution_workspace,
                     detector,
@@ -19284,6 +20325,26 @@ class ChallengeEngine:
                         storage_pre_admitted=_storage_pre_admitted,
                     )
                     raise
+            managed_remote_web_summary_required = (
+                str(get_adapter(running.category).name) == "web"
+                and experiment.extra.get("managed_contract_version")
+                == MANAGED_ROLE_RESULT_SCHEMA_VERSION
+                and experiment.extra.get("network_target_id") is not None
+            )
+            web_response_summary: dict[str, Any] | None = None
+            if (
+                not artifact_notification_failed
+                and managed_remote_web_summary_required
+            ):
+                assert stdout_artifact is not None
+                stdout_evidence = receipt_stream_evidence.get("stdout", {})
+                web_response_summary = evaluate_web_response_stdout(
+                    self.store.challenge_paths(identity).root,
+                    stdout_artifact.path,
+                    expected_sha256=stdout_artifact.sha256,
+                    expected_size=int(stdout_artifact.size or 0),
+                    coverage=stdout_evidence.get("coverage"),
+                )
             if (
                 not artifact_notification_failed
                 and result.exit_code == 0
@@ -19570,6 +20631,25 @@ class ChallengeEngine:
                         validation_payload[
                             "forensic_index_execution"
                         ] = copy.deepcopy(forensic_payload)
+                    if web_response_summary is not None:
+                        result_payload["web_response_summary"] = (
+                            copy.deepcopy(web_response_summary)
+                        )
+                        validation_payload["web_response_summary"] = (
+                            copy.deepcopy(web_response_summary)
+                        )
+                        if web_response_summary.get("valid") is not True:
+                            reason_code = str(
+                                web_response_summary.get(
+                                    "reason_code",
+                                    "invalid",
+                                )
+                            )
+                            validation_payload["ok"] = False
+                            validation_payload["errors"] = [
+                                "managed_remote_web_response_summary:"
+                                + reason_code
+                            ]
                     self.store.write_run_result(
                         identity,
                         None,
@@ -19683,7 +20763,14 @@ class ChallengeEngine:
                 succeeded = (
                     rev_inventory_oracle_outcome.transport_succeeded
                     if rev_inventory_oracle_outcome is not None
-                    else result.exit_code == 0 and not result.timed_out
+                    else (
+                        result.exit_code == 0
+                        and not result.timed_out
+                        and (
+                            web_response_summary is None
+                            or web_response_summary.get("valid") is True
+                        )
+                    )
                 )
                 effective_oracle_outcome = (
                     rev_inventory_oracle_outcome
@@ -19846,6 +20933,21 @@ class ChallengeEngine:
                     item_result["receipt_id"] = receipt_id
                 else:
                     item_result["fact_id"] = result_fact_id
+                if web_response_summary is not None:
+                    item_result["web_response_summary"] = copy.deepcopy(
+                        web_response_summary
+                    )
+                    if web_response_summary.get("valid") is not True:
+                        item.evaluation_reason = (
+                            "managed_remote_web_response_summary:"
+                            + str(
+                                web_response_summary.get(
+                                    "reason_code",
+                                    "invalid",
+                                )
+                            )
+                        )[:512]
+                        item.evaluated_at = utc_now()
                 if effective_oracle_outcome is not None:
                     final_oracle_payload = (
                         effective_oracle_outcome.to_dict()
@@ -19974,6 +21076,10 @@ class ChallengeEngine:
                     "wall_seconds": elapsed,
                     **copy.deepcopy(seed_run_metadata),
                 }
+                if web_response_summary is not None:
+                    run_extra["web_response_summary"] = copy.deepcopy(
+                        web_response_summary
+                    )
                 if effective_oracle_outcome is not None:
                     run_extra["partial_oracle_result"] = copy.deepcopy(
                         effective_oracle_outcome.to_dict()
@@ -20048,6 +21154,29 @@ class ChallengeEngine:
                         ),
                         "stream_evidence": receipt_stream_evidence,
                     }
+                    if _managed_generic_semantic_evaluation(item):
+                        receipt_extra.update(
+                            {
+                                "semantic_authority": False,
+                                "semantic_evaluation_contract_version": (
+                                    _MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION
+                                ),
+                                "semantic_witness_available": (
+                                    _managed_semantic_witness_available(
+                                        receipt_stream_evidence.get("stdout"),
+                                        artifact=stdout_artifact,
+                                        run_id=engine_run_id,
+                                        expected_stdout_bytes=(
+                                            result.stdout_bytes
+                                        ),
+                                    )
+                                ),
+                            }
+                        )
+                    if web_response_summary is not None:
+                        receipt_extra["web_response_summary"] = (
+                            copy.deepcopy(web_response_summary)
+                        )
                     if effective_oracle_outcome is not None:
                         receipt_extra["partial_oracle_result"] = (
                             copy.deepcopy(
@@ -20875,6 +22004,7 @@ class ChallengeEngine:
         evidence_run_ids: Sequence[str] = (),
         support_hypothesis_ids: Sequence[str] = (),
         refute_hypothesis_ids: Sequence[str] = (),
+        _model_authored: bool = False,
     ) -> None:
         if status not in {
             ExperimentStatus.KEPT,
@@ -20917,6 +22047,24 @@ class ChallengeEngine:
         )
         if experiment is None:
             raise EngineError(f"unknown experiment: {experiment_id}")
+        partial_oracle = experiment.extra.get("partial_oracle")
+        if (
+            isinstance(partial_oracle, Mapping)
+            and partial_oracle.get("oracle_id")
+            == REV_INVENTORY_V2_CONTRACT_ID
+        ):
+            raise EngineError(
+                "Rev inventory semantics are owned by the deterministic "
+                "engine oracle"
+            )
+        if (
+            _model_authored
+            and _engine_owned_semantic_evaluation(experiment)
+        ):
+            raise EngineError(
+                "typed/proof/oracle experiment semantics are owned by the "
+                "deterministic engine"
+            )
         if experiment.status not in {
             ExperimentStatus.AWAITING_EVALUATION,
             ExperimentStatus.INCONCLUSIVE,
@@ -20924,6 +22072,18 @@ class ChallengeEngine:
             raise EngineError(
                 f"experiment is not awaiting semantic evaluation: "
                 f"{experiment_id}"
+            )
+        model_generic_evaluation = (
+            _model_authored
+            and _generic_semantic_evaluation(experiment)
+        )
+        if (
+            model_generic_evaluation
+            and status is ExperimentStatus.FAILED
+        ):
+            raise EngineError(
+                "model-authored generic FAILED is not authoritative; "
+                "transport failure semantics are owned by the engine"
             )
         related = set(experiment.hypothesis_ids)
         unknown_updates = sorted(
@@ -21037,6 +22197,67 @@ class ChallengeEngine:
                     "semantic experiment evaluation requires an executed "
                     "fact/artifact chain from that experiment's own run"
                 )
+        if (
+            model_generic_evaluation
+            and status
+            in {ExperimentStatus.KEPT, ExperimentStatus.DROPPED}
+        ):
+            requested_status = status
+            contract_version = experiment.extra.get(
+                _MANAGED_SEMANTIC_EVALUATION_CONTRACT_KEY
+            )
+            artifacts = {
+                artifact.id: artifact for artifact in state.artifacts
+            }
+            stdout_artifact = (
+                artifacts.get(receipt.stdout_artifact_id)
+                if receipt is not None
+                and receipt.stdout_artifact_id is not None
+                else None
+            )
+            stream_evidence = (
+                receipt.extra.get("stream_evidence")
+                if receipt is not None
+                else None
+            )
+            stdout_evidence = (
+                stream_evidence.get("stdout")
+                if isinstance(stream_evidence, Mapping)
+                else None
+            )
+            witness_available = (
+                contract_version
+                == _MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION
+                and receipt is not None
+                and receipt.outcome is ReceiptOutcome.SUCCEEDED
+                and _managed_semantic_witness_available(
+                    stdout_evidence,
+                    artifact=stdout_artifact,
+                    run_id=receipt.run_id,
+                    expected_stdout_bytes=receipt.stdout_bytes,
+                )
+            )
+            experiment.extra["semantic_evaluation_admission"] = {
+                "actor": "model",
+                "applied_status": ExperimentStatus.INCONCLUSIVE.value,
+                "contract_version": contract_version,
+                "reason_code": (
+                    "complete_structured_rec_witness"
+                    if witness_available
+                    else "missing_complete_structured_rec_witness"
+                ),
+                "requested_status": requested_status.value,
+                "semantic_authority": False,
+                "witness_available": witness_available,
+            }
+            status = ExperimentStatus.INCONCLUSIVE
+            reason = (
+                "Model semantic disposition recorded as proposal only: "
+                "generic model evaluations cannot set KEEP/DROP or change "
+                "hypotheses; REC:/RECORD: is audit metadata only."
+            )
+            support_hypothesis_ids = ()
+            refute_hypothesis_ids = ()
         experiment.status = status
         experiment.evaluation_reason = reason
         experiment.evaluated_at = utc_now()
@@ -21150,6 +22371,7 @@ class ChallengeEngine:
         support_hypothesis_ids: Sequence[str] = (),
         refute_hypothesis_ids: Sequence[str] = (),
         _live_only: bool = False,
+        _model_authored: bool = False,
     ) -> ChallengeState:
         """Apply one explicit semantic result to an already executed experiment."""
 
@@ -21166,6 +22388,7 @@ class ChallengeEngine:
                 evidence_run_ids=evidence_run_ids,
                 support_hypothesis_ids=support_hypothesis_ids,
                 refute_hypothesis_ids=refute_hypothesis_ids,
+                _model_authored=_model_authored,
             )
 
         return self.store.update(identity, apply)
@@ -21186,6 +22409,7 @@ class ChallengeEngine:
         expected_revision: int | None = None,
         _live_only: bool = False,
         _experiment_id: str | None = None,
+        _model_authored: bool = False,
     ) -> tuple[ChallengeState, str]:
         """Register a typed/manual experiment before it can execute."""
 
@@ -21341,6 +22565,19 @@ class ChallengeEngine:
                             else {}
                         ),
                         **({"needs_kvm": True} if needs_kvm else {}),
+                        **(
+                            {
+                                _MANAGED_SEMANTIC_EVALUATION_CONTRACT_KEY: (
+                                    _MANAGED_SEMANTIC_EVALUATION_CONTRACT_VERSION
+                                )
+                            }
+                            if (
+                                _model_authored
+                                and state.schema_version
+                                >= STATE_SCHEMA_VERSION
+                            )
+                            else {}
+                        ),
                     },
                 )
             )
@@ -21352,6 +22589,207 @@ class ChallengeEngine:
                 expected_revision=expected_revision,
             ),
             experiment_id,
+        )
+
+    def cancel_stale_registered_experiments(
+        self,
+        identity: ChallengeIdentity,
+        experiment_ids: Sequence[str],
+        *,
+        reason: str,
+    ) -> tuple[ChallengeState, tuple[str, ...]]:
+        """Cancel an exact operator-selected set of stale remote work.
+
+        This is deliberately narrower than generic experiment cancellation:
+        every selected record must still be REGISTERED, must carry a remote
+        target/configuration binding, and that binding must differ from the
+        currently selected active target binding.  The command never executes
+        work or changes the challenge lifecycle.
+        """
+
+        if isinstance(experiment_ids, (str, bytes)):
+            raise EngineError("experiment ids must be a sequence")
+        selected_ids = tuple(experiment_ids)
+        if not selected_ids:
+            raise EngineError("at least one stale experiment id is required")
+        if len(selected_ids) > 64:
+            raise EngineError("at most 64 stale experiments may be cancelled")
+        if any(
+            type(experiment_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", experiment_id) is None
+            for experiment_id in selected_ids
+        ):
+            raise EngineError("experiment id is invalid")
+        if len(set(selected_ids)) != len(selected_ids):
+            raise EngineError("stale experiment ids must be unique")
+        if type(reason) is not str:
+            raise EngineError("operator cancellation reason must be a string")
+        normalized_reason = reason.strip()
+        if (
+            not normalized_reason
+            or "\x00" in normalized_reason
+            or len(normalized_reason) > 1024
+            or len(normalized_reason.encode("utf-8")) > 1024
+        ):
+            raise EngineError(
+                "operator cancellation reason must be 1-1024 UTF-8 bytes"
+            )
+
+        def remote_binding(
+            experiment: Experiment,
+        ) -> tuple[object, object, object, object] | None:
+            if (
+                experiment.kind is ExperimentKind.PROOF
+                and experiment.proof_recipe is not None
+            ):
+                recipe = experiment.proof_recipe
+                if (
+                    recipe.network_endpoint is None
+                    and experiment.extra.get("network_target") is None
+                ):
+                    return None
+                return (
+                    recipe.network_target_id,
+                    recipe.network_target_generation,
+                    recipe.configuration_epoch,
+                    recipe.network_endpoint,
+                )
+            endpoint = experiment.extra.get("network_target")
+            if endpoint is None:
+                return None
+            return (
+                experiment.extra.get("network_target_id"),
+                experiment.extra.get("network_target_generation"),
+                experiment.extra.get("configuration_epoch"),
+                endpoint,
+            )
+
+        def selected_binding(
+            state: ChallengeState,
+        ) -> tuple[object, object, object, object] | None:
+            primary = next(
+                (
+                    target
+                    for target in state.targets
+                    if target.id == state.primary_target_id
+                ),
+                None,
+            )
+            if (
+                primary is None
+                or primary.status is not TargetStatus.ACTIVE
+                or self._target_is_expired(primary)
+                or primary.enforcement not in {"proxy", "builtin"}
+            ):
+                return None
+            return (
+                primary.id,
+                primary.generation,
+                state.configuration_epoch,
+                primary.endpoint,
+            )
+
+        def binding_record(
+            binding: tuple[object, object, object, object] | None,
+        ) -> dict[str, object] | None:
+            if binding is None:
+                return None
+            return {
+                "network_target_id": binding[0],
+                "network_target_generation": binding[1],
+                "configuration_epoch": binding[2],
+                "network_target": binding[3],
+            }
+
+        current = self.store.load(identity)
+        if current.schema_version < STATE_SCHEMA_VERSION:
+            raise EngineError(
+                "stale experiment cancellation requires state schema v2"
+            )
+
+        def require_selected_stale(
+            state: ChallengeState,
+        ) -> dict[str, tuple[object, object, object, object]]:
+            by_id = {
+                experiment.id: experiment
+                for experiment in state.experiments
+            }
+            unknown = [
+                experiment_id
+                for experiment_id in selected_ids
+                if experiment_id not in by_id
+            ]
+            if unknown:
+                raise EngineError(
+                    "unknown experiment id(s): " + ", ".join(unknown)
+                )
+            live_binding = selected_binding(state)
+            stale: dict[
+                str, tuple[object, object, object, object]
+            ] = {}
+            for experiment_id in selected_ids:
+                experiment = by_id[experiment_id]
+                binding = remote_binding(experiment)
+                if experiment.status is not ExperimentStatus.REGISTERED:
+                    raise EngineError(
+                        f"experiment is not registered: {experiment_id}"
+                    )
+                if binding is None:
+                    raise EngineError(
+                        f"experiment is not remote-bound: {experiment_id}"
+                    )
+                if binding == live_binding:
+                    raise EngineError(
+                        f"experiment binding is current, not stale: "
+                        f"{experiment_id}"
+                    )
+                stale[experiment_id] = binding
+            return stale
+
+        stale_bindings = require_selected_stale(current)
+        current_binding = selected_binding(current)
+        cancelled_at = utc_now()
+
+        def apply(state: ChallengeState) -> None:
+            # Re-evaluate the complete selected set inside the CAS mutation so
+            # an operator command can never broaden into unrelated work.
+            canonical_stale = require_selected_stale(state)
+            if canonical_stale != stale_bindings:
+                raise EngineError(
+                    "stale experiment bindings changed before cancellation"
+                )
+            if selected_binding(state) != current_binding:
+                raise EngineError(
+                    "selected target binding changed before cancellation"
+                )
+            selected = set(selected_ids)
+            for experiment in state.experiments:
+                if experiment.id not in selected:
+                    continue
+                experiment.status = ExperimentStatus.CANCELLED
+                experiment.extra["cancelled_at"] = cancelled_at
+                experiment.extra["cancelled_reason"] = (
+                    "operator_cancelled_stale_remote_binding"
+                )
+                experiment.extra["operator_cancellation"] = {
+                    "schema_version": 1,
+                    "kind": "stale_remote_binding",
+                    "reason": normalized_reason,
+                    "cancelled_at": cancelled_at,
+                    "source_state_revision": current.revision,
+                    "stale_binding": binding_record(
+                        stale_bindings[experiment.id]
+                    ),
+                    "selected_binding": binding_record(current_binding),
+                }
+
+        return (
+            self.store.update(
+                identity,
+                apply,
+                expected_revision=current.revision,
+            ),
+            selected_ids,
         )
 
     def _prepare_read_only_analysis_inputs(
@@ -22146,6 +23584,7 @@ class ChallengeEngine:
         input_locators: Sequence[str] = (),
         _session_owned: bool = False,
         _live_only: bool = False,
+        _model_authored: bool = False,
     ) -> ChallengeState:
         """Register and execute one foreground sandbox command."""
 
@@ -22203,6 +23642,7 @@ class ChallengeEngine:
                     input_locators=(),
                     _session_owned=True,
                     _live_only=_live_only,
+                    _model_authored=_model_authored,
                 )
             finally:
                 session_lock.release()
@@ -22223,6 +23663,7 @@ class ChallengeEngine:
                     network_target=network_target,
                     needs_kvm=needs_kvm,
                     _live_only=_live_only,
+                    _model_authored=_model_authored,
                     expected_revision=preflight.revision,
                 )
                 break
@@ -22683,6 +24124,10 @@ class ChallengeEngine:
             detector = FlagDetector(
                 flag_policy.patterns,
                 callback=receive_flag,
+                notice_callback=lambda detected: self._on_tool_flag(
+                    identity,
+                    detected,
+                ),
                 suppress_generic_code_noise=(
                     flag_policy.source == "runtime"
                 ),
@@ -32154,6 +33599,10 @@ class ChallengeEngine:
                 proof_detector = FlagDetector(
                     proof_flag_policy.patterns,
                     callback=receive_proof_flag,
+                    notice_callback=lambda detected: self._on_tool_flag(
+                        identity,
+                        detected,
+                    ),
                     suppress_generic_code_noise=(
                         proof_flag_policy.source == "runtime"
                     ),

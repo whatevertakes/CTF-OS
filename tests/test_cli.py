@@ -15,7 +15,18 @@ from ctf_os import cli
 from ctf_os.engine.challenge import ChallengeEngine
 from ctf_os.engine.rev_runtime_proof import RevRuntimeProofError
 from ctf_os.live_broker import MAX_INSPECT_PAGE_ITEMS
-from ctf_os.models import ChallengeIdentity, GoalStatus, HypothesisStatus
+from ctf_os.managed import ManagedOrchestrator
+from ctf_os.models import (
+    ChallengeIdentity,
+    ChallengeState,
+    GoalStatus,
+    HypothesisStatus,
+    RunOrigin,
+    RunReference,
+    RunStatus,
+    SessionStatus,
+    SubmissionReference,
+)
 from ctf_os.sandbox.daemon import CapabilityAuthority
 from ctf_os.store import ChallengeLock, StateStore
 
@@ -134,6 +145,46 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(status, 0, errors)
         self.assertIn("28800", output)
+
+    def test_pause_overlong_handoff_fails_without_state_mutation(self) -> None:
+        self.add()
+        store = StateStore(self.root)
+        identity = ChallengeIdentity(*self.identity)
+        before = store.load(identity)
+        state_path = store.challenge_paths(identity).state
+        before_state_bytes = state_path.read_bytes()
+
+        status, output, errors = self.run_cli(
+            [
+                "pause",
+                *self.identity,
+                "--handoff",
+                str(self.root / ("H" * 300)),
+            ]
+        )
+
+        after = store.load(identity)
+        self.assertEqual(status, 2)
+        self.assertEqual(output, "")
+        self.assertIn("handoff destination", errors)
+        self.assertEqual(after.revision, before.revision)
+        self.assertIs(after.status, before.status)
+        self.assertEqual(after.checkpoints, before.checkpoints)
+        self.assertEqual(state_path.read_bytes(), before_state_bytes)
+
+    def test_pause_handoff_help_identifies_json_path(self) -> None:
+        parser = cli.build_parser()
+        pause_parser = next(
+            action.choices["pause"]
+            for action in parser._actions
+            if isinstance(getattr(action, "choices", None), dict)
+            and "pause" in action.choices
+        )
+
+        help_text = pause_parser.format_help()
+
+        self.assertIn("--handoff JSON_PATH", help_text)
+        self.assertIn("출력 JSON 파일 경로", help_text)
 
     def test_contest_check_and_diagnose_are_snapshot_only_and_commands_parse(
         self,
@@ -314,6 +365,273 @@ class CLITests(unittest.TestCase):
 
     def test_no_contest_wide_automatic_challenge_runner_is_exposed(self) -> None:
         self.assertNotIn("run-contest", cli.build_parser().format_help())
+
+    def test_reconcile_recovers_selected_orphan_without_execution(self) -> None:
+        self.add()
+        identity = ChallengeIdentity(*self.identity)
+        engine = ChallengeEngine(self.root)
+        state = engine.add_network_target(
+            identity,
+            "https://reconcile-scope.example:443",
+            docker_network="ctfos-test-proxy",
+            enforcement="proxy",
+        )
+        engine.select_network_target(identity, state.targets[-1].id)
+        orchestrator = ManagedOrchestrator(engine)
+        _state, session_id = orchestrator._reserve_session(identity, None)
+        before, cycle = orchestrator._reserve_cycle(identity, session_id)
+        assert cycle.captain_run_id is not None
+
+        forbidden = AssertionError(
+            "explicit reconcile must not execute a model or challenge tool"
+        )
+        with (
+            patch(
+                "ctf_os.codex.runner.BatchRunner.run",
+                side_effect=forbidden,
+            ),
+            patch.object(
+                ChallengeEngine,
+                "sandbox",
+                side_effect=forbidden,
+            ),
+            patch.object(
+                ChallengeEngine,
+                "execute_registered_experiments",
+                side_effect=forbidden,
+            ),
+            patch.object(
+                ChallengeEngine,
+                "refresh_ingest",
+                side_effect=forbidden,
+            ),
+        ):
+            status, output, errors = self.run_cli(
+                ["reconcile", *self.identity, "--json"]
+            )
+
+        self.assertEqual(status, 0, errors)
+        report = json.loads(output)
+        after = engine.store.load(identity)
+        self.assertEqual(report["before_revision"], before.revision)
+        self.assertEqual(report["before_status"], before.status.value)
+        self.assertEqual(report["after_revision"], after.revision)
+        self.assertEqual(report["after_status"], "PAUSED")
+        self.assertEqual(
+            report["identity"],
+            {
+                "contest_id": self.identity[0],
+                "category": self.identity[1],
+                "challenge_id": self.identity[2],
+            },
+        )
+        self.assertEqual(report["identity_key"], "rev/문제 1")
+        self.assertFalse(report["no_op"])
+        self.assertEqual(
+            report["recovered_run_ids"],
+            [cycle.captain_run_id],
+        )
+        self.assertEqual(report["recovered_run_count"], 1)
+        self.assertEqual(report["recovered_run_ids_omitted"], 0)
+        for field in (
+            "model_calls_started",
+            "tools_executed",
+            "targets_changed",
+            "submissions_changed",
+            "flags_submitted",
+        ):
+            self.assertFalse(report[field])
+        recovered_run = next(
+            run for run in after.runs if run.id == cycle.captain_run_id
+        )
+        recovered_cycle = next(
+            item for item in after.cycles if item.id == cycle.id
+        )
+        recovered_session = next(
+            item for item in after.sessions if item.id == session_id
+        )
+        self.assertIs(recovered_run.status, RunStatus.INTERRUPTED)
+        self.assertEqual(recovered_cycle.phase, "interrupted")
+        self.assertIsNotNone(recovered_cycle.completed_at)
+        self.assertIs(recovered_session.status, SessionStatus.INTERRUPTED)
+        self.assertIsNone(after.active_managed_session_id)
+        self.assertEqual(after.targets, before.targets)
+        self.assertEqual(after.primary_target_id, before.primary_target_id)
+        self.assertEqual(after.candidates, before.candidates)
+        self.assertEqual(after.submissions, before.submissions)
+
+    def test_reconcile_json_report_bounds_recovered_run_ids(self) -> None:
+        total = cli.MAX_RECONCILE_REPORT_RUN_IDS + 7
+        before = ChallengeState(
+            "Bounded CTF",
+            "rev",
+            "bounded-reconcile",
+            revision=11,
+        )
+        after = ChallengeState(
+            "Bounded CTF",
+            "rev",
+            "bounded-reconcile",
+            revision=13,
+        )
+        after.primary_target_id = "T-report-change"
+        after.submissions.append(
+            SubmissionReference(
+                id="S-report-change",
+                candidate_id="C-report-change",
+            )
+        )
+        for index in range(total):
+            run_id = f"MR-{index:024x}"
+            before.runs.append(
+                RunReference(
+                    id=run_id,
+                    base_revision=11,
+                    status=RunStatus.CREATED,
+                    origin=RunOrigin.MANAGED_MODEL,
+                )
+            )
+            after.runs.append(
+                RunReference(
+                    id=run_id,
+                    base_revision=11,
+                    status=RunStatus.INTERRUPTED,
+                    origin=RunOrigin.MANAGED_MODEL,
+                    extra={"reconciled_at": "2026-08-03T00:00:00Z"},
+                )
+            )
+
+        report = cli._managed_reconcile_report(before, after)
+
+        self.assertEqual(report["recovered_run_count"], total)
+        self.assertEqual(
+            len(report["recovered_run_ids"]),
+            cli.MAX_RECONCILE_REPORT_RUN_IDS,
+        )
+        self.assertEqual(report["recovered_run_ids_omitted"], 7)
+        self.assertTrue(report["targets_changed"])
+        self.assertTrue(report["submissions_changed"])
+        self.assertTrue(report["flags_submitted"])
+        self.assertLess(
+            len(json.dumps(report).encode("utf-8")),
+            32 * 1024,
+        )
+
+    def test_reconcile_refuses_owned_session_without_touching_state(self) -> None:
+        self.add()
+        identity = ChallengeIdentity(*self.identity)
+        engine = ChallengeEngine(self.root)
+        orchestrator = ManagedOrchestrator(engine)
+        _state, session_id = orchestrator._reserve_session(identity, None)
+        _state, cycle = orchestrator._reserve_cycle(identity, session_id)
+        assert cycle.captain_run_id is not None
+        engine._mark_reserved_run_running(
+            identity,
+            cycle.captain_run_id,
+        )
+        paths = engine.store.challenge_paths(identity)
+        provider_path = (
+            engine.store.run_paths(
+                identity,
+                run_id=cycle.captain_run_id,
+            ).root
+            / "provider.json"
+        )
+        state_before = paths.state.read_bytes()
+        provider_before = provider_path.read_bytes()
+        forbidden = AssertionError(
+            "locked reconcile must not refresh, execute, or call a model"
+        )
+
+        with ChallengeLock(
+            paths.runtime / "session.lock",
+            timeout=0,
+        ) as session_lock:
+            session_lock.acquire()
+            with (
+                patch(
+                    "ctf_os.codex.runner.BatchRunner.run",
+                    side_effect=forbidden,
+                ),
+                patch.object(
+                    ChallengeEngine,
+                    "sandbox",
+                    side_effect=forbidden,
+                ),
+                patch.object(
+                    ChallengeEngine,
+                    "refresh_ingest",
+                    side_effect=forbidden,
+                ),
+            ):
+                status, output, errors = self.run_cli(
+                    ["reconcile", *self.identity, "--json"]
+                )
+
+        self.assertNotEqual(status, 0)
+        self.assertEqual(output, "")
+        self.assertIn("session", errors.lower())
+        self.assertEqual(paths.state.read_bytes(), state_before)
+        self.assertEqual(provider_path.read_bytes(), provider_before)
+
+    def test_operator_cli_cancels_exact_stale_remote_experiment(self) -> None:
+        self.add()
+        identity = ChallengeIdentity(*self.identity)
+        engine = ChallengeEngine(self.root)
+        endpoint = "https://stale-cli.example:443"
+        state = engine.add_network_target(
+            identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        engine.select_network_target(identity, target.id)
+        _state, experiment_id = engine.register_experiment(
+            identity,
+            command=("true",),
+            expected_observation="remote success",
+            keep_if="success",
+            drop_if="failure",
+            network_target=endpoint,
+        )
+        engine.add_network_target(
+            identity,
+            "https://epoch-bump-cli.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        before = engine.store.load(identity)
+
+        status, output, errors = self.run_cli(
+            [
+                "cancel-stale-experiments",
+                *self.identity,
+                "--experiment",
+                experiment_id,
+                "--reason",
+                "operator selected stale configuration pin",
+            ]
+        )
+
+        self.assertEqual(status, 0, errors)
+        report = json.loads(output)
+        self.assertEqual(
+            report["cancelled_experiment_ids"],
+            [experiment_id],
+        )
+        self.assertFalse(report["automatic_execution"])
+        self.assertFalse(report["automatic_submission"])
+        after = engine.store.load(identity)
+        self.assertEqual(after.status, before.status)
+        experiment = next(
+            item for item in after.experiments if item.id == experiment_id
+        )
+        self.assertEqual(experiment.status.value, "cancelled")
+        self.assertEqual(
+            experiment.extra["operator_cancellation"]["reason"],
+            "operator selected stale configuration pin",
+        )
 
     def test_rev_runtime_proof_forwards_only_data_and_prints_summary(
         self,

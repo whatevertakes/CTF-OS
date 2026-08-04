@@ -1596,6 +1596,10 @@ def _prove_pwn_interaction(
                 identity,
                 detected,
             ),
+            notice_callback=lambda detected: engine._on_tool_flag(
+                identity,
+                detected,
+            ),
             suppress_generic_code_noise=flag_policy.source == "runtime",
         )
 

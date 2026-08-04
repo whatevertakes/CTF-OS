@@ -203,7 +203,7 @@ assert browser_timeline_source.startswith("#!/usr/bin/env python3\n")
 assert forensic_triage_source.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
 assert qemu_headless_source.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
 assert managed_manifest["schema_version"] == 2
-assert len(managed_manifest["capabilities"]) == 34
+assert len(managed_manifest["capabilities"]) == 35
 assert {
     item["name"] for item in managed_manifest["capabilities"]
 } == {
@@ -215,6 +215,7 @@ assert {
     "pysat_kissat404",
     "cryptominisat5",
     "angr_python",
+    "web_response_summary_v1",
     "pwn_crash_v1",
     "pwn_runtime_snapshot_v1",
     "pwn_exploit_effect_v1",
@@ -247,6 +248,7 @@ managed_attestations = {
     for item in managed_manifest["capabilities"]
     if item["name"]
     in {
+        "web_response_summary_v1",
         "pwn_crash_v1",
         "pwn_runtime_snapshot_v1",
         "pwn_exploit_effect_v1",
@@ -286,6 +288,12 @@ for capability, probe in functional_capabilities.items():
         "arguments": [probe],
     }
 expected_managed_attestations = {
+    "web_response_summary_v1": {
+        "path": "/opt/ctf-templates/web/request.py",
+        "source": REPO_ROOT / "templates" / "web" / "request.py",
+        "contract_id": "ctfos.web.response_summary",
+        "contract_version": 1,
+    },
     "pwn_crash_v1": {
         "path": "/opt/ctf-templates/pwn/crash_oracle.py",
         "source": REPO_ROOT / "templates" / "pwn" / "crash_oracle.py",
@@ -393,7 +401,10 @@ with tempfile.TemporaryDirectory() as temporary:
         != changed_record["sha256"]
     )
 assert "COPY capabilities.v2.json /tools/capabilities.json" in dockerfile
-assert "(.capabilities | length == 34)" in dockerfile
+assert 'ENV PATH="/opt/dotnet-tools:${PATH}"' in dockerfile
+assert "/opt/dotnet-tools/ilspycmd --version" in dockerfile
+assert "(.capabilities | length == 35)" in dockerfile
+assert 'select(.name == "web_response_summary_v1"' in dockerfile
 assert 'or .name == "pwn_runtime_snapshot_v1"' in dockerfile
 assert 'or .name == "pwn_exploit_effect_v1"' in dockerfile
 assert 'or .name == "pwn_interaction_v1"' in dockerfile

@@ -29,12 +29,13 @@ jq -e '
 ctf-capabilities --json >"${test_root}/managed-capabilities.json"
 jq -e '
     .schema_version == 2
-    and (.capabilities | length == 34)
+    and (.capabilities | length == 35)
     and all(.capabilities[]; .available == true)
     and all(
         .capabilities[]
         | select(
-            .name == "pwn_crash_v1"
+            .name == "web_response_summary_v1"
+            or .name == "pwn_crash_v1"
             or .name == "pwn_runtime_snapshot_v1"
             or .name == "pwn_exploit_effect_v1"
             or .name == "pwn_interaction_v1"
@@ -51,7 +52,8 @@ jq -e '
         and (.attestation.contract_version | type == "number")
         and (
             .attestation.path
-            | startswith("/opt/ctf-templates/pwn/")
+            | startswith("/opt/ctf-templates/web/")
+              or startswith("/opt/ctf-templates/pwn/")
               or startswith("/opt/ctf-templates/rev/")
               or startswith("/opt/ctf-templates/common/")
               or startswith("/opt/ctf-templates/forensic/")
@@ -556,6 +558,8 @@ import tempfile
 with open("/tools/manifest.json", encoding="utf-8") as manifest_file:
     manifest = json.load(manifest_file)
 
+ilspy = next(tool for tool in manifest["tools"] if tool["name"] == "ilspycmd")
+assert ilspy["path"] == "/opt/dotnet-tools/ilspycmd", ilspy
 invocations = sorted(
     {(tool["name"], tool["path"]) for tool in manifest["tools"]}
 )

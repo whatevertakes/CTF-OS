@@ -867,6 +867,7 @@ class LiveBrokerService:
                 ),
                 needs_kvm=_boolean(params, "needs_kvm"),
                 _live_only=True,
+                _model_authored=True,
             )
             del state
             return {"experiment_id": experiment_id}
@@ -905,6 +906,7 @@ class LiveBrokerService:
                     "refute_hypothesis_ids",
                 ),
                 _live_only=True,
+                _model_authored=True,
             )
             experiment = next(
                 item for item in state.experiments
@@ -991,6 +993,7 @@ class LiveBrokerService:
                 ),
                 _session_owned=True,
                 _live_only=True,
+                _model_authored=True,
             )
             return _latest_experiment(state)
 

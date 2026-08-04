@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
@@ -12,7 +13,9 @@ from ctf_os.candidates import (
     candidate_value_is_valid,
     flag_notification_error,
     looks_like_generic_code_noise,
+    looks_like_printf_template_candidate,
 )
+from ctf_os.terminal import terminal_safe
 
 DEFAULT_FLAG_PATTERNS = (
     r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]{1,31}\{[^{}\r\n]{1,512}\}",
@@ -44,6 +47,18 @@ class FlagCandidate:
     value: str
     event_type: str
     source: str = "event_stream"
+
+
+def _print_flag_candidate_notice(candidate: FlagCandidate) -> None:
+    """Print one non-promotable flag-shaped observation immediately."""
+
+    print(
+        "\n🚩 FLAG CANDIDATE (미제출) "
+        f"[{terminal_safe(candidate.source)}]\n"
+        f"{terminal_safe(candidate.value)}\n",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -79,7 +94,10 @@ class FlagDetector:
         *,
         candidate_limit: int = DEFAULT_FLAG_CANDIDATE_LIMIT,
         candidate_chars_limit: int = DEFAULT_FLAG_CANDIDATE_CHARS_LIMIT,
+        notice_limit: int = DEFAULT_FLAG_CANDIDATE_LIMIT,
+        notice_chars_limit: int = DEFAULT_FLAG_CANDIDATE_CHARS_LIMIT,
         suppress_generic_code_noise: bool = False,
+        notice_callback: Callable[[FlagCandidate], None] | None = None,
     ) -> None:
         compiled = tuple(re.compile(pattern) for pattern in patterns)
         if not compiled:
@@ -88,14 +106,33 @@ class FlagDetector:
             raise ValueError("candidate_limit must not be negative")
         if candidate_chars_limit < 0:
             raise ValueError("candidate_chars_limit must not be negative")
+        if notice_limit < 0:
+            raise ValueError("notice_limit must not be negative")
+        if notice_chars_limit < 0:
+            raise ValueError("notice_chars_limit must not be negative")
         self._patterns = compiled
         self._seen: set[str] = set()
         self._candidate_limit = candidate_limit
         self._candidate_chars_limit = candidate_chars_limit
+        self.notice_limit = notice_limit
+        self.notice_chars_limit = notice_chars_limit
         self._suppress_generic_code_noise = suppress_generic_code_noise
+        self._notice_callback = (
+            _print_flag_candidate_notice
+            if notice_callback is None
+            else notice_callback
+        )
+        self._notice_seen: set[str] = set()
+        self.notice_chars = 0
+        self.notice_suppressed_matches = 0
         self.accepted_chars = 0
         self.suppressed_matches = 0
         self.code_noise_suppressed_matches = 0
+        self.template_suppressed_matches = 0
+
+    @property
+    def notice_count(self) -> int:
+        return len(self._notice_seen)
 
     def _accept(
         self,
@@ -118,11 +155,64 @@ class FlagDetector:
         self.accepted_chars += len(candidate)
         return FlagCandidate(candidate, event_type, source)
 
-    def scan(self, value: Any, event_type: str, source: str = "event_stream") -> list[FlagCandidate]:
+    def _notice(
+        self,
+        candidate: str,
+        event_type: str,
+        source: str,
+    ) -> FlagCandidate | None:
+        if not candidate_value_is_valid(candidate):
+            return None
+        if candidate in self._notice_seen or candidate in self._seen:
+            return None
+        if (
+            len(self._notice_seen) >= self.notice_limit
+            or self.notice_chars + len(candidate)
+            > self.notice_chars_limit
+        ):
+            self.notice_suppressed_matches += 1
+            return None
+        self._notice_seen.add(candidate)
+        self.notice_chars += len(candidate)
+        return FlagCandidate(candidate, event_type, source)
+
+    def _release_notices(
+        self,
+        notices: Iterable[FlagCandidate],
+    ) -> None:
+        for notice in notices:
+            if notice.value not in self._notice_seen:
+                continue
+            self._notice_seen.remove(notice.value)
+            self.notice_chars -= len(notice.value)
+
+    def scan(
+        self,
+        value: Any,
+        event_type: str,
+        source: str = "event_stream",
+    ) -> list[FlagCandidate]:
         candidates: list[FlagCandidate] = []
+        notices: list[FlagCandidate] = []
         for text in _string_values(value):
             for pattern in self._patterns:
                 for match in pattern.finditer(text):
+                    if (
+                        self._suppress_generic_code_noise
+                        and looks_like_printf_template_candidate(
+                            match.group(0)
+                        )
+                    ):
+                        self.template_suppressed_matches += 1
+                        self.code_noise_suppressed_matches += 1
+                        notice = self._notice(
+                            match.group(0),
+                            event_type,
+                            source,
+                        )
+                        if notice is not None:
+                            notices.append(notice)
+                        continue
                     if (
                         self._suppress_generic_code_noise
                         and looks_like_generic_code_noise(
@@ -134,6 +224,13 @@ class FlagDetector:
                     ):
                         self.suppressed_matches += 1
                         self.code_noise_suppressed_matches += 1
+                        notice = self._notice(
+                            match.group(0),
+                            event_type,
+                            source,
+                        )
+                        if notice is not None:
+                            notices.append(notice)
                         continue
                     candidate = self._accept(
                         match.group(0),
@@ -142,6 +239,18 @@ class FlagDetector:
                     )
                     if candidate is not None:
                         candidates.append(candidate)
+        if self._notice_callback is not None:
+            for index, notice in enumerate(notices):
+                try:
+                    self._notice_callback(notice)
+                except BaseException as error:
+                    self._release_notices(notices[index:])
+                    self.release(candidates)
+                    if not isinstance(error, Exception):
+                        raise
+                    if isinstance(error, FlagNotificationError):
+                        raise
+                    raise flag_notification_error(error) from error
         return candidates
 
     def report_candidate(

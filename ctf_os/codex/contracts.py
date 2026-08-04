@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
@@ -236,17 +237,53 @@ def role_output_schema(
         )
     decision_schema: dict[str, Any]
     if role is Role.CAPTAIN:
+        decision_properties: dict[str, Any] = {
+            "next_stage": {"enum": list(NEXT_STAGE_VALUES)},
+            "reason": {"type": "string"},
+        }
+        if contract_version == 2:
+            decision_properties["selected_experiment"] = {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "experiment_id",
+                            "command_sha256",
+                            "contract_sha256",
+                        ],
+                        "properties": {
+                            "experiment_id": {
+                                "type": "string",
+                                "pattern": (
+                                    r"^[A-Za-z0-9]"
+                                    r"[A-Za-z0-9_.:-]{0,255}$"
+                                ),
+                            },
+                            "command_sha256": {
+                                "type": "string",
+                                "pattern": r"^[0-9a-f]{64}$",
+                            },
+                            "contract_sha256": {
+                                "type": "string",
+                                "pattern": r"^[0-9a-f]{64}$",
+                            },
+                        },
+                    },
+                ]
+            }
+        decision_required = ["next_stage", "reason"]
+        if contract_version == 2:
+            decision_required.append("selected_experiment")
         decision_schema = {
             "anyOf": [
                 {"type": "null"},
                 {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["next_stage", "reason"],
-                    "properties": {
-                        "next_stage": {"enum": list(NEXT_STAGE_VALUES)},
-                        "reason": {"type": "string"},
-                    },
+                    "required": decision_required,
+                    "properties": decision_properties,
                 },
             ]
         }
@@ -356,7 +393,6 @@ def role_output_schema(
         managed_hypothesis_ids_schema = {
             "type": "array",
             "maxItems": 64,
-            "uniqueItems": True,
             "items": managed_reference_schema,
         }
         managed_sha256_schema = {
@@ -758,7 +794,8 @@ def role_output_schema(
                         "Exact POSIX /bin/sh script executed as "
                         "/bin/sh -lc <script>; detached/background jobs "
                         "are forbidden. This is a script, not an argv "
-                        "serialization."
+                        "serialization. Generic Web commands are stateless; "
+                        "do not pass --session to an image Web helper."
                     ),
                 }
                 if action_kind == "command"
@@ -916,7 +953,7 @@ def role_output_schema(
                         "statement": nullable_string,
                         "falsifier": nullable_string,
                         "status": {
-                            "enum": list(HYPOTHESIS_STATUS_VALUES)
+                            "enum": ["open"]
                         },
                         "evidence_fact_ids": {
                             "type": "array",
@@ -935,7 +972,7 @@ def role_output_schema(
                             "minimum": 0,
                             "maximum": 1,
                         },
-                        "refuted_by": nullable_string,
+                        "refuted_by": {"type": "null"},
                     },
                 },
             },
@@ -1094,6 +1131,65 @@ def _valid_relative_path(value: str) -> bool:
         )
         and not path.is_absolute()
         and ".." not in path.parts
+    )
+
+
+def _valid_reported_artifact_path(value: str, role: Role) -> bool:
+    """Keep publication locators unambiguous for the state-aware normalizer."""
+
+    if not _valid_relative_path(value):
+        return False
+    parts = PurePosixPath(value).parts
+    if not parts or parts[0] not in {"artifacts", "proof"}:
+        return True
+    expected_prefix = (
+        ("proof", "workspace")
+        if role in {Role.REPRODUCER, Role.VALIDATOR, Role.EVIDENCE_AUDITOR}
+        else ("artifacts", "workspace")
+    )
+    if parts[:2] == expected_prefix:
+        return True
+    # Existing immutable evidence is resolved against canonical state later.
+    # Unknown or digest-mismatched snapshot references still fail closed there.
+    return parts[:2] in {
+        ("artifacts", "snapshots"),
+        ("proof", "snapshots"),
+    }
+
+
+_DIRECT_WEB_HELPERS = frozenset(
+    {
+        "/opt/ctf-templates/web/request.py",
+        "/opt/ctf-templates/web/browser.py",
+        "/opt/ctf-templates/web/active_probe.py",
+        "/usr/local/bin/ctf-browser",
+        "/usr/local/bin/ctf-web-probe",
+        "ctf-browser",
+        "ctf-web-probe",
+    }
+)
+
+
+def _direct_web_helper_requests_private_session(command: str) -> bool:
+    """Recognize only the direct helper form that prompts prescribe.
+
+    Managed command actions are wrapped in ``/bin/sh -lc`` and therefore do
+    not cross the direct-helper boundary that mounts engine-private Web state.
+    This intentionally performs lexical recognition only; compound shell
+    programs are left to the ordinary sandbox instead of being over-parsed.
+    """
+
+    try:
+        words = tuple(shlex.split(command, posix=True))
+    except ValueError:
+        return False
+    return bool(
+        words
+        and words[0] in _DIRECT_WEB_HELPERS
+        and any(
+            word == "--session" or word.startswith("--session=")
+            for word in words[1:]
+        )
     )
 
 
@@ -1384,8 +1480,10 @@ def validate_role_output(
                 ):
                     errors.append(f"{path}.{field}: expected string or null")
             status = item.get("status")
-            if status not in HYPOTHESIS_STATUS_VALUES:
-                errors.append(f"{path}.status: invalid hypothesis status")
+            if status != "open":
+                errors.append(
+                    f"{path}.status: Batch hypothesis updates must remain open"
+                )
             for field in (
                 "evidence_fact_ids",
                 "evidence_artifact_ids",
@@ -1402,9 +1500,9 @@ def validate_role_output(
                 errors.append(
                     f"{path}.confidence: expected number from 0 to 1 or null"
                 )
-            if status != "refuted" and item.get("refuted_by") is not None:
+            if item.get("refuted_by") is not None:
                 errors.append(
-                    f"{path}.refuted_by: valid only for refuted status"
+                    f"{path}.refuted_by: Batch hypothesis updates must leave it null"
                 )
 
     evaluations = value.get("evaluations")
@@ -1890,6 +1988,15 @@ def validate_role_output(
                         errors.append(
                             f"{path}.command: command action requires text"
                         )
+                    elif _direct_web_helper_requests_private_session(
+                        str(item["command"])
+                    ):
+                        errors.append(
+                            f"{path}.command: generic managed Web commands "
+                            "are stateless; omit --session because persistent "
+                            "sessions require an explicit engine private-state "
+                            "boundary"
+                        )
                     if item.get("artifact_path") is not None:
                         errors.append(
                             f"{path}.artifact_path: command action "
@@ -1913,8 +2020,14 @@ def validate_role_output(
                 continue
             _exact_keys(item, keys, path, errors)
             artifact_path = item.get("path")
-            if not isinstance(artifact_path, str) or not _valid_relative_path(artifact_path):
-                errors.append(f"{path}.path: expected safe relative path")
+            if (
+                not isinstance(artifact_path, str)
+                or not _valid_reported_artifact_path(artifact_path, role)
+            ):
+                errors.append(
+                    f"{path}.path: expected safe relative path using a bare "
+                    "workspace-relative path or the role workspace prefix"
+                )
             digest = item.get("sha256")
             if digest is not None and (
                 not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest)
@@ -1966,7 +2079,61 @@ def validate_role_output(
         if not isinstance(decision, Mapping):
             errors.append(f"{path}: expected object or null")
         else:
-            _exact_keys(decision, {"next_stage", "reason"}, path, errors)
+            decision_keys = {"next_stage", "reason"}
+            if contract_version == 2 and role is Role.CAPTAIN:
+                decision_keys.add("selected_experiment")
+                _exact_keys(decision, decision_keys, path, errors)
+                selected_experiment = decision.get(
+                    "selected_experiment"
+                )
+                if selected_experiment is not None:
+                    selected_path = f"{path}.selected_experiment"
+                    if not isinstance(selected_experiment, Mapping):
+                        errors.append(
+                            f"{selected_path}: expected object or null"
+                        )
+                    else:
+                        _exact_keys(
+                            selected_experiment,
+                            {
+                                "experiment_id",
+                                "command_sha256",
+                                "contract_sha256",
+                            },
+                            selected_path,
+                            errors,
+                        )
+                        experiment_id = selected_experiment.get(
+                            "experiment_id"
+                        )
+                        if (
+                            not isinstance(experiment_id, str)
+                            or not _REFERENCE_ID_RE.fullmatch(
+                                experiment_id
+                            )
+                        ):
+                            errors.append(
+                                f"{selected_path}.experiment_id: invalid id"
+                            )
+                        for field in (
+                            "command_sha256",
+                            "contract_sha256",
+                        ):
+                            digest = selected_experiment.get(field)
+                            if (
+                                not isinstance(digest, str)
+                                or _SHA256_RE.fullmatch(digest) is None
+                            ):
+                                errors.append(
+                                    f"{selected_path}.{field}: invalid sha256"
+                                )
+            else:
+                _exact_keys(
+                    decision,
+                    decision_keys,
+                    path,
+                    errors,
+                )
             if decision.get("next_stage") not in NEXT_STAGE_VALUES:
                 errors.append(f"{path}.next_stage: invalid stage")
             if not isinstance(decision.get("reason"), str):
@@ -2076,7 +2243,15 @@ def role_prompt(role: Role, user_prompt: str) -> str:
         else "You are read-only. Do not modify challenge or workspace files."
     )
     decision_rule = (
-        "You must propose the engine's next_stage in decision."
+        (
+            "You must propose the engine's next_stage in decision. When the "
+            "output schema offers decision.selected_experiment and an "
+            "existing pending experiment is the exact next action, set it to "
+            "the canonical experiment_id, command_sha256, and "
+            "contract_sha256 exactly as exposed in the resume capsule. "
+            "Otherwise set it to null; the v2 field is always required. "
+            "Never reconstruct or repeat the command body."
+        )
         if role is Role.CAPTAIN
         else "You may not decide the engine stage; decision must be null."
     )
@@ -2092,6 +2267,89 @@ def role_prompt(role: Role, user_prompt: str) -> str:
             spec.purpose,
             "Do not spawn or delegate to subagents in Batch mode.",
             write_rule,
+            (
+                "Top-level artifacts is the current run's publication list. "
+                "Do not repeat existing canonical artifacts/snapshots paths "
+                "there; cite their canonical artifact IDs in observation, "
+                "hypothesis, evaluation, or action evidence fields instead."
+            ),
+            (
+                "For a new top-level artifact, report either a bare path whose "
+                "first component is not artifacts/proof, or the exact role "
+                "prefix artifacts/workspace/... (proof/workspace/... for "
+                "proof roles). If the file itself is artifacts/name, report "
+                "artifacts/workspace/artifacts/name."
+            ),
+            (
+                "Canonical state and artifact paths shown in context are "
+                "evidence pointers, not paths available inside a command "
+                "sandbox. Never embed a host workspace or .ctfos absolute "
+                "path in an action command. Every generic command receives a "
+                "fresh /work. Prior-run canonical artifacts are never staged. "
+                "Only a top-level artifact published by the same role "
+                "invocation that emits that exact command can become a /work "
+                "input at its reported relative path. Use relative paths for "
+                "action-created output; a direct absolute /work/FILE shell "
+                "argument is admitted only when that same-run input binding "
+                "exists. Commands may read immutable challenge input below "
+                "/challenge. If prior raw output is needed, rerun a bounded "
+                "tool against /challenge instead of trying to open its "
+                "canonical snapshot pointer."
+            ),
+            (
+                "Command stdout is preserved in a bounded immutable artifact, "
+                "but later model context exposes only small redacted head/tail "
+                "samples. Do not dump an entire source file or long analysis "
+                "when a focused extraction will do. Emit every exact value "
+                "needed by the next role in concise records, then end with one "
+                "ASCII line beginning exactly SUMMARY: that contains all "
+                "discriminating values within the final 256 output bytes. The "
+                "SUMMARY line must be self-contained against every keep_if, "
+                "drop_if, and success condition tested by that action. Include "
+                "the matched code/data location rather than substituting the "
+                "first nearby or generic match. If a required value is absent, "
+                "record it as missing and make the oracle fail instead of "
+                "guessing; split the work into narrower actions if the complete "
+                "summary cannot fit."
+            ),
+            (
+                "Files below /challenge are immutable and may deliberately "
+                "lack execute bits even when their content is executable. "
+                "Never chmod or replace a /challenge path. If a command action "
+                "must execute one, copy its exact bytes to a fresh relative "
+                "private path from the /work current directory, verify the "
+                "copy's SHA-256 against canonical "
+                "inventory evidence, add execute permission only to that copy, "
+                "and execute the copy. This disposable action-local copy is "
+                "permitted for read-only roles; it is not a role artifact and "
+                "does not permit any canonical workspace mutation."
+            ),
+            (
+                "When a target-bound sandbox exposes proxy environment "
+                "variables, direct DNS and TCP sockets are denied. HTTP(S) "
+                "clients must honor HTTP_PROXY/HTTPS_PROXY; raw TCP clients "
+                "must use the SOCKS5H endpoint in ALL_PROXY with proxy-side "
+                "DNS (PySocks is available)."
+            ),
+            (
+                "For ordinary managed Web HTTP command actions, use the "
+                "stateless exact helper shape "
+                "`/opt/ctf-templates/web/request.py URL -X METHOD ...`. URL "
+                "is a required positional argument: never invent a `--url` "
+                "option. For a GET, write "
+                "`/opt/ctf-templates/web/request.py http://target/path -X GET`. "
+                "If a body marker determines expected_observation, keep_if, or "
+                "drop_if, add `--observe-text HARMLESS_MARKER` for every "
+                "bounded non-secret marker. The durable helper summary exposes "
+                "only status, byte count, body/marker SHA-256, and presence. A "
+                "managed remote Web command without a canonical response "
+                "summary fails closed even when its process exits zero. "
+                "Omit `--session` from every generic command action: its "
+                "shell execution path has no engine private-state boundary. "
+                "Persistent `--session ROLE` is only valid when an "
+                "engine-owned typed Web gate or another explicit direct-helper "
+                "execution path supplies that boundary."
+            ),
             decision_rule,
             independence_rule,
             (
@@ -2129,6 +2387,17 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 if role is Role.BUILDER
                 else ""
             ),
+            (
+                "The Pwn gates prove_pwn_exploit_effect and "
+                "prove_pwn_interaction are strictly local and network-denied. "
+                "If state has a selected primary remote target, do not propose "
+                "either gate. Publish the exploit or recipe as a top-level "
+                "Builder artifact, then use a command action bound to the "
+                "canonical network_target_id and network_target_generation; "
+                "the command must reach the target through the supplied proxy."
+                if role is Role.BUILDER
+                else ""
+            ),
             "Use only these provenance values: executed, tool_inferred, model_claimed, "
             "external_doc, operator.",
             "Every hypothesis must include falsifier, keep_if, and drop_if before execution.",
@@ -2142,10 +2411,49 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 "keep_if/drop_if."
             ),
             (
+                "A generic command intended to support semantic KEEP/DROP must "
+                "emit one ASCII raw witness line anchored with REC: or RECORD:, "
+                "at most 200 characters, as the first or last stdout line. "
+                "SUMMARY: and oracle= tokens alone are not semantic authority."
+            ),
+            (
+                "A model evaluation of a generic command is proposal only. "
+                "Reconcile its exact keep_if or drop_if predicate against the "
+                "anchored raw witness records for the audit reason, but the "
+                "canonical result remains inconclusive with no hypothesis or "
+                "Fact relationship changes even when REC:/RECORD: is present. "
+                "Never label a successful receipt FAILED; transport failure "
+                "semantics are owned by the engine."
+            ),
+            (
+                "hypothesis_updates may edit only an OPEN hypothesis without "
+                "changing its status: status must be open and refuted_by must "
+                "be null. Once any experiment references that hypothesis, "
+                "leave its statement and falsifier unchanged. Confirm or "
+                "refute a hypothesis only through an "
+                "evaluation tied to a canonical executed experiment, using "
+                "support_hypothesis_ids or refute_hypothesis_ids."
+            ),
+            (
+                "One experiment evaluation has one overall disposition. If one "
+                "probe could support or refute some referenced hypotheses while "
+                "leaving others unresolved, split it into separate narrow "
+                "experiments before execution, preferably one hypothesis per "
+                "experiment. Never attach support_hypothesis_ids or "
+                "refute_hypothesis_ids to an inconclusive or failed evaluation, "
+                "and never use hypothesis_updates to preserve a partial mixed "
+                "disposition."
+            ),
+            (
                 "confirmed hypotheses require canonical executed fact, run, "
                 "and immutable artifact evidence; model claims alone are invalid."
             ),
             "Report any possible flag in flag_candidates immediately; never submit a flag.",
+            (
+                "Do not re-emit an exact candidate that an executed positive/negative "
+                "oracle already rejected for the same immutable source and target "
+                "generation. Record that value only as disproven evaluation evidence."
+            ),
             "Return only the requested JSON object. Do not add Markdown fences or extra keys.",
             "",
             "Problem-solving prompt:",

@@ -39,6 +39,8 @@ if grep -q '^160000 ' <<<"${entry}"; then
 fi
 
 required=(
+  ctf_os/operator_hash_verifier.py
+  docs/team-main-bootstrap.md
   ctf-os-image/.dockerignore
   ctf-os-image/AGENTS.md
   ctf-os-image/Dockerfile
@@ -64,17 +66,22 @@ required=(
   ctf-os-image/tests/fixtures/rev-stdin-oracle.c
   ctf-os-image/tests/test-capability-contract.py
   ctf-os-image/tests/test-forensic-browser-timeline.py
+  ctf-os-image/tests/test-forensic-evidence-index.py
   ctf-os-image/tests/test-forensic-triage.py
   ctf-os-image/tests/test-pwn-qemu-headless.py
   ctf-os-image/tests/test-pwn-crash-oracle.py
+  ctf-os-image/tests/test-pwn-exploit-effect.py
+  ctf-os-image/tests/test-pwn-interaction-v1.py
   ctf-os-image/tests/test-pwn-runtime-snapshot.py
   ctf-os-image/tests/test-rev-inventory.py
   ctf-os-image/tests/test-rev-runtime-exec.py
   ctf-os-image/tests/test-rev-stdin-exec.py
   ctf-os-image/tests/test-sqlite-readonly.py
+  ctf-os-image/tests/test-web-session-state.py
   scripts/check-pwn-docker-crash.py
   scripts/check-pwn-docker-snapshot.py
   scripts/check-rev-docker-proof.py
+  scripts/ctftiny-operator-verify.py
 )
 for path in "${required[@]}"; do
   if [[ ! -f "${path}" ]]; then
@@ -102,17 +109,22 @@ fi
 "${python_bin}" ctf-os-image/tests/test-tool-manifest.py
 "${python_bin}" ctf-os-image/tests/test-browser-safety.py
 "${python_bin}" ctf-os-image/tests/test-forensic-browser-timeline.py
+"${python_bin}" ctf-os-image/tests/test-forensic-evidence-index.py
 "${python_bin}" ctf-os-image/tests/test-forensic-triage.py
 "${python_bin}" ctf-os-image/tests/test-pwn-crash-oracle.py
+"${python_bin}" ctf-os-image/tests/test-pwn-exploit-effect.py
+"${python_bin}" ctf-os-image/tests/test-pwn-interaction-v1.py
 "${python_bin}" ctf-os-image/tests/test-pwn-qemu-headless.py
 "${python_bin}" ctf-os-image/tests/test-pwn-runtime-snapshot.py
 "${python_bin}" ctf-os-image/tests/test-rev-inventory.py
 "${python_bin}" ctf-os-image/tests/test-rev-runtime-exec.py
 "${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
 "${python_bin}" ctf-os-image/tests/test-sqlite-readonly.py
+"${python_bin}" ctf-os-image/tests/test-web-session-state.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-crash.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-snapshot.py
 "${python_bin}" -m py_compile scripts/check-rev-docker-proof.py
+"${python_bin}" -m py_compile scripts/ctftiny-operator-verify.py
 
 for script in ctf-os-image/scripts/* ctf-os-image/tests/*.sh; do
   if [[ ! -f "${script}" ]]; then

@@ -12,11 +12,20 @@ from unittest import mock
 import ctf_os.promotion_bundles as promotion_bundles
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.budget import deadline_utc_after
-from ctf_os.codex import BatchRunner, FifoModelCallLimiter, Role
+from ctf_os.codex import (
+    BatchRunner,
+    FifoModelCallLimiter,
+    LimiterSnapshot,
+    Role,
+)
 from ctf_os.config import load_config
 from ctf_os.engine.challenge import ChallengeEngine, EngineError
 from ctf_os.managed import ManagedError, ManagedOrchestrator
-from ctf_os.managed_budget import MANAGED_WAVE_BUDGET_GUARD_KEY
+from ctf_os.managed_budget import (
+    MANAGED_WAVE_BUDGET_GUARD_KEY,
+    MANAGED_WAVE_BUDGET_GUARD_V2_KEY,
+    build_managed_wave_budget_guard,
+)
 from ctf_os.models import (
     ChallengeIdentity,
     ChallengeStatus,
@@ -91,8 +100,20 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
         *,
         provider_limit: int = 1,
         image_digest: str = "sha256:" + "b" * 64,
+        use_default_reserves: bool = False,
     ) -> ChallengeEngine:
         config = load_config(self.root)
+        runtime = replace(
+            config.runtime,
+            image_digest=image_digest,
+        )
+        if not use_default_reserves:
+            runtime = replace(
+                runtime,
+                managed_wave_queue_reserve_s=10.0,
+                managed_wave_role_call_reserve_s=20.0,
+                managed_wave_action_commit_reserve_s=30.0,
+            )
         config = replace(
             config,
             resources=replace(
@@ -100,13 +121,7 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
                 provider_max_concurrent_calls=provider_limit,
                 max_standard_jobs=3,
             ),
-            runtime=replace(
-                config.runtime,
-                image_digest=image_digest,
-                managed_wave_queue_reserve_s=10.0,
-                managed_wave_role_call_reserve_s=20.0,
-                managed_wave_action_commit_reserve_s=30.0,
-            ),
+            runtime=runtime,
         )
         return ChallengeEngine(
             self.root,
@@ -186,7 +201,7 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
         self.assertEqual(executor.roles, [Role.CAPTAIN])
         self.assertEqual(len(state.cycles), 1)
         cycle = state.cycles[0]
-        audit = cycle.extra[MANAGED_WAVE_BUDGET_GUARD_KEY]
+        audit = cycle.extra[MANAGED_WAVE_BUDGET_GUARD_V2_KEY]
         self.assertEqual(audit["decision"], "pause")
         self.assertEqual(
             audit["reason_code"],
@@ -218,6 +233,145 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
         self.assertIn("remaining_ms=99000", session.stop_reason or "")
         state.validate()
 
+    def test_live_backlog_reserve_pauses_the_complete_wave(self) -> None:
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor, provider_limit=3)
+        engine.batch_runner.limiter.snapshot = mock.Mock(
+            return_value=LimiterSnapshot(
+                capacity=3,
+                active=3,
+                waiting=3,
+            )
+        )
+        # Without backlog the v1/static reserve is 60s. Including six calls
+        # ahead of this fixed three-role wave requires three 20s occupancy
+        # batches plus the same 10s queue and 30s commit reserves: 100s.
+        self.add_with_accounting_only_budget(engine, 99)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        self.assertIs(state.status, ChallengeStatus.PAUSED)
+        self.assertEqual(state.waves, [])
+        self.assertEqual(executor.roles, [Role.CAPTAIN])
+        audit = state.cycles[0].extra[
+            MANAGED_WAVE_BUDGET_GUARD_V2_KEY
+        ]
+        self.assertEqual(audit["provider_snapshot_capacity"], 3)
+        self.assertEqual(audit["provider_snapshot_active"], 3)
+        self.assertEqual(audit["provider_snapshot_waiting"], 3)
+        self.assertEqual(audit["effective_provider_capacity"], 3)
+        self.assertEqual(audit["serial_provider_batches"], 1)
+        self.assertEqual(audit["occupied_provider_batches"], 3)
+        self.assertEqual(audit["backlog_provider_batches"], 2)
+        self.assertEqual(audit["minimum_required_ms"], 100_000)
+        self.assertEqual(audit["remaining_budget_ms"], 99_000)
+        self.assertEqual(audit["decision"], "pause")
+        state.validate()
+
+    def test_calibrated_defaults_cover_live_provider_occupancy(self) -> None:
+        engine = self.engine(
+            ProbeRoleExecutor(),
+            provider_limit=3,
+            use_default_reserves=True,
+        )
+        self.add_with_accounting_only_budget(engine, 3_600)
+        state = engine.store.load(self.identity)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+
+        cases = (
+            (LimiterSnapshot(3, 0, 0), 1, 2_400_000, "allow"),
+            (LimiterSnapshot(3, 3, 0), 2, 3_600_000, "allow"),
+            (LimiterSnapshot(3, 3, 3), 3, 4_800_000, "pause"),
+        )
+        for snapshot, occupied_batches, minimum_ms, decision in cases:
+            with self.subTest(snapshot=snapshot):
+                engine.batch_runner.limiter.snapshot = mock.Mock(
+                    return_value=snapshot
+                )
+                audit = orchestrator._managed_wave_budget_guard(
+                    state,
+                    "attack",
+                )
+
+                self.assertEqual(audit["logical_role_count"], 3)
+                self.assertEqual(audit["provider_parallel_capacity"], 3)
+                self.assertEqual(
+                    audit["occupied_provider_batches"],
+                    occupied_batches,
+                )
+                self.assertEqual(audit["minimum_required_ms"], minimum_ms)
+                self.assertEqual(audit["remaining_budget_ms"], 3_600_000)
+                self.assertEqual(audit["decision"], decision)
+
+    def test_live_backlog_exact_boundary_keeps_all_three_roles(self) -> None:
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor, provider_limit=3)
+        engine.batch_runner.limiter.snapshot = mock.Mock(
+            return_value=LimiterSnapshot(
+                capacity=3,
+                active=3,
+                waiting=3,
+            )
+        )
+        self.add_with_accounting_only_budget(engine, 100)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        self.assertEqual(len(state.waves), 1)
+        self.assertEqual(
+            set(state.waves[0].role_run_ids),
+            {"builder", "falsifier", "reproducer"},
+        )
+        self.assertEqual(len(state.waves[0].role_run_ids), 3)
+        self.assertEqual(
+            set(executor.roles),
+            {
+                Role.CAPTAIN,
+                Role.BUILDER,
+                Role.FALSIFIER,
+                Role.REPRODUCER,
+            },
+        )
+        audit = state.cycles[0].extra[
+            MANAGED_WAVE_BUDGET_GUARD_V2_KEY
+        ]
+        self.assertEqual(audit["decision"], "allow")
+        self.assertEqual(audit["minimum_required_ms"], 100_000)
+        state.validate()
+
+    def test_backlog_math_uses_global_capacity_above_wave_width(self) -> None:
+        engine = self.engine(ProbeRoleExecutor(), provider_limit=10)
+        engine.batch_runner.limiter.snapshot = mock.Mock(
+            return_value=LimiterSnapshot(
+                capacity=10,
+                active=8,
+                waiting=0,
+            )
+        )
+        self.add_with_accounting_only_budget(engine, 1_000)
+        state = engine.store.load(self.identity)
+        audit = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )._managed_wave_budget_guard(state, "attack")
+
+        self.assertEqual(audit["effective_provider_capacity"], 10)
+        self.assertEqual(audit["provider_parallel_capacity"], 3)
+        self.assertEqual(audit["serial_provider_batches"], 1)
+        # Eight live calls leave only two immediate slots. The final logical
+        # role therefore needs a second batch, not four batches from capping
+        # global occupancy capacity to the three-role wave width.
+        self.assertEqual(audit["occupied_provider_batches"], 2)
+        self.assertEqual(audit["backlog_provider_batches"], 1)
+        self.assertEqual(audit["minimum_required_ms"], 80_000)
+
     def test_exact_boundary_reserves_all_roles_even_with_serial_provider(
         self,
     ) -> None:
@@ -246,7 +400,7 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             },
         )
         audit = state.cycles[0].extra[
-            MANAGED_WAVE_BUDGET_GUARD_KEY
+            MANAGED_WAVE_BUDGET_GUARD_V2_KEY
         ]
         self.assertEqual(audit["decision"], "allow")
         self.assertEqual(audit["remaining_budget_ms"], 100_000)
@@ -283,9 +437,81 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
         self.assertEqual(after.revision, before.revision)
         self.assertEqual(after.waves, [])
         self.assertNotIn(
-            MANAGED_WAVE_BUDGET_GUARD_KEY,
+            MANAGED_WAVE_BUDGET_GUARD_V2_KEY,
             after.cycles[0].extra,
         )
+
+    def test_hostile_provider_snapshot_fails_before_wave_reservation(
+        self,
+    ) -> None:
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor, provider_limit=3)
+        self.add_with_accounting_only_budget(engine, 1_000)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        before, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+
+        cases = (
+            (
+                LimiterSnapshot(0, 0, 0),
+                "provider_snapshot_capacity must be a positive integer",
+            ),
+            (
+                LimiterSnapshot(3, 4, 0),
+                "provider_snapshot_active exceeds",
+            ),
+            (
+                LimiterSnapshot(3, 0, -1),
+                "provider_snapshot_waiting must be a non-negative integer",
+            ),
+        )
+        for snapshot, message in cases:
+            with self.subTest(snapshot=snapshot):
+                engine.batch_runner.limiter.snapshot = mock.Mock(
+                    return_value=snapshot
+                )
+                with self.assertRaisesRegex(ManagedError, message):
+                    orchestrator._reserve_wave(
+                        self.identity,
+                        session_id,
+                        cycle.id,
+                        "attack",
+                        enforce_budget_guard=True,
+                    )
+                after = engine.store.load(self.identity)
+                self.assertEqual(after.revision, before.revision)
+                self.assertEqual(after.waves, [])
+                self.assertNotIn(
+                    MANAGED_WAVE_BUDGET_GUARD_V2_KEY,
+                    after.cycles[0].extra,
+                )
+
+        engine.batch_runner.limiter.snapshot = mock.Mock(
+            side_effect=RuntimeError("snapshot unavailable")
+        )
+        with self.assertRaisesRegex(
+            ManagedError,
+            "managed wave provider snapshot failed",
+        ):
+            orchestrator._reserve_wave(
+                self.identity,
+                session_id,
+                cycle.id,
+                "attack",
+                enforce_budget_guard=True,
+            )
+        after = engine.store.load(self.identity)
+        self.assertEqual(after.revision, before.revision)
+        self.assertEqual(after.waves, [])
 
     def test_injected_wall_clock_uses_strict_absolute_boundary(self) -> None:
         engine = self.engine(ProbeRoleExecutor())
@@ -328,25 +554,71 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             capability_probe=self.capability,
         ).run_cycle(self.identity)
 
-        mutated = copy.deepcopy(state)
-        mutated.cycles[0].extra[
-            MANAGED_WAVE_BUDGET_GUARD_KEY
-        ]["logical_role_count"] = 2
-        with self.assertRaisesRegex(
-            ModelValidationError,
-            "managed wave budget guard",
+        for field, value in (
+            ("logical_role_count", 2),
+            ("provider_snapshot_waiting", 1),
+            ("occupied_provider_batches", 4),
         ):
-            mutated.validate()
+            with self.subTest(field=field):
+                mutated = copy.deepcopy(state)
+                mutated.cycles[0].extra[
+                    MANAGED_WAVE_BUDGET_GUARD_V2_KEY
+                ][field] = value
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    "managed wave budget guard",
+                ):
+                    mutated.validate()
 
         orphaned = copy.deepcopy(state)
         orphaned.cycles[0].extra.pop(
-            MANAGED_WAVE_BUDGET_GUARD_KEY
+            MANAGED_WAVE_BUDGET_GUARD_V2_KEY
         )
         with self.assertRaisesRegex(
             ModelValidationError,
             "capsule lacks",
         ):
             orphaned.validate()
+
+    def test_legacy_v1_pause_guard_remains_canonical(self) -> None:
+        engine = self.engine(ProbeRoleExecutor(), provider_limit=1)
+        self.add_with_accounting_only_budget(engine, 99)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+        v2_audit = copy.deepcopy(
+            state.cycles[0].extra[MANAGED_WAVE_BUDGET_GUARD_V2_KEY]
+        )
+
+        legacy = copy.deepcopy(state)
+        legacy.cycles[0].extra.pop(MANAGED_WAVE_BUDGET_GUARD_V2_KEY)
+        legacy.cycles[0].extra[MANAGED_WAVE_BUDGET_GUARD_KEY] = (
+            build_managed_wave_budget_guard(
+                wave_kind="attack",
+                provider_max_concurrent_calls=1,
+                queue_reserve_seconds=10.0,
+                role_call_reserve_seconds=20.0,
+                action_commit_reserve_seconds=30.0,
+                remaining_seconds=99.0,
+                checked_state_revision=v2_audit[
+                    "checked_state_revision"
+                ],
+                configuration_epoch=v2_audit["configuration_epoch"],
+                budget_mode="bounded",
+            )
+        )
+        legacy.validate()
+
+        ambiguous = copy.deepcopy(legacy)
+        ambiguous.cycles[0].extra[
+            MANAGED_WAVE_BUDGET_GUARD_V2_KEY
+        ] = v2_audit
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "both v1 and v2",
+        ):
+            ambiguous.validate()
 
     def test_prepared_evaluation_records_managed_scaffold_once_before_session(
         self,

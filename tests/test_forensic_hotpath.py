@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -387,6 +388,110 @@ class ForensicIndexHotPathTests(unittest.TestCase):
         self.assertEqual(state.candidates, [])
         self.assertEqual(state.submissions, [])
         state.validate()
+
+    def test_runtime_image_rotation_preserves_completed_seed_graph(
+        self,
+    ) -> None:
+        engine, _holder = self._engine()
+        seed = self._bound_seed(engine)
+        completed_state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(seed.id,),
+        )
+        old_plan = completed_state.metadata[
+            "adapter_seed_plan_sha256"
+        ]
+        replacement_digest = "sha256:" + ("9" * 64)
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                image_digest=replacement_digest,
+            ),
+        )
+
+        rotated = engine.synchronize_managed_adapter_seed_plan(
+            self.identity,
+            "S-forensic-hotpath",
+        )
+
+        self.assertNotEqual(
+            rotated.metadata["adapter_seed_plan_sha256"],
+            old_plan,
+        )
+        historical = next(
+            experiment
+            for experiment in rotated.experiments
+            if experiment.id == seed.id
+        )
+        self.assertIs(historical.status, ExperimentStatus.COMPLETED)
+        replacement = [
+            experiment
+            for experiment in rotated.experiments
+            if (
+                experiment.extra.get("adapter_seed") is True
+                and experiment.status is ExperimentStatus.REGISTERED
+                and experiment.extra.get("adapter_plan_sha256")
+                == rotated.metadata["adapter_seed_plan_sha256"]
+            )
+        ]
+        self.assertEqual(len(replacement), 1)
+        self.assertEqual(
+            replacement[0].extra["source_binding"],
+            rotated.metadata["adapter_seed_source_binding"],
+        )
+        rotated.validate()
+
+    def test_budget_reset_preserves_completed_index_graph_epoch(self) -> None:
+        engine, _holder = self._engine()
+        seed = self._bound_seed(engine)
+        completed_state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(seed.id,),
+        )
+        experiment = next(
+            item
+            for item in completed_state.experiments
+            if item.id == seed.id
+        )
+        run = next(
+            item
+            for item in completed_state.runs
+            if item.id == experiment.result["run_id"]
+        )
+        receipt = next(
+            item
+            for item in completed_state.receipts
+            if item.id == experiment.result["receipt_id"]
+        )
+        pinned_epoch = run.configuration_epoch
+        pinned_experiment = copy.deepcopy(experiment.to_dict(v2=True))
+        pinned_run = copy.deepcopy(run.to_dict(v2=True))
+        pinned_receipt = copy.deepcopy(receipt.to_dict())
+
+        reset = engine.reset_budget(self.identity, 3_600)
+
+        self.assertEqual(
+            reset.configuration_epoch,
+            completed_state.configuration_epoch + 1,
+        )
+        reset_experiment = next(
+            item for item in reset.experiments if item.id == seed.id
+        )
+        reset_run = next(
+            item for item in reset.runs if item.id == run.id
+        )
+        reset_receipt = next(
+            item for item in reset.receipts if item.id == receipt.id
+        )
+        self.assertEqual(reset_run.configuration_epoch, pinned_epoch)
+        self.assertEqual(
+            reset_experiment.to_dict(v2=True),
+            pinned_experiment,
+        )
+        self.assertEqual(reset_run.to_dict(v2=True), pinned_run)
+        self.assertEqual(reset_receipt.to_dict(), pinned_receipt)
+        reset.validate()
 
     def test_source_mutation_during_transport_fails_closed(self) -> None:
         incoming_file = (

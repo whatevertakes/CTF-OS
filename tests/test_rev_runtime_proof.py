@@ -19,6 +19,7 @@ from ctf_os.engine.rev_runtime_proof import (
     REV_RUNTIME_EXEC_CAPABILITY,
     REV_RUNTIME_PROOF_RESULT_KEY,
     RevRuntimeProofError,
+    _validate_private_rev_runtime_proof_evaluation,
     prove_rev_runtime_accepted_input,
     rev_runtime_proof_state_errors,
     validate_rev_runtime_proof_evaluation,
@@ -27,6 +28,7 @@ from ctf_os.engine.rev_runtime_proof import (
 from ctf_os.live_broker import inspect_state
 from ctf_os.models import (
     ChallengeIdentity,
+    ExperimentStatus,
     ModelValidationError,
     RunOrigin,
     RunStatus,
@@ -94,6 +96,7 @@ class _Controller:
         self.proof_inputs = []
         self.challenge_closures = []
         self.duplicate_sandbox_identity = False
+        self.mismatched_clean_stream_identity = False
         self.truncate_ordinal: int | None = None
         self.mutate_after_ordinal: int | None = None
         self.mutate_path: Path | None = None
@@ -202,10 +205,24 @@ class _RuntimeSandbox:
             ACCEPTED_OUTPUT if accepted else REJECTED_OUTPUT
         )
         exit_code = 0 if accepted else 7
-        directory = self.work / "proof" / f"clean-{ordinal:02d}"
-        directory.mkdir(parents=True)
-        stdout = directory / "stdout.bin"
-        stderr = directory / "stderr.bin"
+        clean_nonce = (
+            "000000000001"
+            if self.controller.duplicate_sandbox_identity
+            else f"{ordinal:012x}"
+        )
+        stderr_nonce = (
+            "ffffffffffff"
+            if self.controller.mismatched_clean_stream_identity
+            else clean_nonce
+        )
+        directory = self.work / "proof" / f"clean-{clean_nonce}"
+        stderr_directory = (
+            self.work / "proof" / f"clean-{stderr_nonce}"
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        stderr_directory.mkdir(parents=True, exist_ok=True)
+        stdout = directory / "stdout.log"
+        stderr = stderr_directory / "stderr.log"
         stdout.write_bytes(stdout_payload)
         stderr.write_bytes(b"")
         truncated = self.controller.truncate_ordinal == ordinal
@@ -215,11 +232,7 @@ class _RuntimeSandbox:
         ):
             self.controller.mutate_path.write_bytes(b"changed-after-run")
         return SandboxResult(
-            (
-                "sandbox-reused"
-                if self.controller.duplicate_sandbox_identity
-                else f"sandbox-{ordinal}"
-            ),
+            "run-00000001",
             "completed",
             exit_code,
             False,
@@ -228,8 +241,8 @@ class _RuntimeSandbox:
             "",
             len(stdout_payload),
             0,
-            f"/work/proof/clean-{ordinal:02d}/stdout.bin",
-            f"/work/proof/clean-{ordinal:02d}/stderr.bin",
+            f"/work/proof/clean-{clean_nonce}/stdout.log",
+            f"/work/proof/clean-{stderr_nonce}/stderr.log",
             stdout_stored_bytes=len(stdout_payload),
             stderr_stored_bytes=0,
             stdout_limit_bytes=16 * 1024 * 1024,
@@ -396,6 +409,17 @@ class RevRuntimeProofTests(unittest.TestCase):
             and REV_RUNTIME_PROOF_RESULT_KEY in item.result
         ]
 
+    def _private_evaluation(self, state):
+        proof = self._proof_experiments(state)[0]
+        artifact = next(
+            item
+            for item in state.artifacts
+            if item.extra.get("experiment_id") == proof.id
+            and item.extra.get("kind") == "rev_runtime_evaluation"
+        )
+        paths = self.engine.store.challenge_paths(self.identity)
+        return json.loads((paths.root / artifact.path).read_bytes())
+
     def test_hash_bound_multifile_runtime_passes_candidate_free(self):
         self.assertEqual(
             tuple(
@@ -416,6 +440,23 @@ class RevRuntimeProofTests(unittest.TestCase):
         state, evaluation = self._prove()
         self.assertTrue(evaluation["passed"])
         validate_rev_runtime_proof_evaluation(evaluation)
+        private_evaluation = self._private_evaluation(state)
+        self.assertEqual(
+            {
+                record["sandbox_run_id"]
+                for record in private_evaluation["records"]
+            },
+            {"run-00000001"},
+        )
+        self.assertEqual(
+            len(
+                {
+                    record["stdout_locator"].split("/")[1]
+                    for record in private_evaluation["records"]
+                }
+            ),
+            6,
+        )
         self.assertFalse((self.workspace / "accepted.bin").exists())
         self.assertEqual(self.controller.proof_calls, 6)
         self.assertEqual(self.probe_count, 2)
@@ -851,6 +892,75 @@ class RevRuntimeProofTests(unittest.TestCase):
         )
         self.assertEqual(state.candidates, [])
         self.assertEqual(state.submissions, [])
+
+    def test_reused_clean_proof_nonce_alone_cannot_pass(self):
+        self.controller.duplicate_sandbox_identity = True
+        state, evaluation = self._prove()
+        self.assertFalse(evaluation["passed"])
+        self.assertEqual(
+            evaluation["reason_codes"],
+            ["sandbox_identity_reused"],
+        )
+        self.assertEqual(state.candidates, [])
+        self.assertEqual(state.submissions, [])
+
+    def test_clean_proof_streams_must_share_one_exact_promoted_nonce(self):
+        before = self.engine.store.load(self.identity)
+        self.controller.mismatched_clean_stream_identity = True
+        with self.assertRaises(RevRuntimeProofError) as raised:
+            self._prove()
+        self.assertEqual(
+            raised.exception.code,
+            "runtime_result_locator_invalid",
+        )
+        after = self.engine.store.load(self.identity)
+        self.assertEqual(after.revision, before.revision)
+        self.assertEqual(self._proof_experiments(after), [])
+
+    def test_legacy_false_reuse_blocker_state_remains_valid(self):
+        state, _evaluation = self._prove()
+        private_evaluation = self._private_evaluation(state)
+        legacy_private = copy.deepcopy(private_evaluation)
+        legacy_private["passed"] = False
+        legacy_private["reason_codes"] = ["sandbox_identity_reused"]
+        _validate_private_rev_runtime_proof_evaluation(legacy_private)
+
+        legacy_payload = (
+            json.dumps(
+                legacy_private,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+        legacy_sha256 = hashlib.sha256(legacy_payload).hexdigest()
+        legacy = copy.deepcopy(state)
+        proof = self._proof_experiments(legacy)[0]
+        public = proof.result[REV_RUNTIME_PROOF_RESULT_KEY]["evaluation"]
+        public["passed"] = False
+        public["reason_codes"] = ["sandbox_identity_reused"]
+        public["private_evaluation"] = {
+            "sha256": legacy_sha256,
+            "size_bytes": len(legacy_payload),
+        }
+        proof.status = ExperimentStatus.FAILED
+        proof.evaluation_reason = (
+            "rev_runtime_proof:sandbox_identity_reused"
+        )
+        artifact = next(
+            item
+            for item in legacy.artifacts
+            if item.extra.get("experiment_id") == proof.id
+            and item.extra.get("kind") == "rev_runtime_evaluation"
+        )
+        artifact.sha256 = legacy_sha256
+        artifact.size = len(legacy_payload)
+        artifact.extra["evaluation_sha256"] = legacy_sha256
+
+        validate_rev_runtime_proof_state_graph(legacy)
+        legacy.validate()
 
     def test_accepted_input_cannot_be_smuggled_in_runtime_argv(self):
         disclosed = build_rev_runtime_v1_spec(

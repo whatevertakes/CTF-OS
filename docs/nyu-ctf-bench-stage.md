@@ -25,15 +25,28 @@ so source verification cannot invoke a checkout-defined clean filter. Before sta
 pin the CTF-OS runtime image and keep every logical role on one model so the
 current promotion execution fingerprint can be recorded.
 
+Choose the upstream official dataset explicitly with `--source-dataset`.
+`test` is the compatibility default and binds the root
+`test_dataset.json`; `development` binds the root
+`development_dataset.json`. No arbitrary dataset filename or path is
+accepted. The chosen file is read as a regular, bounded JSON object and must
+match its blob in `--release-commit`; its exact filename is recorded as
+`metadata.source_dataset` in the partial manifest. This source selector is
+independent of the promotion `--split` label. For example, an upstream
+development smoke cohort normally uses `--source-dataset development
+--split dev`, with every `--case` taken from `development_dataset.json`.
+
 Specify every case ID yourself. At least one case from each of `pwn`, `web`,
 `rev`, `crypto`, `forensics`, and `misc` is required:
 
 ```sh
+mkdir -p .ctfos/benchmarks/nyu/manifests
 ctfos benchmark nyu-stage \
   --source /srv/bench/NYU_CTF_Bench \
   --release-commit FULL_RELEASE_COMMIT \
+  --source-dataset test \
   --case 2021f-pwn-horrorscope \
-  --case 2021q-web-no_pass_needed \
+  --case 2021q-web-poem_collection \
   --case 2021f-rev-maze \
   --case 2021f-cry-interoperable \
   --case 2021f-for-no_time_to_register \
@@ -43,7 +56,7 @@ ctfos benchmark nyu-stage \
   --budget-wall-seconds 7200 \
   --budget-model-calls 64 \
   --budget-tokens 2000000 \
-  --output-manifest nyu-dev.partial.json
+  --output-manifest .ctfos/benchmarks/nyu/manifests/nyu-dev.partial.json
 ```
 
 For every selected case, staging creates exactly three `thin_scaffold` and

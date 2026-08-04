@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.machinery
 import importlib.util
 import json
@@ -90,7 +91,15 @@ class _DockerBoundaryRunner:
                 return self._result(values, 1, stderr="not found")
             return self._result(values, stdout=json.dumps([details]))
         if values[:3] == ["docker", "container", "inspect"]:
-            details = self.containers.get(values[3])
+            reference = values[3]
+            details = next(
+                (
+                    item
+                    for name, item in self.containers.items()
+                    if reference in {name, item.get("Id")}
+                ),
+                None,
+            )
             if details is None:
                 return self._result(values, 1, stderr="not found")
             return self._result(values, stdout=json.dumps([details]))
@@ -133,17 +142,50 @@ class _DockerBoundaryRunner:
                     "ReadonlyRootfs": True,
                     "SecurityOpt": ["no-new-privileges"],
                 },
+                "Id": "a" * 64,
                 "Image": "local-image-id",
+                "Name": f"/{name}",
                 "NetworkSettings": {
                     "Networks": {
                         network: {"Aliases": [alias]},
                     }
                 },
-                "State": {"Running": True},
+                "State": {
+                    "Dead": False,
+                    "Paused": False,
+                    "Pid": 123,
+                    "Restarting": False,
+                    "Running": True,
+                    "Status": "running",
+                },
             }
             return self._result(values, stdout="container-id\n")
+        if values[:3] == ["docker", "container", "start"]:
+            reference = values[3]
+            name = next(
+                name
+                for name, details in self.containers.items()
+                if reference in {name, details["Id"]}
+            )
+            state = self.containers[name]["State"]
+            state.update(
+                {
+                    "Dead": False,
+                    "Paused": False,
+                    "Pid": 123,
+                    "Restarting": False,
+                    "Running": True,
+                    "Status": "running",
+                }
+            )
+            return self._result(values, stdout=f"{name}\n")
         if values[:3] == ["docker", "network", "connect"]:
-            network, name = values[3:5]
+            network, reference = values[3:5]
+            name = next(
+                name
+                for name, details in self.containers.items()
+                if reference in {name, details["Id"]}
+            )
             networks = self.containers[name]["NetworkSettings"]["Networks"]
             if network in networks:
                 return self._result(values, 1, stderr="already connected")
@@ -254,6 +296,191 @@ class RestrictedEgressBoundaryTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ScopeError, "does not match"):
             boundary.ensure()
+
+    def test_boundary_recovers_an_exact_exited_proxy(self) -> None:
+        runner = _DockerBoundaryRunner()
+        boundary = RestrictedEgressBoundary(
+            self.scope,
+            self.policy,
+            image="ctf-os:core",
+            image_digest=None,
+            runner=runner,
+        )
+        expected = boundary.ensure()
+        state = runner.containers[expected.proxy_container]["State"]
+        state.update(
+            {
+                "Dead": False,
+                "Paused": False,
+                "Pid": 0,
+                "Restarting": False,
+                "Running": False,
+                "Status": "exited",
+            }
+        )
+        runner.calls.clear()
+
+        recovered = boundary.ensure()
+
+        self.assertEqual(recovered, expected)
+        self.assertEqual(
+            [
+                call
+                for call in runner.calls
+                if call[:3] == ["docker", "container", "start"]
+            ],
+            [["docker", "container", "start", "a" * 64]],
+        )
+        self.assertFalse(
+            any(call[:2] == ["docker", "run"] for call in runner.calls)
+        )
+
+    def test_boundary_does_not_restart_a_mismatched_exited_proxy(self) -> None:
+        for mismatch in ("command", "labels", "networks"):
+            with self.subTest(mismatch=mismatch):
+                runner = _DockerBoundaryRunner()
+                boundary = RestrictedEgressBoundary(
+                    self.scope,
+                    self.policy,
+                    image="ctf-os:core",
+                    image_digest=None,
+                    runner=runner,
+                )
+                runtime = boundary.ensure()
+                proxy = runner.containers[runtime.proxy_container]
+                proxy["State"].update(
+                    {
+                        "Dead": False,
+                        "Paused": False,
+                        "Pid": 0,
+                        "Restarting": False,
+                        "Running": False,
+                        "Status": "exited",
+                    }
+                )
+                if mismatch == "command":
+                    proxy["Config"]["Cmd"] = ["serve", "--allow-all"]
+                elif mismatch == "labels":
+                    proxy["Config"]["Labels"]["ctfos.scope"] = "another-scope"
+                else:
+                    proxy["NetworkSettings"]["Networks"]["unexpected"] = {
+                        "Aliases": []
+                    }
+                runner.calls.clear()
+
+                with self.assertRaisesRegex(ScopeError, "does not match"):
+                    boundary.ensure()
+
+                self.assertFalse(
+                    any(
+                        call[:3] == ["docker", "container", "start"]
+                        for call in runner.calls
+                    )
+                )
+
+    def test_boundary_does_not_restart_an_ambiguous_stopped_state(self) -> None:
+        runner = _DockerBoundaryRunner()
+        boundary = RestrictedEgressBoundary(
+            self.scope,
+            self.policy,
+            image="ctf-os:core",
+            image_digest=None,
+            runner=runner,
+        )
+        runtime = boundary.ensure()
+        runner.containers[runtime.proxy_container]["State"].update(
+            {
+                "Dead": False,
+                "Paused": False,
+                "Pid": 0,
+                "Restarting": False,
+                "Running": False,
+                "Status": "created",
+            }
+        )
+        runner.calls.clear()
+
+        with self.assertRaisesRegex(ScopeError, "recoverable stopped state"):
+            boundary.ensure()
+
+        self.assertFalse(
+            any(
+                call[:3] == ["docker", "container", "start"]
+                for call in runner.calls
+            )
+        )
+
+    def test_boundary_rejects_name_replacement_after_exact_restart(self) -> None:
+        class ReplacingRunner(_DockerBoundaryRunner):
+            replace_after_connect = False
+
+            def __call__(self, argv, **kwargs):
+                values = list(argv)
+                result = super().__call__(values, **kwargs)
+                if (
+                    self.replace_after_connect
+                    and values[:3] == ["docker", "network", "connect"]
+                ):
+                    self.replace_after_connect = False
+                    reference = values[4]
+                    original_name = next(
+                        name
+                        for name, details in self.containers.items()
+                        if reference in {name, details["Id"]}
+                    )
+                    original = self.containers.pop(original_name)
+                    original["Name"] = "/renamed-exact-proxy"
+                    self.containers["renamed-exact-proxy"] = original
+                    replacement = copy.deepcopy(original)
+                    replacement["Id"] = "b" * 64
+                    replacement["Name"] = f"/{original_name}"
+                    self.containers[original_name] = replacement
+                return result
+
+        runner = ReplacingRunner()
+        boundary = RestrictedEgressBoundary(
+            self.scope,
+            self.policy,
+            image="ctf-os:core",
+            image_digest=None,
+            runner=runner,
+        )
+        runtime = boundary.ensure()
+        runner.containers[runtime.proxy_container]["State"].update(
+            {
+                "Dead": False,
+                "Paused": False,
+                "Pid": 0,
+                "Restarting": False,
+                "Running": False,
+                "Status": "exited",
+            }
+        )
+        runner.calls.clear()
+        runner.replace_after_connect = True
+
+        with self.assertRaisesRegex(
+            ScopeError,
+            "identity changed after recovery",
+        ):
+            boundary.ensure()
+
+        self.assertIn(
+            [
+                "docker",
+                "network",
+                "connect",
+                "bridge",
+                "a" * 64,
+            ],
+            runner.calls,
+        )
+        self.assertFalse(
+            any(
+                call[:3] == ["docker", "container", "exec"]
+                for call in runner.calls
+            )
+        )
 
     def test_backend_substitutes_internal_network_and_reserved_proxy_env(
         self,

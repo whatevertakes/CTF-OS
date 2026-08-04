@@ -26,7 +26,7 @@ CORE_MANAGED_CAPABILITIES = frozenset(
     }
 )
 CATEGORY_MANAGED_CAPABILITIES: dict[str, frozenset[str]] = {
-    "web": frozenset(),
+    "web": frozenset({"web_response_summary_v1"}),
     "pwn": frozenset(
         {
             "angr_python",
@@ -120,6 +120,16 @@ _CATEGORY_ALIASES = {
     "custom-protocol": "misc",
 }
 REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
+    "web_response_summary_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.web.response_summary",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/web/request.py",
+        "sha256": (
+            "861fb376828b218978d4853c34f17d44"
+            "f8206fbb83f7f23b72e14decaebc3052"
+        ),
+    },
     "pwn_crash_v1": {
         "schema_version": 1,
         "contract_id": "ctfos.pwn.crash",

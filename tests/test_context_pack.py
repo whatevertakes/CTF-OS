@@ -8,6 +8,10 @@ from types import SimpleNamespace
 
 from ctf_os.adapters import get_adapter
 from ctf_os.engine import failure_capsule as failure_capsule_module
+from ctf_os.engine.checkpoint_projection import (
+    checkpoint_action_projection_metadata,
+    checkpoint_action_reference,
+)
 from ctf_os.engine.context_pack import (
     _compact_receipt_streams,
     build_context_pack,
@@ -17,6 +21,10 @@ from ctf_os.engine.resume_capsule import (
     MAX_RESUME_CAPSULE_BYTES,
     ResumeCapsulePolicy,
     render_resume_capsule,
+)
+from ctf_os.managed_budget import (
+    MANAGED_WAVE_BUDGET_GUARD_KEY,
+    build_managed_wave_budget_guard,
 )
 from ctf_os.models import (
     ArtifactReference,
@@ -158,6 +166,80 @@ class ContextPackTests(unittest.TestCase):
             structure,
         )
 
+    def test_receipt_context_tail_keeps_final_compact_summary(self) -> None:
+        marker = "SUMMARY=tail-safe-discriminators"
+        tail_text = ("\\" * 240) + marker
+        receipt = SimpleNamespace(
+            extra={
+                "stream_evidence": {
+                    "stdout": {
+                        "artifact_id": "A-stdout",
+                        "path": "artifacts/snapshots/A-stdout.log",
+                        "sha256": "a" * 64,
+                        "stored_bytes": len(tail_text),
+                        "drained_bytes": len(tail_text),
+                        "coverage": "complete_stream",
+                        "head": None,
+                        "tail": {
+                            "byte_start": 0,
+                            "byte_end": len(tail_text),
+                            "encoding": "utf-8",
+                            "text": tail_text,
+                            "text_truncated": False,
+                        },
+                    }
+                }
+            }
+        )
+
+        compact = _compact_receipt_streams(receipt)
+        tail = compact["stdout"]["tail"]
+
+        self.assertTrue(tail["text"].endswith(marker))
+        self.assertTrue(tail["context_text_truncated"])
+        self.assertEqual(tail["context_sample_view"], "suffix")
+        self.assertLessEqual(
+            len(canonical_json_record(tail["text"])),
+            512,
+        )
+
+    def test_receipt_context_head_keeps_full_256_byte_contract_sample(self) -> None:
+        marker = '"functions":{"encr_vals":'
+        head_text = ("A" * 200) + marker
+        receipt = SimpleNamespace(
+            extra={
+                "stream_evidence": {
+                    "stdout": {
+                        "artifact_id": "A-stdout",
+                        "path": "artifacts/snapshots/A-stdout.log",
+                        "sha256": "a" * 64,
+                        "stored_bytes": len(head_text),
+                        "drained_bytes": len(head_text),
+                        "coverage": "complete_stream",
+                        "head": {
+                            "byte_start": 0,
+                            "byte_end": len(head_text),
+                            "encoding": "utf-8",
+                            "text": head_text,
+                            "text_truncated": False,
+                        },
+                        "tail": None,
+                    }
+                }
+            }
+        )
+
+        compact = _compact_receipt_streams(receipt)
+        head = compact["stdout"]["head"]
+
+        self.assertTrue(head["text"].endswith(marker))
+        self.assertFalse(head["context_text_truncated"])
+        self.assertEqual(head["context_sample_view"], "prefix")
+        self.assertLessEqual(
+            len(canonical_json_record(head["text"])),
+            512,
+        )
+
     def pwn_crash_state(
         self,
         statuses=None,
@@ -192,7 +274,12 @@ class ContextPackTests(unittest.TestCase):
         finally:
             case.tearDown()
 
-    def failure_capsule_state(self) -> tuple[ChallengeState, dict[str, str]]:
+    def failure_capsule_state(
+        self,
+        *,
+        reason_code: str = "analysis_wave_invalid",
+        extra_cycle_next_count: int = 0,
+    ) -> tuple[ChallengeState, dict[str, str]]:
         state = self.state()
         state.schema_version = 2
         state.revision = 8
@@ -263,9 +350,24 @@ class ContextPackTests(unittest.TestCase):
             kind=ExperimentKind.STRATEGIC,
             status=ExperimentStatus.REGISTERED,
         )
+        extra_cycle_next = [
+            Experiment(
+                id=f"E-cycle-next-{index}",
+                hypothesis_ids=["H-1"],
+                command=f"probe --cycle-next={index}",
+                expected_observation="the deferred branch is observed",
+                keep_if="the branch changes",
+                drop_if="the branch remains fixed",
+                timeout_seconds=10,
+                kind=ExperimentKind.STRATEGIC,
+                status=ExperimentStatus.REGISTERED,
+                source_run_id=captain.id,
+            )
+            for index in range(extra_cycle_next_count)
+        ]
         state.runs.extend((captain, failed))
         state.experiments.extend(
-            (failed_experiment, next_experiment)
+            (failed_experiment, next_experiment, *extra_cycle_next)
         )
         state.sessions.append(
             SolveSession(
@@ -278,22 +380,44 @@ class ContextPackTests(unittest.TestCase):
                 run_ids=[captain.id, failed.id],
             )
         )
+        insufficient_budget = reason_code == "insufficient_budget_for_wave"
+        cycle_extra = {}
+        if insufficient_budget:
+            cycle_extra[MANAGED_WAVE_BUDGET_GUARD_KEY] = (
+                build_managed_wave_budget_guard(
+                    wave_kind="attack",
+                    provider_max_concurrent_calls=1,
+                    queue_reserve_seconds=1.0,
+                    role_call_reserve_seconds=1.0,
+                    action_commit_reserve_seconds=1.0,
+                    remaining_seconds=0.0,
+                    checked_state_revision=state.revision,
+                    configuration_epoch=0,
+                    budget_mode="bounded",
+                )
+            )
         state.cycles.append(
             ManagedCycle(
                 id="CY-failure",
                 session_id="S-failure",
                 ordinal=1,
-                phase="invalid",
+                phase=(
+                    "wave_budget_blocked"
+                    if insufficient_budget
+                    else "invalid"
+                ),
                 configuration_epoch=0,
+                captain_run_id=(captain.id if insufficient_budget else None),
                 selected_action_ids=[failed_experiment.id],
+                extra=cycle_extra,
             )
         )
         capsule = build_failure_capsule(
             state,
             session_id="S-failure",
             cycle_id="CY-failure",
-            reason_code="analysis_wave_invalid",
-            stage="attack",
+            reason_code=reason_code,
+            stage=("captain" if insufficient_budget else "attack"),
             state_revision_after=state.revision + 1,
         )
         state.cycles[-1].checkpoint_id = "CP-failure"
@@ -474,6 +598,256 @@ class ContextPackTests(unittest.TestCase):
         self.assertNotIn("run the cheapest discriminator", pack.text)
         self.assertNotIn("avoid the stale brute-force path", pack.text)
         self.assertIn("operator_context", pack.omitted)
+
+    def test_checkpoint_digest_uses_current_canonical_hypotheses(self) -> None:
+        state = self.state()
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-before-evaluation",
+                session_id=None,
+                cycle_id=None,
+                active_goal_id="G-1",
+                open_hypothesis_ids=["H-1"],
+            )
+        )
+        resolved = state.hypotheses[0]
+        resolved.status = HypothesisStatus.CONFIRMED
+        resolved.evidence_fact_ids = ["F-1"]
+        state.facts[0].supports.append("H-1")
+        state.hypotheses.append(
+            Hypothesis(
+                "H-current",
+                "a newly canonical frontier hypothesis",
+                Falsifier("run its discriminator"),
+            )
+        )
+        state.validate()
+
+        record = strict_json_loads(
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            ).text
+        )
+        checkpoint = record["checkpoint"]
+
+        self.assertEqual(checkpoint["hypothesis_ids"], ["H-current"])
+        self.assertEqual(
+            checkpoint["hypothesis_ids_source"],
+            "canonical_state",
+        )
+        self.assertEqual(
+            checkpoint["checkpoint_hypothesis_ids_stale"],
+            1,
+        )
+        self.assertNotIn("H-1", checkpoint["hypothesis_ids"])
+
+    def test_legacy_checkpoint_actions_render_as_bounded_hashes(self) -> None:
+        state = self.state()
+        legacy_command = "probe " + ("C" * 12_000)
+        unmatched_action = "operator note " + ("N" * 12_000)
+        state.experiments.append(
+            Experiment(
+                id="E-legacy-command",
+                hypothesis_ids=[],
+                command=legacy_command,
+                expected_observation="a bounded observation",
+                keep_if="the observation advances the goal",
+                drop_if="the observation is absent",
+                timeout_seconds=10,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.REGISTERED,
+            )
+        )
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-legacy-actions",
+                session_id=None,
+                cycle_id=None,
+                active_goal_id="G-1",
+                open_hypothesis_ids=["H-1"],
+                next_actions=[legacy_command],
+                do_not_repeat=[unmatched_action],
+            )
+        )
+        state.validate()
+
+        capsule = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+        )
+        checkpoint = strict_json_loads(capsule.text)["checkpoint"]
+
+        self.assertNotIn(legacy_command, capsule.text)
+        self.assertNotIn(unmatched_action, capsule.text)
+        next_reference = checkpoint["next_action_projection"][
+            "references"
+        ][0]
+        self.assertEqual(
+            next_reference["experiment_id"],
+            "E-legacy-command",
+        )
+        self.assertTrue(next_reference["canonical_match"])
+        self.assertEqual(checkpoint["do_not_repeat_count"], 1)
+        self.assertNotIn("do_not_repeat_projection", checkpoint)
+
+    def test_reference_shaped_legacy_command_is_not_misclassified(self) -> None:
+        state = self.state()
+        legacy_command = "experiment:E-fake@sha256:" + ("a" * 64)
+        state.experiments.append(
+            Experiment(
+                id="E-real-legacy-command",
+                hypothesis_ids=[],
+                command=legacy_command,
+                expected_observation="a bounded observation",
+                keep_if="the observation advances the goal",
+                drop_if="the observation is absent",
+                timeout_seconds=10,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.REGISTERED,
+            )
+        )
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-reference-shaped-legacy",
+                session_id=None,
+                cycle_id=None,
+                active_goal_id="G-1",
+                open_hypothesis_ids=["H-1"],
+                next_actions=[legacy_command],
+            )
+        )
+        state.validate()
+
+        record = strict_json_loads(
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            ).text
+        )
+        reference = record["checkpoint"]["next_action_projection"][
+            "references"
+        ][0]
+
+        self.assertEqual(
+            reference["experiment_id"],
+            "E-real-legacy-command",
+        )
+        self.assertTrue(reference["legacy_reference"])
+
+    def test_hashed_experiment_id_reference_resolves_without_expansion(
+        self,
+    ) -> None:
+        state = self.state()
+        oversized_id = "E-" + ("I" * 10_000)
+        experiment = Experiment(
+            id=oversized_id,
+            hypothesis_ids=[],
+            command="probe hashed experiment id",
+            expected_observation="a bounded observation",
+            keep_if="the observation advances the goal",
+            drop_if="the observation is absent",
+            timeout_seconds=10,
+            kind=ExperimentKind.PROBE,
+            status=ExperimentStatus.REGISTERED,
+        )
+        state.experiments.append(experiment)
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-hashed-experiment-id",
+                session_id=None,
+                cycle_id=None,
+                active_goal_id="G-1",
+                open_hypothesis_ids=["H-1"],
+                next_actions=[checkpoint_action_reference(experiment)],
+                extra=checkpoint_action_projection_metadata(),
+            )
+        )
+        state.validate()
+
+        capsule = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        reference = strict_json_loads(capsule.text)["checkpoint"][
+            "next_action_projection"
+        ]["references"][0]
+
+        self.assertNotIn(oversized_id, capsule.text)
+        self.assertTrue(reference["canonical_match"])
+        self.assertEqual(len(reference["experiment_id_sha256"]), 64)
+
+    def test_legacy_match_with_oversized_id_stays_bounded(self) -> None:
+        state = self.state()
+        oversized_id = "E-" + ("I" * 20_000)
+        state.experiments.append(
+            Experiment(
+                id=oversized_id,
+                hypothesis_ids=[],
+                command="legacy-probe",
+                expected_observation="a bounded observation",
+                keep_if="the observation advances the goal",
+                drop_if="the observation is absent",
+                timeout_seconds=10,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.COMPLETED,
+            )
+        )
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-oversized-legacy-id",
+                session_id=None,
+                cycle_id=None,
+                active_goal_id="G-1",
+                open_hypothesis_ids=["H-1"],
+                next_actions=["legacy-probe"],
+            )
+        )
+        state.validate()
+
+        capsule = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+        )
+        reference = strict_json_loads(capsule.text)["checkpoint"][
+            "next_action_projection"
+        ]["references"][0]
+
+        self.assertLessEqual(
+            len(capsule.text.encode("ascii")),
+            MAX_RESUME_CAPSULE_BYTES,
+        )
+        self.assertNotIn(oversized_id, capsule.text)
+        self.assertEqual(len(reference["experiment_id_sha256"]), 64)
+
+    def test_compact_failure_checkpoint_keeps_current_hypothesis(self) -> None:
+        state, _canaries = self.failure_capsule_state()
+        resolved = state.hypotheses[0]
+        resolved.status = HypothesisStatus.CONFIRMED
+        resolved.evidence_fact_ids = ["F-1"]
+        state.facts[0].supports.append("H-1")
+        state.hypotheses.append(
+            Hypothesis(
+                "H-current",
+                "the current post-evaluation frontier",
+                Falsifier("run the current discriminator"),
+            )
+        )
+        state.revision += 1
+        state.sessions[0].end_revision = state.revision
+        state.validate()
+
+        capsule = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        checkpoint = strict_json_loads(capsule.text)["checkpoint"]
+
+        self.assertLessEqual(len(capsule.text.encode("ascii")), 1536)
+        self.assertEqual(checkpoint["hypothesis_ids"], ["H-current"])
+        self.assertNotIn("H-1", checkpoint["hypothesis_ids"])
 
     def test_resume_capsule_is_deterministic_bounded_and_reserves_facts(
         self,
@@ -1745,6 +2119,26 @@ class ContextPackTests(unittest.TestCase):
                 state_path=Path("/state/state.json"),
             )
 
+    def test_failure_capsule_recomputes_fingerprint_at_capture_revision(
+        self,
+    ) -> None:
+        state, _canaries = self.failure_capsule_state()
+        captured_failed = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == "E-cycle-proposal"
+        )
+        captured_failed.command = "probe --mutated-at-capture"
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "fingerprint does not match canonical state",
+        ):
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            )
+
     def test_failure_capsule_builder_requires_next_state_revision(
         self,
     ) -> None:
@@ -1883,6 +2277,103 @@ class ContextPackTests(unittest.TestCase):
         self.assertEqual(failure["next_experiments_stale"], 1)
         self.assertEqual(failure["unresolved_hypotheses"]["ids"], [])
         self.assertEqual(failure["unresolved_hypotheses_stale"], 1)
+
+    def test_insufficient_budget_capsule_preserves_cancelled_next_boundary(
+        self,
+    ) -> None:
+        state, _canaries = self.failure_capsule_state(
+            reason_code="insufficient_budget_for_wave"
+        )
+        capsule = state.checkpoints[-1].failure_capsule
+        assert capsule is not None
+        self.assertIn("E-cycle-proposal", capsule.next_experiment_ids)
+        self.assertNotIn("E-cycle-proposal", capsule.failed_experiment_ids)
+
+        captured_next = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == "E-cycle-proposal"
+        )
+        captured_next.status = ExperimentStatus.CANCELLED
+        state.revision += 1
+        state.sessions[0].end_revision = state.revision
+        state.validate()
+
+        record = strict_json_loads(
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            ).text
+        )
+        failure = record["checkpoint"]["failure_capsule"]
+
+        self.assertEqual(failure["failed_experiments"], [])
+        self.assertEqual(failure["next_experiments_stale"], 1)
+        self.assertNotIn("E-cycle-proposal", failure["next_experiments"])
+
+    def test_insufficient_budget_capsule_preserves_omitted_next_boundary(
+        self,
+    ) -> None:
+        state, _canaries = self.failure_capsule_state(
+            reason_code="insufficient_budget_for_wave",
+            extra_cycle_next_count=5,
+        )
+        capsule = state.checkpoints[-1].failure_capsule
+        assert capsule is not None
+        self.assertGreater(capsule.omitted_counts["next_experiment_ids"], 0)
+        omitted_cycle_next = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.source_run_id == "R-failure-captain"
+            and experiment.status is ExperimentStatus.REGISTERED
+            and experiment.id not in capsule.next_experiment_ids
+        )
+
+        omitted_cycle_next.status = ExperimentStatus.CANCELLED
+        state.revision += 1
+        state.sessions[0].end_revision = state.revision
+        state.validate()
+
+        rendered = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+        )
+        failure = strict_json_loads(rendered.text)["checkpoint"][
+            "failure_capsule"
+        ]
+
+        self.assertIn(
+            '"reason_code":"insufficient_budget_for_wave"',
+            rendered.text,
+        )
+        self.assertNotIn(
+            omitted_cycle_next.id,
+            [item["id"] for item in failure["next_experiments"]],
+        )
+
+    def test_historical_failure_capsule_still_requires_cycle_binding(
+        self,
+    ) -> None:
+        state, _canaries = self.failure_capsule_state()
+        captured_failed = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == "E-cycle-proposal"
+        )
+        captured_failed.source_run_id = None
+        state.cycles[-1].selected_action_ids = []
+        state.revision += 1
+        state.sessions[0].end_revision = state.revision
+        state.validate()
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "canonical cycle-bound set",
+        ):
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            )
 
     def test_failure_capsule_omits_mutated_next_experiment_text(
         self,

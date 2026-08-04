@@ -58,6 +58,7 @@ from ctf_os.sandbox import (
     SandboxResult,
 )
 from ctf_os.sandbox.daemon import CapabilityAuthority
+from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import ChallengeLock
 
 
@@ -68,6 +69,7 @@ class FakeLiveSandbox:
         self.work = work
         self.run_count = 0
         self.initialized = False
+        self.stdout_payload: str | None = None
 
     def initialize_workspace(
         self,
@@ -86,7 +88,9 @@ class FakeLiveSandbox:
         stdout = run_root / "stdout.log"
         stderr = run_root / "stderr.log"
         stdout.write_text(
-            f"{' '.join(spec.argv)} KCTF{{broker_tool_flag}}\n",
+            self.stdout_payload
+            if self.stdout_payload is not None
+            else f"{' '.join(spec.argv)} KCTF{{broker_tool_flag}}\n",
             encoding="utf-8",
         )
         stderr.write_text("", encoding="utf-8")
@@ -102,6 +106,16 @@ class FakeLiveSandbox:
             stderr_bytes=0,
             stdout_path=f"/work/.ctf/runs/{run_id}/stdout.log",
             stderr_path=f"/work/.ctf/runs/{run_id}/stderr.log",
+            stdout_stored_bytes=stdout.stat().st_size,
+            stderr_stored_bytes=0,
+            stdout_limit_bytes=4096,
+            stderr_limit_bytes=4096,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            stdout_truncation_known=True,
+            stderr_truncation_known=True,
+            stdout_capture_complete=True,
+            stderr_capture_complete=True,
         )
 
     def register_artifact(
@@ -837,7 +851,7 @@ class LiveBrokerTests(unittest.TestCase):
             )
         )
 
-    def test_live_closed_loop_refutes_only_after_executed_evidence(
+    def test_live_closed_loop_model_drop_is_proposal_only(
         self,
     ) -> None:
         service, token = self._service()
@@ -912,40 +926,182 @@ class LiveBrokerTests(unittest.TestCase):
                 "refute_hypothesis_ids": ["H-live-existing"],
             },
         )
-        self.assertEqual(evaluation["status"], "dropped")
+        self.assertEqual(evaluation["status"], "inconclusive")
         state = self.engine.store.load(self.identity)
         hypothesis = next(
             item
             for item in state.hypotheses
             if item.id == "H-live-existing"
         )
-        self.assertIs(hypothesis.status, HypothesisStatus.REFUTED)
-        self.assertEqual(hypothesis.refuted_by, experiment_id)
-        with self.assertRaisesRegex(EngineError, "cannot reopen"):
+        fact = next(item for item in state.facts if item.id == fact_id)
+        evaluated = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertIsNone(hypothesis.refuted_by)
+        self.assertNotIn("H-live-existing", fact.contradicts)
+        admission = evaluated.extra["semantic_evaluation_admission"]
+        self.assertIsNone(admission["contract_version"])
+        self.assertEqual(admission["requested_status"], "dropped")
+        self.assertEqual(admission["applied_status"], "inconclusive")
+
+    def test_live_tool_run_model_semantics_are_proposal_only(
+        self,
+    ) -> None:
+        clients: dict[Path, FakeLiveSandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            return clients.setdefault(work, FakeLiveSandbox(work))
+
+        identity = ChallengeIdentity(
+            "current schema contest",
+            "misc",
+            "Live tool semantic witness",
+        )
+        engine = ChallengeEngine(
+            self.root / "current-schema-live",
+            sandbox_factory=sandbox_factory,
+        )
+        engine.add_challenge(
+            identity,
+            prompt="verify Live semantic admission",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        prepared = engine.prepare_live_session(identity)
+        authority = CapabilityAuthority.from_file(
+            engine.config.state_root / "runtime" / "capability-secret"
+        )
+        token = str(prepared.environment[LIVE_SCOPE_CAPABILITY_ENV])
+        service = LiveBrokerService(engine, identity, authority, token)
+        sandbox = next(iter(clients.values()))
+
+        def dispatch(operation: str, params: dict[str, object]) -> object:
+            return service.dispatch(
+                {
+                    "schema_version": 1,
+                    "token": token,
+                    "identity": identity.to_dict(),
+                    "operation": operation,
+                    "params": params,
+                }
+            )
+
+        def run_case(
+            *,
+            hypothesis_id: str,
+            stdout_payload: str,
+            expected_status: ExperimentStatus,
+            expected_hypothesis_status: HypothesisStatus,
+            witness_available: bool,
+        ) -> None:
             dispatch(
                 "agent.hypothesis",
                 {
-                    "action": "update",
-                    "hypothesis_id": "H-live-existing",
-                    "statement": None,
-                    "falsifier": None,
+                    "action": "create",
+                    "hypothesis_id": hypothesis_id,
+                    "statement": "the Live generic probe matches its record",
+                    "falsifier": "the bounded record supplies a counterexample",
                     "status": "open",
                     "evidence_fact_ids": [],
                     "evidence_artifact_ids": [],
                     "evidence_run_ids": [],
                     "confidence": 0.5,
-                    "refuted_by": None,
                 },
             )
-        unchanged = next(
-            item
-            for item in self.engine.store.load(
-                self.identity
-            ).hypotheses
-            if item.id == "H-live-existing"
+            sandbox.stdout_payload = stdout_payload
+            tool_result = dispatch(
+                "tool.run",
+                {
+                    "command": ["true"],
+                    "expected_observation": "one bounded discriminator",
+                    "keep_if": "the record supports the hypothesis",
+                    "drop_if": "the record refutes the hypothesis",
+                    "hypothesis_ids": [hypothesis_id],
+                    "timeout_seconds": 30,
+                    "resource_class": "light",
+                    "network_target": None,
+                    "needs_kvm": False,
+                },
+            )
+            experiment_id = str(tool_result["experiment_id"])
+            executed = engine.store.load(identity)
+            experiment = next(
+                item
+                for item in executed.experiments
+                if item.id == experiment_id
+            )
+            self.assertEqual(
+                experiment.extra[
+                    "managed_semantic_evaluation_contract_version"
+                ],
+                2,
+            )
+
+            evaluation = dispatch(
+                "agent.evaluate",
+                {
+                    "experiment_id": experiment_id,
+                    "status": "dropped",
+                    "reason": "the bounded record refuted the prediction",
+                    "evidence_fact_ids": [],
+                    "evidence_artifact_ids": [],
+                    "evidence_run_ids": [],
+                    "support_hypothesis_ids": [],
+                    "refute_hypothesis_ids": [hypothesis_id],
+                },
+            )
+            self.assertEqual(evaluation["status"], expected_status.value)
+            state = engine.store.load(identity)
+            experiment = next(
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            )
+            hypothesis = next(
+                item
+                for item in state.hypotheses
+                if item.id == hypothesis_id
+            )
+            receipt = next(
+                item
+                for item in state.receipts
+                if item.experiment_id == experiment_id
+            )
+            self.assertIs(experiment.status, expected_status)
+            self.assertIs(hypothesis.status, expected_hypothesis_status)
+            admission = experiment.extra["semantic_evaluation_admission"]
+            self.assertEqual(admission["requested_status"], "dropped")
+            self.assertEqual(admission["applied_status"], "inconclusive")
+            self.assertIs(admission["semantic_authority"], False)
+            if expected_hypothesis_status is HypothesisStatus.OPEN:
+                self.assertTrue(
+                    all(
+                        hypothesis_id not in fact.contradicts
+                        for fact in state.facts
+                    )
+                )
+            self.assertIs(
+                receipt.extra["semantic_witness_available"],
+                witness_available,
+            )
+
+        run_case(
+            hypothesis_id="H-live-summary-only",
+            stdout_payload="SUMMARY: hidden=1 oracle=DROP\n",
+            expected_status=ExperimentStatus.INCONCLUSIVE,
+            expected_hypothesis_status=HypothesisStatus.OPEN,
+            witness_available=False,
         )
-        self.assertIs(unchanged.status, HypothesisStatus.REFUTED)
-        self.assertEqual(unchanged.refuted_by, experiment_id)
+        run_case(
+            hypothesis_id="H-live-rec-witness",
+            stdout_payload="REC: observed_counterexample=true\n",
+            expected_status=ExperimentStatus.INCONCLUSIVE,
+            expected_hypothesis_status=HypothesisStatus.OPEN,
+            witness_available=True,
+        )
 
     def test_inspect_list_pagination_is_deterministic_and_compatible(
         self,

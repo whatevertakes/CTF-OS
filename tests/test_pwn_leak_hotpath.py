@@ -437,7 +437,9 @@ class PwnLeakHotPathTests(unittest.TestCase):
         persisted = (
             engine.store.challenge_paths(fixture.identity).state.read_bytes()
         )
-        self.assertNotIn(b"0x7f", persisted.lower())
+        for base in _BASES:
+            leaked_pointer = f"0x{base + _OFFSET:012x}".encode("ascii")
+            self.assertNotIn(leaked_pointer, persisted.lower())
         self.assertNotIn(b"[heap]", persisted)
         self.assertNotIn(baseline_payload, persisted)
         self.assertEqual(

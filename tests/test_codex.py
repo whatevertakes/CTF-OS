@@ -41,6 +41,7 @@ from ctf_os.codex import (
     ReasoningEffort,
     Role,
     SubprocessExecutor,
+    role_prompt,
     role_output_schema,
     validate_role_output,
 )
@@ -310,6 +311,100 @@ class SelectiveFailureExecutor:
 
 
 class ContractTests(unittest.TestCase):
+    def test_role_prompt_blocks_executed_oracle_rejected_candidate_reemission(
+        self,
+    ) -> None:
+        for role in Role:
+            with self.subTest(role=role.value):
+                prompt = role_prompt(role, "solve the selected challenge")
+                self.assertIn(
+                    "Do not re-emit an exact candidate that an executed "
+                    "positive/negative oracle already rejected",
+                    prompt,
+                )
+                self.assertIn(
+                    "same immutable source and target generation",
+                    prompt,
+                )
+                self.assertIn("disproven evaluation evidence", prompt)
+
+    def test_builder_prompt_routes_remote_pwn_away_from_local_gates(
+        self,
+    ) -> None:
+        prompt = role_prompt(Role.BUILDER, "solve the selected challenge")
+        self.assertIn(
+            "prove_pwn_exploit_effect and prove_pwn_interaction are strictly "
+            "local and network-denied",
+            prompt,
+        )
+        self.assertIn(
+            "do not propose either gate",
+            prompt,
+        )
+        self.assertIn(
+            "command action bound to the canonical network_target_id and "
+            "network_target_generation",
+            prompt,
+        )
+        self.assertIn(
+            "Publish the exploit or recipe as a top-level Builder artifact",
+            prompt,
+        )
+
+    def test_role_prompt_distinguishes_evidence_pointers_from_sandbox_paths(
+        self,
+    ) -> None:
+        for role in Role:
+            with self.subTest(role=role.value):
+                prompt = role_prompt(role, "solve the selected challenge")
+                self.assertIn(
+                    "evidence pointers, not paths available inside a command "
+                    "sandbox",
+                    prompt,
+                )
+                self.assertIn("below /challenge", prompt)
+                self.assertIn("Every generic command receives a fresh /work", prompt)
+                self.assertIn("Prior-run canonical artifacts are never staged", prompt)
+                self.assertIn("same role invocation", prompt)
+                self.assertIn("Use relative paths for action-created output", prompt)
+                self.assertIn("absolute /work/FILE shell argument", prompt)
+                self.assertIn("Never embed a host workspace or .ctfos", prompt)
+                self.assertIn(
+                    "may deliberately lack execute bits even when their "
+                    "content is executable",
+                    prompt,
+                )
+                self.assertIn(
+                    "verify the copy's SHA-256 against canonical inventory "
+                    "evidence",
+                    prompt,
+                )
+                self.assertIn(
+                    "disposable action-local copy is permitted for read-only "
+                    "roles",
+                    prompt,
+                )
+                self.assertIn(
+                    "later model context exposes only small redacted head/tail "
+                    "samples",
+                    prompt,
+                )
+                self.assertIn(
+                    "within the final 256 output bytes",
+                    prompt,
+                )
+                self.assertIn("beginning exactly SUMMARY:", prompt)
+                self.assertIn(
+                    "self-contained against every keep_if, drop_if, and "
+                    "success condition",
+                    prompt,
+                )
+                self.assertIn(
+                    "record it as missing and make the oracle fail instead of "
+                    "guessing",
+                    prompt,
+                )
+
     def test_role_routes_cover_sol_terra_luna_and_proof_separation(self) -> None:
         self.assertEqual(ROLE_SPECS[Role.CAPTAIN].model_family, ModelFamily.SOL)
         self.assertEqual(ROLE_SPECS[Role.RECON].model_family, ModelFamily.TERRA)
@@ -398,6 +493,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(command_schema["minLength"], 1)
         self.assertIn("/bin/sh -lc <script>", command_schema["description"])
         self.assertIn("not an argv", command_schema["description"])
+        self.assertIn("Generic Web commands are stateless", command_schema["description"])
         self.assertEqual(
             action_variants["command"]["properties"]["artifact_path"],
             {"type": "null"},
@@ -425,6 +521,129 @@ class ContractTests(unittest.TestCase):
         joined = "\n".join(result.errors)
         self.assertIn("provided together", joined)
         self.assertIn("requires text", joined)
+
+    def test_v2_captain_may_select_one_hash_bound_pending_experiment(
+        self,
+    ) -> None:
+        payload = valid_payload(Role.CAPTAIN)
+        payload["schema_version"] = 2
+        payload["hypotheses"] = []
+        payload["actions"] = []
+        payload["decision"]["selected_experiment"] = {
+            "experiment_id": "E-existing-1",
+            "command_sha256": "a" * 64,
+            "contract_sha256": "b" * 64,
+        }
+
+        result = validate_role_output(
+            payload,
+            Role.CAPTAIN,
+            contract_version=2,
+        )
+        self.assertTrue(result.valid, result.errors)
+        schema = role_output_schema(
+            Role.CAPTAIN,
+            contract_version=2,
+        )
+        decision = schema["properties"]["decision"]["anyOf"][1]
+        self.assertIn("selected_experiment", decision["properties"])
+        self.assertIn("selected_experiment", decision["required"])
+
+        missing = copy.deepcopy(payload)
+        missing["decision"].pop("selected_experiment")
+        result = validate_role_output(
+            missing,
+            Role.CAPTAIN,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("missing keys", "\n".join(result.errors))
+
+        no_selection = copy.deepcopy(payload)
+        no_selection["decision"]["selected_experiment"] = None
+        result = validate_role_output(
+            no_selection,
+            Role.CAPTAIN,
+            contract_version=2,
+        )
+        self.assertTrue(result.valid, result.errors)
+
+        for field, value in (
+            ("command_sha256", "A" * 64),
+            ("contract_sha256", "short"),
+            ("experiment_id", "not an id"),
+        ):
+            with self.subTest(field=field):
+                invalid = copy.deepcopy(payload)
+                invalid["decision"]["selected_experiment"][field] = value
+                result = validate_role_output(
+                    invalid,
+                    Role.CAPTAIN,
+                    contract_version=2,
+                )
+                self.assertFalse(result.valid)
+
+        v1_schema = role_output_schema(Role.CAPTAIN)
+        v1_decision = v1_schema["properties"]["decision"]["anyOf"][1]
+        self.assertNotIn(
+            "selected_experiment",
+            v1_decision["properties"],
+        )
+        v1_payload = valid_payload(Role.CAPTAIN)
+        v1_payload["decision"]["selected_experiment"] = None
+        result = validate_role_output(v1_payload, Role.CAPTAIN)
+        self.assertFalse(result.valid)
+        self.assertIn("unexpected keys", "\n".join(result.errors))
+
+    def test_managed_web_generic_commands_reject_direct_private_session(
+        self,
+    ) -> None:
+        payload = valid_payload(Role.RECON)
+        payload["schema_version"] = 2
+        payload["hypotheses"] = []
+        payload["actions"][0].update(
+            {
+                "hypothesis_ids": [],
+                "expected_observation": "the endpoint returns one response",
+                "keep_if": "the expected route is present",
+                "drop_if": "the expected route is absent",
+                "timeout_seconds": 30,
+                "resource_class": "light",
+                "network_target_id": "T-primary",
+                "network_target_generation": 1,
+            }
+        )
+
+        for command in (
+            "/opt/ctf-templates/web/request.py http://target/path -X GET",
+            "printf '%s' '--session attacker'",
+        ):
+            with self.subTest(command=command):
+                candidate = copy.deepcopy(payload)
+                candidate["actions"][0]["command"] = command
+                result = validate_role_output(
+                    candidate,
+                    Role.RECON,
+                    contract_version=2,
+                )
+                self.assertTrue(result.valid, result.errors)
+
+        payload["actions"][0]["command"] = (
+            "/opt/ctf-templates/web/request.py http://target/path -X GET "
+            "--session attacker"
+        )
+        result = validate_role_output(
+            payload,
+            Role.RECON,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "$.actions[0].command: generic managed Web commands are "
+            "stateless; omit --session because persistent sessions require "
+            "an explicit engine private-state boundary",
+            result.errors,
+        )
 
     def test_managed_v2_hypothesis_requires_complete_discriminators(
         self,
@@ -467,6 +686,112 @@ class ContractTests(unittest.TestCase):
         self.assertIn("$.hypotheses[0].experiment", joined)
         self.assertIn("$.hypotheses[0].success_oracle", joined)
         self.assertIn("$.hypotheses[0].falsifier", joined)
+
+    def test_reported_artifact_paths_keep_workspace_roots_unambiguous(self) -> None:
+        for reported_path in (
+            "solver.py",
+            "artifacts/workspace/artifacts/solver.py",
+            "artifacts/snapshots/A-existing.log",
+        ):
+            with self.subTest(reported_path=reported_path):
+                payload = valid_payload(Role.BUILDER)
+                payload["artifacts"] = [
+                    {
+                        "path": reported_path,
+                        "sha256": None,
+                        "purpose": "solver",
+                    }
+                ]
+                result = validate_role_output(payload, Role.BUILDER)
+                self.assertTrue(result.valid, result.errors)
+
+        payload = valid_payload(Role.BUILDER)
+        payload["artifacts"] = [
+            {
+                "path": "artifacts/solver.py",
+                "sha256": None,
+                "purpose": "ambiguous workspace path",
+            }
+        ]
+        result = validate_role_output(payload, Role.BUILDER)
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "$.artifacts[0].path: expected safe relative path using a bare "
+            "workspace-relative path or the role workspace prefix",
+            result.errors,
+        )
+
+    def test_managed_v2_provider_schemas_never_emit_unique_items(
+        self,
+    ) -> None:
+        def assert_supported_schema(
+            value: object,
+            *,
+            path: str,
+        ) -> None:
+            if isinstance(value, dict):
+                self.assertNotIn("uniqueItems", value, path)
+                for key, child in value.items():
+                    assert_supported_schema(child, path=f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    assert_supported_schema(
+                        child,
+                        path=f"{path}[{index}]",
+                    )
+
+        for role in Role:
+            with self.subTest(role=role.value):
+                schema = role_output_schema(role, contract_version=2)
+                assert_supported_schema(schema, path="$schema")
+
+    def test_managed_v2_typed_gate_duplicate_hypothesis_ids_stay_local(
+        self,
+    ) -> None:
+        actions = {
+            "prove_web_impact": {
+                "kind": "prove_web_impact",
+                "description": "Run the exact multi-session impact plan.",
+                "operator_spec_artifact_path": "web/spec.json",
+                "driver_artifact_path": "web/driver.json",
+                "hypothesis_ids": ["H-web", "H-web"],
+                "timeout_seconds": 900,
+            },
+            "prove_web_active_probe": {
+                "kind": "prove_web_active_probe",
+                "description": "Run the exact race differential plan.",
+                "operator_spec_artifact_path": "web/active-spec.json",
+                "driver_artifact_path": "web/active-driver.json",
+                "hypothesis_ids": ["H-active", "H-active"],
+                "timeout_seconds": 900,
+            },
+            "prove_forensic_assertion": {
+                "kind": "prove_forensic_assertion",
+                "description": "Corroborate the assertion independently.",
+                "operator_spec_artifact_path": "forensic/spec.json",
+                "hypothesis_ids": ["H-forensic", "H-forensic"],
+                "timeout_seconds": 900,
+            },
+        }
+
+        for kind, action in actions.items():
+            with self.subTest(kind=kind):
+                payload = valid_payload(Role.BUILDER)
+                payload["schema_version"] = 2
+                payload["hypotheses"] = []
+                payload["actions"] = [action]
+
+                result = validate_role_output(
+                    payload,
+                    Role.BUILDER,
+                    contract_version=2,
+                )
+
+                self.assertFalse(result.valid)
+                self.assertIn(
+                    "$.actions[0].hypothesis_ids: invalid or duplicate id",
+                    result.errors,
+                )
 
     def test_managed_proof_action_is_minimal_and_reproducer_only(
         self,
@@ -876,7 +1201,82 @@ class ContractTests(unittest.TestCase):
             }
         ]
         result = validate_role_output(payload, Role.FALSIFIER)
+        self.assertFalse(result.valid)
+        joined = "\n".join(result.errors)
+        self.assertIn(
+            "Batch hypothesis updates must remain open",
+            joined,
+        )
+        self.assertIn(
+            "Batch hypothesis updates must leave it null",
+            joined,
+        )
+
+        payload["hypothesis_updates"][0]["status"] = "open"
+        payload["hypothesis_updates"][0]["refuted_by"] = None
+        result = validate_role_output(payload, Role.FALSIFIER)
         self.assertTrue(result.valid, result.errors)
+
+    def test_role_prompt_routes_hypothesis_status_through_evaluations(
+        self,
+    ) -> None:
+        for role in Role:
+            with self.subTest(role=role.value):
+                prompt = role_prompt(role, "solve the selected challenge")
+                self.assertIn(
+                    "status must be open and refuted_by must be null",
+                    prompt,
+                )
+                self.assertIn(
+                    "Once any experiment references that hypothesis, leave "
+                    "its statement and falsifier unchanged",
+                    prompt,
+                )
+                self.assertIn(
+                    "only through an evaluation tied to a canonical executed "
+                    "experiment",
+                    prompt,
+                )
+                self.assertIn(
+                    "one ASCII raw witness line anchored with REC: or RECORD:",
+                    prompt,
+                )
+                self.assertIn(
+                    "at most 200 characters, as the first or last stdout line",
+                    prompt,
+                )
+                self.assertIn(
+                    "SUMMARY: and oracle= tokens alone are not semantic "
+                    "authority",
+                    prompt,
+                )
+                self.assertIn(
+                    "A model evaluation of a generic command is proposal only",
+                    prompt,
+                )
+                self.assertIn(
+                    "canonical result remains inconclusive with no hypothesis "
+                    "or Fact relationship changes",
+                    prompt,
+                )
+                self.assertIn(
+                    "transport failure semantics are owned by the engine",
+                    prompt,
+                )
+                self.assertIn(
+                    "One experiment evaluation has one overall disposition",
+                    prompt,
+                )
+                self.assertIn(
+                    "preferably one hypothesis per experiment",
+                    prompt,
+                )
+                self.assertIn(
+                    "Never attach support_hypothesis_ids or "
+                    "refute_hypothesis_ids to an inconclusive or failed "
+                    "evaluation",
+                    prompt,
+                )
 
 
 class CommandTests(unittest.TestCase):
@@ -919,6 +1319,34 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--strict-config", command.argv)
         self.assertEqual(command.argv[-1], "-")
         self.assertIn("Do not spawn or delegate", command.stdin)
+        self.assertIn(
+            "Top-level artifacts is the current run's publication list",
+            command.stdin,
+        )
+        self.assertIn(
+            "cite their canonical artifact IDs",
+            command.stdin,
+        )
+        self.assertIn(
+            "raw TCP clients must use the SOCKS5H endpoint in ALL_PROXY",
+            command.stdin,
+        )
+        self.assertIn(
+            "request.py URL -X METHOD ...",
+            command.stdin,
+        )
+        self.assertIn(
+            "request.py http://target/path -X GET",
+            command.stdin,
+        )
+        self.assertIn("Omit `--session` from every generic command action", command.stdin)
+        self.assertIn("engine private-state boundary", command.stdin)
+        self.assertNotIn("-X GET --session attacker", command.stdin)
+        self.assertIn("never invent a `--url` option", command.stdin)
+        self.assertIn(
+            "artifacts/workspace/artifacts/name",
+            command.stdin,
+        )
 
     def test_batch_and_live_commands_honor_explicit_effort_overrides(self) -> None:
         invocation = BatchInvocation(
@@ -3826,6 +4254,109 @@ class BatchRunnerTests(unittest.TestCase):
             self.assertEqual(len(result.events), 2)
             self.assertEqual(metadata["event_accumulator"]["events_dropped"], 4)
             self.assertGreater(metadata["flag_scan"]["suppressed_matches"], 0)
+
+    def test_printf_template_notice_is_not_candidate_overflow(
+        self,
+    ) -> None:
+        executor = ScriptedExecutor(
+            [
+                (
+                    [
+                        {
+                            "type": "item.completed",
+                            "text": "static csawctf{%[2]08x}",
+                        }
+                    ],
+                    valid_payload(Role.RECON),
+                    0,
+                )
+            ]
+        )
+        notified = []
+        notices = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = BatchRunner(
+                process_executor=executor,
+                max_schema_retries=0,
+            ).run(
+                BatchInvocation(
+                    "printf-template",
+                    Role.RECON,
+                    "inspect",
+                    root,
+                    root / "run",
+                ),
+                on_flag=notified.append,
+                on_flag_notice=notices.append,
+            )
+            metadata = json.loads(
+                result.attempts[0].capture_metadata_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(result.success, result.validation.errors)
+        self.assertEqual(result.flag_candidates, ())
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(
+            result.events[0].payload["text"],
+            "static csawctf{%[2]08x}",
+        )
+        self.assertEqual(notified, [])
+        self.assertEqual(
+            [candidate.value for candidate in notices],
+            ["csawctf{%[2]08x}"],
+        )
+        self.assertEqual(metadata["flag_scan"]["suppressed_matches"], 0)
+        self.assertGreaterEqual(
+            metadata["flag_scan"]["template_suppressed_matches"],
+            1,
+        )
+        self.assertEqual(metadata["flag_scan"]["notice_count"], 1)
+        self.assertEqual(
+            metadata["flag_scan"]["candidate_chars_stored"],
+            0,
+        )
+
+    def test_printf_template_notice_failure_is_fatal(self) -> None:
+        executor = ScriptedExecutor(
+            [
+                (
+                    [
+                        {
+                            "type": "item.completed",
+                            "text": "static csawctf{%[2]08x}",
+                        }
+                    ],
+                    valid_payload(Role.RECON),
+                    0,
+                )
+            ]
+        )
+
+        def fail_notice(_candidate) -> None:
+            raise OSError("notice terminal unavailable")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(
+                FlagNotificationError,
+                "notice terminal unavailable",
+            ):
+                BatchRunner(
+                    process_executor=executor,
+                    max_schema_retries=0,
+                ).run(
+                    BatchInvocation(
+                        "printf-notice-failure",
+                        Role.RECON,
+                        "inspect",
+                        root,
+                        root / "run",
+                    ),
+                    on_flag_notice=fail_notice,
+                )
 
     def test_runner_retries_invalid_schema_on_same_thread_and_streams_flag(self) -> None:
         first_output = valid_payload(Role.RECON)

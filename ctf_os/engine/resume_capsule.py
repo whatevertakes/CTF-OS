@@ -14,6 +14,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from ctf_os.contracts.pwn_crash_v1 import PWN_CRASH_V1_ATTEMPT_COUNT
+from ctf_os.engine.checkpoint_projection import (
+    checkpoint_has_action_projection,
+    experiment_command_sha256 as checkpoint_command_sha256,
+    experiment_contract_sha256,
+    experiment_id_pointer,
+    experiment_id_sha256,
+    parse_checkpoint_action_reference,
+)
 from ctf_os.engine.failure_capsule import (
     experiment_command_sha256,
     safe_run_diagnostics,
@@ -261,20 +269,6 @@ def _command_sha256(experiment: Experiment) -> str:
             f"experiment {experiment.id} command is not valid UTF-8"
         ) from error
     return hashlib.sha256(payload).hexdigest()
-
-
-def _experiment_contract_sha256(experiment: Experiment) -> str:
-    """Hash model-authored conditions without replaying their free text."""
-
-    return hashlib.sha256(
-        canonical_json_record(
-            {
-                "drop_if": experiment.drop_if,
-                "expected_observation": experiment.expected_observation,
-                "keep_if": experiment.keep_if,
-            }
-        ).encode("ascii")
-    ).hexdigest()
 
 
 def _safe_engine_evaluation_reason(
@@ -977,7 +971,7 @@ def _experiment_digest(
     safe_evaluation_reason = _safe_engine_evaluation_reason(experiment)
     return {
         "command_sha256": _command_sha256(experiment),
-        "contract_sha256": _experiment_contract_sha256(experiment),
+        "contract_sha256": experiment_contract_sha256(experiment),
         "evaluated_at": _bounded(experiment.evaluated_at, 64),
         "evaluation_reason": safe_evaluation_reason,
         "evaluation_reason_available": bool(
@@ -1537,27 +1531,12 @@ def _failure_capsule_digest(
             "runs_omitted": run_count - len(run_records),
             "schema_version": capsule.schema_version,
             "stage": capsule.stage,
-            "unresolved_hypothesis_ids": list(
-                active_unresolved_hypothesis_ids[:2]
-            ),
-            "unresolved_hypotheses_omitted": max(
-                0,
-                len(active_unresolved_hypothesis_ids)
-                - 2
-                + capsule.omitted_counts[
-                    "unresolved_hypothesis_ids"
-                ],
-            ),
         }
         if next_experiments_stale:
             digest["next_experiments_stale"] = next_experiments_stale
         if capsule.omitted_counts["next_experiment_ids"]:
             digest["next_experiments_omitted"] = (
                 capsule.omitted_counts["next_experiment_ids"]
-            )
-        if unresolved_hypotheses_stale:
-            digest["unresolved_hypotheses_stale"] = (
-                unresolved_hypotheses_stale
             )
         if occurrence_history_omitted:
             digest["occurrence_history_omitted"] = (
@@ -1633,6 +1612,110 @@ def _failure_capsule_digest(
     return digest
 
 
+def _checkpoint_action_digest(
+    state: ChallengeState,
+    checkpoint: Any,
+    values: list[str],
+) -> dict[str, object] | None:
+    """Project checkpoint actions without copying legacy or current commands."""
+
+    if not values:
+        return None
+    experiments_by_id = {item.id: item for item in state.experiments}
+    experiments_by_id_sha256: dict[str, list[Experiment]] = {}
+    experiments_by_command: dict[str, list[Experiment]] = {}
+    for experiment in state.experiments:
+        experiments_by_id_sha256.setdefault(
+            experiment_id_sha256(experiment),
+            [],
+        ).append(experiment)
+        experiments_by_command.setdefault(experiment.command, []).append(
+            experiment
+        )
+    for matches in experiments_by_command.values():
+        matches.sort(key=_recent_key, reverse=True)
+
+    references: list[dict[str, object]] = []
+    legacy_entries = 0
+    stale_entries = 0
+    projected_actions = checkpoint_has_action_projection(checkpoint.extra)
+    for value in values:
+        parsed = (
+            parse_checkpoint_action_reference(value)
+            if projected_actions
+            else None
+        )
+        if parsed is not None:
+            reference_kind, experiment_pointer, recorded_sha256 = parsed
+            matches = (
+                [experiments_by_id[experiment_pointer]]
+                if reference_kind == "id"
+                and experiment_pointer in experiments_by_id
+                else experiments_by_id_sha256.get(experiment_pointer, [])
+                if reference_kind == "id_sha256"
+                else []
+            )
+            command_matches = [
+                item
+                for item in matches
+                if checkpoint_command_sha256(item) == recorded_sha256
+            ]
+            canonical_match = len(command_matches) == 1
+            if not canonical_match:
+                stale_entries += 1
+            if len(references) < 1:
+                record: dict[str, object] = {
+                    "canonical_match": canonical_match,
+                    "command_sha256": recorded_sha256,
+                }
+                if reference_kind == "id":
+                    record["experiment_id"] = experiment_pointer
+                else:
+                    record["experiment_id_sha256"] = experiment_pointer
+                if len(command_matches) == 1:
+                    record["current_status"] = (
+                        command_matches[0].status.value
+                    )
+                references.append(record)
+            continue
+
+        # Legacy checkpoints stored free-form action or complete command text.
+        # Resolve an exact command match when possible and otherwise retain
+        # only an aggregate stale count. Never copy the legacy value into
+        # model context.
+        legacy_entries += 1
+        matches = experiments_by_command.get(value, [])
+        if not matches:
+            stale_entries += 1
+        if len(references) >= 1:
+            continue
+        if matches:
+            selected = matches[0]
+            references.append(
+                {
+                    "canonical_match": True,
+                    "command_sha256": checkpoint_command_sha256(selected),
+                    "current_status": selected.status.value,
+                    "legacy_reference": True,
+                    "matching_experiments": len(matches),
+                    **experiment_id_pointer(selected),
+                }
+            )
+    if not references:
+        # Counts already live on the checkpoint digest.  An unmatched legacy
+        # description has no canonical experiment pointer; omitting its text
+        # is safer and smaller than inventing one.
+        return None
+    return {
+        "canonical_pointer": "canonical_state#/experiments",
+        "entries": len(values),
+        "legacy_entries": legacy_entries,
+        "references": references,
+        "references_omitted": max(0, len(values) - len(references)),
+        "stale_entries": stale_entries,
+    }
+
+
 def _checkpoint_digest(
     state: ChallengeState,
     *,
@@ -1641,35 +1724,68 @@ def _checkpoint_digest(
     if not state.checkpoints:
         return None
     checkpoint = state.checkpoints[-1]
+    active_hypothesis_ids = [
+        item.id
+        for item in state.hypotheses
+        if item.status in ACTIVE_HYPOTHESIS_STATUSES
+    ]
     failure_capsule = _failure_capsule_digest(
         state,
         checkpoint,
         compact=compact_failure,
     )
     if compact_failure and failure_capsule is not None:
-        # The active goal and evidence indexes are already represented by
-        # mandatory top-level/context records.  Under byte pressure retain
-        # only the checkpoint binding and the failure evidence itself.
+        # The active goal and evidence indexes are represented elsewhere.
+        # Under byte pressure retain the checkpoint binding, failure evidence,
+        # and the current canonical hypothesis frontier needed to resume.
         return {
             "cycle_id": checkpoint.cycle_id,
             "failure_capsule": failure_capsule,
+            "hypothesis_ids": list(active_hypothesis_ids[:2]),
+            "hypothesis_ids_omitted": max(
+                0, len(active_hypothesis_ids) - 2
+            ),
             "id": checkpoint.id,
         }
+    checkpoint_hypothesis_ids = set(checkpoint.open_hypothesis_ids)
+    canonical_active_hypothesis_ids = set(active_hypothesis_ids)
     digest = {
         "active_goal_id": checkpoint.active_goal_id,
         "artifact_count": len(checkpoint.artifact_ids),
         "cycle_id": checkpoint.cycle_id,
         "do_not_repeat_count": len(checkpoint.do_not_repeat),
         "fact_count": len(checkpoint.observation_fact_ids),
-        "hypothesis_ids": list(checkpoint.open_hypothesis_ids[:12]),
+        # A checkpoint is a historical binding, not a second source of truth.
+        # Operator evaluation may resolve its formerly-open hypotheses before
+        # the next model call, so always render the current canonical frontier.
+        "hypothesis_ids": list(active_hypothesis_ids[:12]),
         "hypothesis_ids_omitted": max(
-            0, len(checkpoint.open_hypothesis_ids) - 12
+            0, len(active_hypothesis_ids) - 12
         ),
         "id": checkpoint.id,
         "next_action_count": len(checkpoint.next_actions),
         "note_available": bool((checkpoint.note or "").strip()),
         "receipt_count": len(checkpoint.receipt_ids),
     }
+    if checkpoint_hypothesis_ids != canonical_active_hypothesis_ids:
+        digest["hypothesis_ids_source"] = "canonical_state"
+        digest["checkpoint_hypothesis_ids_stale"] = len(
+            checkpoint_hypothesis_ids - canonical_active_hypothesis_ids
+        )
+    next_action_projection = _checkpoint_action_digest(
+        state,
+        checkpoint,
+        checkpoint.next_actions,
+    )
+    if next_action_projection is not None:
+        digest["next_action_projection"] = next_action_projection
+    do_not_repeat_projection = _checkpoint_action_digest(
+        state,
+        checkpoint,
+        checkpoint.do_not_repeat,
+    )
+    if do_not_repeat_projection is not None:
+        digest["do_not_repeat_projection"] = do_not_repeat_projection
     if failure_capsule is not None:
         digest["failure_capsule"] = failure_capsule
     return digest

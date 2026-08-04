@@ -19,6 +19,8 @@ from ctf_os.budget import (
 from ctf_os.codex import (
     BatchInvocation,
     BatchRunner,
+    BatchWave,
+    BatchWaveRunner,
     BuiltCommand,
     FifoModelCallLimiter,
     FileFifoModelCallLimiter,
@@ -68,6 +70,24 @@ class _RecordingExecutor:
         return ProcessOutcome(0, "", 0.01)
 
 
+class _RecordingLimiter:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self._lock = threading.Lock()
+        self.requested_timeouts: list[float | None] = []
+
+    def slot(self, timeout=None, *, cancel_event=None):
+        with self._lock:
+            self.requested_timeouts.append(timeout)
+        return self.delegate.slot(
+            timeout,
+            cancel_event=cancel_event,
+        )
+
+    def snapshot(self):
+        return self.delegate.snapshot()
+
+
 class _ForbiddenExecutor:
     def __init__(self) -> None:
         self.calls = 0
@@ -89,6 +109,20 @@ class _DeadlineExecutor:
             timeout + 0.02,
             timed_out=True,
         )
+
+
+class _FakeMonotonicClock:
+    def __init__(self, value: float) -> None:
+        self._value = value
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self._value
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self._value += seconds
 
 
 class BudgetTests(unittest.TestCase):
@@ -155,6 +189,178 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(executor.calls, 0)
         self.assertEqual(limiter.snapshot().active, 0)
         self.assertEqual(limiter.snapshot().waiting, 0)
+
+    def test_file_limited_wave_waits_until_challenge_deadline_then_gets_full_timeout(
+        self,
+    ) -> None:
+        fake_monotonic = _FakeMonotonicClock(100.0)
+        executor = _RecordingExecutor()
+        completed = []
+        failures: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            file_limiter = FileFifoModelCallLimiter(
+                root / "model-calls.json",
+                1,
+                poll_interval=0.005,
+            )
+            limiter = _RecordingLimiter(file_limiter)
+            runner = BatchRunner(
+                process_executor=executor,
+                limiter=limiter,
+                # Deliberately shorter than the simulated queue wait. A hard
+                # challenge deadline, not this fallback, governs admission.
+                limiter_wait_timeout=1,
+                max_schema_retries=0,
+            )
+            invocations = tuple(
+                BatchInvocation(
+                    f"queued-role-{number}",
+                    Role.RECON,
+                    "inspect",
+                    root,
+                    root / f"run-{number}",
+                    timeout_seconds=10,
+                    deadline_monotonic_seconds=200,
+                )
+                for number in range(3)
+            )
+            wave = BatchWave.create("queued-wave", invocations)
+
+            def run_wave() -> None:
+                try:
+                    completed.append(BatchWaveRunner(runner).run(wave))
+                except BaseException as error:
+                    failures.append(error)
+
+            with mock.patch.object(
+                runner_module.time,
+                "monotonic",
+                side_effect=fake_monotonic,
+            ):
+                with file_limiter.slot() as external_holder:
+                    external_holder.acquire()
+                    thread = threading.Thread(target=run_wave)
+                    thread.start()
+                    snapshot = limiter.snapshot()
+                    for _ in range(400):
+                        if snapshot.waiting == 3:
+                            break
+                        threading.Event().wait(0.005)
+                        snapshot = limiter.snapshot()
+                    self.assertEqual(len(wave.invocations), 3)
+                    self.assertEqual(snapshot.active, 1)
+                    self.assertEqual(snapshot.waiting, 3)
+                    self.assertEqual(executor.timeouts, [])
+                    self.assertEqual(
+                        limiter.requested_timeouts,
+                        [100, 100, 100],
+                    )
+
+                    # This exceeds both the fallback admission timeout and the
+                    # execution timeout, while remaining inside the challenge.
+                    fake_monotonic.advance(20)
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(len(completed), 1)
+            results = completed[0]
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(result.success for result in results))
+            self.assertEqual(executor.timeouts, [10, 10, 10])
+            self.assertTrue(
+                all(
+                    result.timing.provider_wait_seconds >= 20
+                    for result in results
+                )
+            )
+            self.assertEqual(limiter.snapshot().active, 0)
+            self.assertEqual(limiter.snapshot().waiting, 0)
+
+    def test_file_limited_wave_still_stops_at_challenge_deadline(self) -> None:
+        fake_monotonic = _FakeMonotonicClock(100.0)
+        executor = _RecordingExecutor()
+        completed = []
+        failures: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            file_limiter = FileFifoModelCallLimiter(
+                root / "model-calls.json",
+                1,
+                poll_interval=0.005,
+            )
+            limiter = _RecordingLimiter(file_limiter)
+            runner = BatchRunner(
+                process_executor=executor,
+                limiter=limiter,
+                limiter_wait_timeout=60,
+                max_schema_retries=0,
+            )
+            wave = BatchWave.create(
+                "expiring-queued-wave",
+                tuple(
+                    BatchInvocation(
+                        f"expiring-role-{number}",
+                        Role.RECON,
+                        "inspect",
+                        root,
+                        root / f"run-{number}",
+                        timeout_seconds=30,
+                        deadline_monotonic_seconds=110,
+                    )
+                    for number in range(3)
+                ),
+            )
+
+            def run_wave() -> None:
+                try:
+                    completed.append(BatchWaveRunner(runner).run(wave))
+                except BaseException as error:
+                    failures.append(error)
+
+            with mock.patch.object(
+                runner_module.time,
+                "monotonic",
+                side_effect=fake_monotonic,
+            ):
+                with file_limiter.slot() as external_holder:
+                    external_holder.acquire()
+                    thread = threading.Thread(target=run_wave)
+                    thread.start()
+                    snapshot = limiter.snapshot()
+                    for _ in range(400):
+                        if snapshot.waiting == 3:
+                            break
+                        threading.Event().wait(0.005)
+                        snapshot = limiter.snapshot()
+                    self.assertEqual(snapshot.active, 1)
+                    self.assertEqual(snapshot.waiting, 3)
+                    self.assertEqual(executor.timeouts, [])
+                    self.assertEqual(
+                        limiter.requested_timeouts,
+                        [10, 10, 10],
+                    )
+                    fake_monotonic.advance(11)
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(len(completed), 1)
+            results = completed[0]
+            self.assertEqual(executor.timeouts, [])
+            self.assertTrue(all(not result.success for result in results))
+            self.assertTrue(
+                all(
+                    [failure.kind for failure in result.failures]
+                    == ["challenge_budget_expired"]
+                    for result in results
+                )
+            )
+            self.assertEqual(limiter.snapshot().active, 0)
+            self.assertEqual(limiter.snapshot().waiting, 0)
 
     def test_process_finishing_after_deadline_has_one_budget_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -307,6 +513,7 @@ class BudgetTests(unittest.TestCase):
                 root,
                 root / "output",
                 timeout_seconds=30,
+                deadline_monotonic_seconds=time.monotonic() + 30,
             )
             cancel_event = threading.Event()
             results = []

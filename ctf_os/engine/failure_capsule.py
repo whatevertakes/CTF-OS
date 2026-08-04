@@ -976,30 +976,55 @@ def validate_failure_capsule(
             "cycle runs"
         )
     cycle_run_ids = {run.id for run in all_cycle_runs}
-    all_failed_experiments = _all_failed_cycle_experiments(
+    at_capture_revision = state.revision == capsule.state_revision_after
+    all_cycle_bound_experiments = _all_failed_cycle_experiments(
         state,
         selected_action_ids=cycle.selected_action_ids,
         failed_runs=all_cycle_runs,
-        preserve_registered_experiments=(
-            capsule.reason_code == "insufficient_budget_for_wave"
-        ),
     )
-    expected_failed_ids, expected_failed_omitted = (
-        _bounded_failed_experiment_projection(
-            all_failed_experiments,
+    cycle_bound_experiment_ids = {
+        experiment.id for experiment in all_cycle_bound_experiments
+    }
+    all_failed_experiments: tuple[Experiment, ...] = ()
+    expected_failed_ids: tuple[str, ...] = ()
+    expected_failed_omitted = 0
+    if at_capture_revision:
+        all_failed_experiments = _all_failed_cycle_experiments(
+            state,
             selected_action_ids=cycle.selected_action_ids,
+            failed_runs=all_cycle_runs,
+            preserve_registered_experiments=(
+                capsule.reason_code == "insufficient_budget_for_wave"
+            ),
         )
-    )
+        expected_failed_ids, expected_failed_omitted = (
+            _bounded_failed_experiment_projection(
+                all_failed_experiments,
+                selected_action_ids=cycle.selected_action_ids,
+            )
+        )
     if (
         len(failed_experiments) > MAX_FAILED_EXPERIMENTS
         or len({item.id for item in failed_experiments})
         != len(failed_experiments)
-        or tuple(
-            experiment.id for experiment in failed_experiments
+        or (
+            at_capture_revision
+            and (
+                tuple(
+                    experiment.id for experiment in failed_experiments
+                )
+                != expected_failed_ids
+                or capsule.omitted_counts["failed_experiment_ids"]
+                != expected_failed_omitted
+            )
         )
-        != expected_failed_ids
-        or capsule.omitted_counts["failed_experiment_ids"]
-        != expected_failed_omitted
+        or (
+            not at_capture_revision
+            and any(
+                experiment.id not in cycle_bound_experiment_ids
+                for experiment in failed_experiments
+            )
+        )
     ):
         raise ModelValidationError(
             "failure capsule failed experiments are not the canonical "
@@ -1030,7 +1055,7 @@ def validate_failure_capsule(
     # reconstructable, so require exact evidence/frontier capture.  On later
     # revisions records may legitimately become resolved or gain evidence;
     # content_sha256 still makes the historical capture tamper-evident.
-    if state.revision == capsule.state_revision_after:
+    if at_capture_revision:
         (
             expected_fact_ids,
             expected_artifact_ids,
@@ -1094,6 +1119,16 @@ def validate_failure_capsule(
                 "projection"
             )
 
+    # Failed membership and its fingerprint are historical after the capture
+    # revision.  In particular, an insufficient-budget next experiment may
+    # later become CANCELLED without becoming a failure of the earlier cycle.
+    # Use the complete structural cycle binding for causal evidence checks,
+    # while retaining exact failed-set/fingerprint recomputation at capture.
+    associated_experiments = (
+        all_failed_experiments
+        if at_capture_revision
+        else all_cycle_bound_experiments
+    )
     associated_artifact_ids = {
         artifact.id
         for artifact in state.artifacts
@@ -1104,16 +1139,16 @@ def validate_failure_capsule(
         for receipt in state.receipts
         if receipt.run_id in cycle_run_ids
         or receipt.experiment_id
-        in {item.id for item in all_failed_experiments}
+        in {item.id for item in associated_experiments}
     }
     associated_receipt_ids.update(
         receipt_id
-        for experiment in all_failed_experiments
+        for experiment in associated_experiments
         for receipt_id in experiment.evidence_receipt_ids
     )
     associated_artifact_ids.update(
         artifact_id
-        for experiment in all_failed_experiments
+        for experiment in associated_experiments
         for artifact_id in experiment.artifact_ids
     )
     for receipt in capsule_receipts:
@@ -1129,7 +1164,7 @@ def validate_failure_capsule(
     }
     associated_fact_ids.update(
         fact_id
-        for experiment in all_failed_experiments
+        for experiment in associated_experiments
         for fact_id in experiment.evidence_fact_ids
     )
     if (
@@ -1149,16 +1184,17 @@ def validate_failure_capsule(
         raise ModelValidationError(
             "failure capsule evidence lacks a causal cycle binding"
         )
-    expected_fingerprint = _fingerprint(
-        reason_code=capsule.reason_code,
-        stage=capsule.stage,
-        runs=all_cycle_runs,
-        failed_experiments=all_failed_experiments,
-    )
-    if capsule.fingerprint_sha256 != expected_fingerprint:
-        raise ModelValidationError(
-            "failure capsule fingerprint does not match canonical state"
+    if at_capture_revision:
+        expected_fingerprint = _fingerprint(
+            reason_code=capsule.reason_code,
+            stage=capsule.stage,
+            runs=all_cycle_runs,
+            failed_experiments=all_failed_experiments,
         )
+        if capsule.fingerprint_sha256 != expected_fingerprint:
+            raise ModelValidationError(
+                "failure capsule fingerprint does not match canonical state"
+            )
     return runs, failed_experiments, next_experiments
 
 

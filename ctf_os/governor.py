@@ -371,8 +371,9 @@ def evaluate_stall(
         experiment.id: experiment
         for experiment in _tail(state.experiments, maximum)
     }
-    labeled_runs: list[tuple[str, str]] = []
-    for run in runs:
+    recent_runs = runs[-window:]
+    recent_run_labels: list[tuple[str, str | None]] = []
+    for run in recent_runs:
         experiment_id = run.extra.get("experiment_id")
         linked = (
             experiment_by_id.get(str(experiment_id))
@@ -380,22 +381,41 @@ def evaluate_stall(
             else None
         )
         label = _run_failure_label(run, linked, known_failure_labels)
-        if label is not None:
-            labeled_runs.append((run.id, label))
-    recent_labels = tuple(labeled_runs[-window:])
-    if len(recent_labels) < window:
-        experiment_labels = tuple(
-            (experiment.id, label)
-            for experiment in experiments
-            if (
-                label := _experiment_failure_label(
+        recent_run_labels.append((run.id, label))
+    recent_labels: tuple[tuple[str, str], ...] = ()
+    if len(recent_run_labels) == window and all(
+        label is not None for _run_id, label in recent_run_labels
+    ):
+        recent_labels = tuple(
+            (run_id, label)
+            for run_id, label in recent_run_labels
+            if label is not None
+        )
+    elif not runs:
+        # Some callers persist executed experiments without separate run
+        # records.  Keep that compatibility path, but align labels to the
+        # complete recent experiment window.  Never reach behind newer
+        # unlabeled runs to revive stale historical failures.
+        recent_experiments = experiments[-window:]
+        recent_experiment_labels = tuple(
+            (
+                experiment.id,
+                _experiment_failure_label(
                     experiment,
                     known_failure_labels,
-                )
+                ),
             )
-            is not None
+            for experiment in recent_experiments
         )
-        recent_labels = experiment_labels[-window:]
+        if len(recent_experiment_labels) == window and all(
+            label is not None
+            for _experiment_id, label in recent_experiment_labels
+        ):
+            recent_labels = tuple(
+                (experiment_id, label)
+                for experiment_id, label in recent_experiment_labels
+                if label is not None
+            )
     repeated_failure_label = (
         recent_labels[0][1]
         if len(recent_labels) == window
@@ -403,7 +423,6 @@ def evaluate_stall(
         else None
     )
 
-    recent_runs = runs[-window:]
     recent_run_ids = tuple(run.id for run in recent_runs)
     fact_run_ids = {
         fact.source_run_id

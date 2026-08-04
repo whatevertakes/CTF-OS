@@ -115,6 +115,10 @@ REV_RUNTIME_EXEC_ARGV = (
 )
 _DIGEST_PIN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SANDBOX_RUN_ID = re.compile(r"^run-[0-9]{8,}$")
+_CLEAN_PROOF_STDOUT_LOCATOR = re.compile(
+    r"^proof/clean-([0-9a-f]{12})/stdout\.log$"
+)
 _AUTHORITIES = {
     "automatic_submission_authorized": False,
     "candidate_authorized": False,
@@ -695,6 +699,23 @@ def _normalized_result_locator(value: object) -> str:
         ) from error
 
 
+def _clean_proof_execution_id(
+    stdout_locator: object,
+    stderr_locator: object,
+) -> str | None:
+    """Return the host-promoted clean-proof nonce for one exact stream pair."""
+
+    if type(stdout_locator) is not str or type(stderr_locator) is not str:
+        return None
+    matched = _CLEAN_PROOF_STDOUT_LOCATOR.fullmatch(stdout_locator)
+    if matched is None:
+        return None
+    nonce = matched.group(1)
+    if stderr_locator != f"proof/clean-{nonce}/stderr.log":
+        return None
+    return nonce
+
+
 def _accepted_input_disclosed(
     spec: RevRuntimeV1Spec,
     accepted_input: bytes,
@@ -953,8 +974,8 @@ def _validate_private_rev_runtime_proof_evaluation(
             "validation_sha256",
             "validation_size_bytes",
         }
-        sandbox_ids: set[str] = set()
-        proof_locators: set[str] = set()
+        sandbox_run_ids: set[str] = set()
+        clean_proof_ids: set[str] = set()
         durable_paths: set[str] = set()
         sandbox_reused = False
         for index, record in enumerate(value["records"]):
@@ -966,23 +987,24 @@ def _validate_private_rev_runtime_proof_evaluation(
                 or record["scope_fingerprint"]
                 != value["proof_scope_fingerprint"]
                 or type(record["sandbox_run_id"]) is not str
-                or not record["sandbox_run_id"]
+                or _SANDBOX_RUN_ID.fullmatch(record["sandbox_run_id"])
+                is None
             ):
                 raise RevRuntimeProofError(
                     "runtime_evaluation_record_invalid"
                 )
-            if record["sandbox_run_id"] in sandbox_ids:
+            sandbox_run_ids.add(record["sandbox_run_id"])
+            clean_proof_id = _clean_proof_execution_id(
+                record["stdout_locator"],
+                record["stderr_locator"],
+            )
+            if clean_proof_id is None:
+                raise RevRuntimeProofError(
+                    "runtime_evaluation_record_invalid"
+                )
+            if clean_proof_id in clean_proof_ids:
                 sandbox_reused = True
-            sandbox_ids.add(record["sandbox_run_id"])
-            for stream in ("stdout", "stderr"):
-                locator = record[f"{stream}_locator"]
-                if (
-                    type(locator) is not str
-                    or normalize_locator(locator) != locator
-                    or locator in proof_locators
-                ):
-                    sandbox_reused = True
-                proof_locators.add(locator)
+            clean_proof_ids.add(clean_proof_id)
             for prefix in ("request", "result", "validation"):
                 path = record[f"{prefix}_path"]
                 digest = record[f"{prefix}_sha256"]
@@ -1059,6 +1081,17 @@ def _validate_private_rev_runtime_proof_evaluation(
                 "runtime_evaluation_acceptance_invalid"
             )
         if sandbox_reused:
+            expected_reasons.append("sandbox_identity_reused")
+        elif (
+            # Compatibility for v1 evaluations emitted before clean-proof
+            # identity was bound to the host-promoted nonce.  Fresh ctfwrap
+            # trees legitimately reuse run-00000001; old engines treated that
+            # safe pattern as a blocker.  Preserve only that fail-closed
+            # verdict, never a passing or authority-bearing result.
+            len(sandbox_run_ids) == 1
+            and value["passed"] is False
+            and "sandbox_identity_reused" in value["reason_codes"]
+        ):
             expected_reasons.append("sandbox_identity_reused")
         expected_reasons = list(dict.fromkeys(expected_reasons))
         if value["reason_codes"] != expected_reasons:
@@ -1795,8 +1828,7 @@ def prove_rev_runtime_accepted_input(
             timeout_seconds,
         )
         request_resources = tool_profile("standard", network=False)
-        sandbox_run_ids: set[str] = set()
-        result_locators: set[str] = set()
+        clean_proof_ids: set[str] = set()
 
         snapshot_parent = ensure_private_directory(
             paths.runtime / "rev-runtime-proof-snapshots"
@@ -1979,7 +2011,7 @@ def prove_rev_runtime_accepted_input(
                     if (
                         proof_client.scope_fingerprint != proof_scope
                         or type(result.run_id) is not str
-                        or not result.run_id
+                        or _SANDBOX_RUN_ID.fullmatch(result.run_id) is None
                     ):
                         raise RevRuntimeProofError(
                             "runtime_proof_scope_changed"
@@ -1990,16 +2022,16 @@ def prove_rev_runtime_accepted_input(
                     stderr_locator = _normalized_result_locator(
                         result.stderr_path
                     )
-                    reused_identity = (
-                        result.run_id in sandbox_run_ids
-                        or stdout_locator == stderr_locator
-                        or stdout_locator in result_locators
-                        or stderr_locator in result_locators
+                    clean_proof_id = _clean_proof_execution_id(
+                        stdout_locator,
+                        stderr_locator,
                     )
-                    sandbox_run_ids.add(result.run_id)
-                    result_locators.update(
-                        (stdout_locator, stderr_locator)
-                    )
+                    if clean_proof_id is None:
+                        raise RevRuntimeProofError(
+                            "runtime_result_locator_invalid"
+                        )
+                    reused_identity = clean_proof_id in clean_proof_ids
+                    clean_proof_ids.add(clean_proof_id)
                     if reused_identity:
                         additional_reason_codes.append(
                             "sandbox_identity_reused"

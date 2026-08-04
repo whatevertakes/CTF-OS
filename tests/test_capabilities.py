@@ -41,7 +41,7 @@ def capability_payload(
 
 class CapabilityTests(unittest.TestCase):
     def test_host_attestations_match_vendored_v2_manifest(self):
-        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 34)
+        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 35)
         manifest = json.loads(
             (
                 Path(__file__).resolve().parents[1]
@@ -299,9 +299,40 @@ class CapabilityTests(unittest.TestCase):
                 "rev_runtime_exec_v1",
                 "rev_safe_output",
                 "rev_stdin_exec",
+                "web_response_summary_v1",
             ],
         )
         self.assertEqual(report["attestations"], {})
+
+    def test_previous_web_image_without_response_summary_fails_preflight(self):
+        payload = capability_payload()
+        records = payload["capabilities"]
+        self.assertIsInstance(records, list)
+        payload["capabilities"] = [
+            item
+            for item in records
+            if item["name"] != "web_response_summary_v1"
+        ]
+
+        def runner(argv, **kwargs):
+            del kwargs
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(payload).encode(),
+                b"",
+            )
+
+        report = inspect_pinned_capabilities(
+            DIGEST,
+            runner=runner,
+            required=required_managed_capabilities_for_category("web"),
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["missing"], ["web_response_summary_v1"])
+        self.assertEqual(report["attestations"], {})
+        self.assertEqual(report["attestation_errors"], {})
 
     def test_pwn_crash_capability_missing_fails_closed(self):
         def runner(argv, **kwargs):
@@ -404,6 +435,12 @@ class CapabilityTests(unittest.TestCase):
         payload = capability_payload()
         records = payload["capabilities"]
         self.assertIsInstance(records, list)
+        web_summary = next(
+            item
+            for item in records
+            if item["name"] == "web_response_summary_v1"
+        )
+        web_summary["attestation"]["sha256"] = "a" * 64
         inventory = next(
             item
             for item in records
@@ -497,6 +534,7 @@ class CapabilityTests(unittest.TestCase):
                 "rev_runtime_exec_v1",
                 "rev_safe_output",
                 "rev_stdin_exec",
+                "web_response_summary_v1",
             ],
         )
         self.assertEqual(
@@ -512,6 +550,7 @@ class CapabilityTests(unittest.TestCase):
                 "rev_runtime_exec_v1",
                 "rev_safe_output",
                 "rev_stdin_exec",
+                "web_response_summary_v1",
             },
         )
         self.assertEqual(report["attestations"], {})

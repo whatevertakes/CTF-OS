@@ -14,6 +14,75 @@ from ctf_os.contracts.rev_inventory_v2 import (
 from .base import ExperimentSpec, GenericAdapter, ProgressMarker, ProofPolicy
 
 
+_REV_REGULAR_PRIMARY_PROBE = (
+    "set -eu; target=$1; probe=$2; "
+    "if [ -L \"$target\" ]; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\" >&2; "
+    "printf '%s\\n' 'ctfos_rev_probe_error=symlink_primary_binding' >&2; "
+    "exit 2; fi; "
+    "if [ ! -f \"$target\" ]; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\"; "
+    "printf '%s\\n' 'ctfos_rev_probe_status=skipped' "
+    "'ctfos_rev_probe_reason=no_regular_primary_binding'; "
+    "exit 0; fi; "
+    "exec ghidra-decompile \"$target\""
+)
+
+
+_REV_ELF_PRIMARY_PROBE = (
+    "set -eu; target=$1; probe=$2; work_root=${3:-/work}; "
+    "if [ -L \"$target\" ]; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\" >&2; "
+    "printf '%s\\n' 'ctfos_rev_probe_error=symlink_primary_binding' >&2; "
+    "exit 2; fi; "
+    "if [ ! -f \"$target\" ]; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\"; "
+    "printf '%s\\n' 'ctfos_rev_probe_status=skipped' "
+    "'ctfos_rev_probe_reason=no_regular_primary_binding'; "
+    "exit 0; fi; "
+    "magic=$(/usr/bin/od -An -tx1 -N4 -- \"$target\" | "
+    "/usr/bin/tr -d '[:space:]'); "
+    "case \"$magic\" in "
+    "7f454c46) ;; "
+    "cafebabe) reason=java_class_non_elf ;; "
+    "*) reason=unsupported_non_elf_primary ;; "
+    "esac; "
+    "if [ \"${reason:-}\" ]; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\"; "
+    "printf '%s\\n' 'ctfos_rev_probe_status=skipped'; "
+    "printf 'ctfos_rev_probe_reason=%s\\n' \"$reason\"; "
+    "exit 0; fi; "
+    "case \"$probe\" in "
+    "assembly_observation) exec /usr/bin/objdump -d -- \"$target\" ;; "
+    "dynamic_observation) "
+    "if ! command -v ctfwrap >/dev/null 2>&1; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\" >&2; "
+    "printf '%s\\n' 'ctfos_rev_probe_error=missing_ctfwrap' >&2; "
+    "exit 2; fi; "
+    "umask 077; "
+    "if ! staged=$(/usr/bin/mktemp "
+    "\"$work_root/ctfos-rev-dynamic.XXXXXX\"); then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\" >&2; "
+    "printf '%s\\n' 'ctfos_rev_probe_error=staging_failed' >&2; "
+    "exit 2; fi; "
+    "trap '/usr/bin/rm -f -- \"$staged\"' EXIT HUP INT TERM; "
+    "if ! /usr/bin/cp -- \"$target\" \"$staged\"; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\" >&2; "
+    "printf '%s\\n' 'ctfos_rev_probe_error=staging_failed' >&2; "
+    "exit 2; fi; "
+    "if ! /usr/bin/chmod 0500 -- \"$staged\"; then "
+    "printf 'ctfos_rev_probe=%s\\n' \"$probe\" >&2; "
+    "printf '%s\\n' 'ctfos_rev_probe_error=staging_failed' >&2; "
+    "exit 2; fi; "
+    "set +e; ctfwrap -- \"$staged\"; rc=$?; set -e; "
+    "printf 'ctfos_rev_dynamic_exit=%s\\n' \"$rc\"; "
+    "exit 0 ;; "
+    "*) printf '%s\\n' 'ctfos_rev_probe_error=unknown_probe' >&2; "
+    "exit 2 ;; "
+    "esac"
+)
+
+
 class ReversingAdapter(GenericAdapter):
     name = "reversing"
 
@@ -32,7 +101,14 @@ class ReversingAdapter(GenericAdapter):
             ExperimentSpec(
                 "assembly_observation",
                 "collect independent disassembly and symbols",
-                ("objdump", "-d", "{primary}"),
+                (
+                    "/bin/sh",
+                    "-lc",
+                    _REV_ELF_PRIMARY_PROBE,
+                    "ctfos-rev-elf-primary-probe",
+                    "{primary}",
+                    "assembly_observation",
+                ),
                 "function and branch locators in raw output",
                 "candidate validation logic is localized",
                 "format is unsupported",
@@ -41,7 +117,14 @@ class ReversingAdapter(GenericAdapter):
             ExperimentSpec(
                 "decompiler_observation",
                 "collect an independent decompiler view",
-                ("ghidra-decompile", "{primary}"),
+                (
+                    "/bin/sh",
+                    "-lc",
+                    _REV_REGULAR_PRIMARY_PROBE,
+                    "ctfos-rev-regular-primary-probe",
+                    "{primary}",
+                    "decompiler_observation",
+                ),
                 "decompiled functions with locators",
                 "logic agrees with execution or assembly",
                 "decompiler output is missing or contradictory",
@@ -51,7 +134,14 @@ class ReversingAdapter(GenericAdapter):
             ExperimentSpec(
                 "dynamic_observation",
                 "observe actual executed validation path",
-                ("ctfwrap", "--", "{primary}"),
+                (
+                    "/bin/sh",
+                    "-lc",
+                    _REV_ELF_PRIMARY_PROBE,
+                    "ctfos-rev-elf-primary-probe",
+                    "{primary}",
+                    "dynamic_observation",
+                ),
                 "runtime trace or input/output behavior",
                 "executed path confirms a static hypothesis",
                 "anti-debug or packer invalidates the view",

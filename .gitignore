@@ -1,11 +1,13 @@
-# Challenge input and canonical challenge state. .ctfos/ holds run artifacts
-# (currently 15 GB) and incoming/ holds untrusted challenge input; neither is
-# ever a tracked source of truth. Removing these two lines commits both.
+# Challenge input and canonical challenge state. .ctfos/ holds local state,
+# benchmark manifests/receipts, and run artifacts; incoming/ holds untrusted
+# challenge input. Neither directory is a tracked source of truth.
 .ctfos/
 incoming/
 
-# Local audit/design working note; not part of the release source tree.
-docs/category-solve-design.md
+# Guard against accidentally creating bulk benchmark checkouts/results at the
+# repository root. Supported local benchmark state belongs below .ctfos/.
+/benchmarks/
+/benchmark-results/
 
 .venv/
 __pycache__/

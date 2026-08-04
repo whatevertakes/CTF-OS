@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,6 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-import chardet
 import requests
 from safe_output import atomic_write, open_output_dir
 from session_state import (
@@ -34,6 +34,10 @@ OUTPUT_DIR = Path("/work/web")
 HARD_MAX_BYTES = 256 * 1024 * 1024
 HARD_MAX_REQUEST_BYTES = 64 * 1024 * 1024
 HARD_MAX_DEADLINE = 300.0
+MAX_OBSERVE_TEXT_BYTES = 1024
+MAX_OBSERVATIONS = 16
+MAX_REPORTED_MATCH_COUNT = 1_000_000
+WEB_RESPONSE_SUMMARY_PREFIX = "CTFOS_WEB_RESPONSE_V1 "
 
 
 class RequestDeadlineExceeded(TimeoutError):
@@ -48,6 +52,19 @@ def header(value: str) -> tuple[str, str]:
     if not name:
         raise argparse.ArgumentTypeError("header name cannot be empty")
     return name, raw_value.strip()
+
+
+def observe_text(value: str) -> str:
+    encoded = value.encode("utf-8")
+    if (
+        not encoded
+        or len(encoded) > MAX_OBSERVE_TEXT_BYTES
+        or any(not character.isprintable() for character in value)
+    ):
+        raise argparse.ArgumentTypeError(
+            "observation text must be 1..1024 UTF-8 bytes of printable text"
+        )
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,6 +112,17 @@ def parse_args() -> argparse.Namespace:
         default=16 * 1024 * 1024,
         help="maximum response bytes to retain (default: 16 MiB)",
     )
+    parser.add_argument(
+        "--observe-text",
+        action="append",
+        default=[],
+        type=observe_text,
+        metavar="HARMLESS_MARKER",
+        help=(
+            "test a non-secret response marker without printing the marker or "
+            "response body; repeat at most 16 times"
+        ),
+    )
     args = parser.parse_args()
     if not args.url.startswith(("http://", "https://")):
         parser.error("url must start with http:// or https://")
@@ -104,6 +132,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-bytes must be between 1 byte and 256 MiB")
     if not 1 <= args.max_request_bytes <= HARD_MAX_REQUEST_BYTES:
         parser.error("--max-request-bytes must be between 1 byte and 64 MiB")
+    if len(args.observe_text) > MAX_OBSERVATIONS:
+        parser.error(f"--observe-text may be repeated at most {MAX_OBSERVATIONS} times")
+    if len(set(args.observe_text)) != len(args.observe_text):
+        parser.error("--observe-text values must be unique")
     if args.data_file is not None and not args.data_file.is_file():
         parser.error(f"request body file does not exist: {args.data_file}")
     return args
@@ -158,6 +190,10 @@ def read_limited(
 
 
 def choose_encoding(response: requests.Response, body: bytes) -> str:
+    # The helper image pins chardet, but summary-only host tests import this
+    # module without installing every image dependency.
+    import chardet
+
     content_type = response.headers.get("content-type", "")
     match = re.search(r"charset\s*=\s*[\"']?([^;\"'\s]+)", content_type, re.IGNORECASE)
     if match:
@@ -217,6 +253,62 @@ def dump_requests_cookies(
             }
         )
     return normalize_cookies(cookies)
+
+
+def _request_sha256(
+    method: str,
+    url: str,
+    request_body: bytes | str | None,
+) -> str:
+    if request_body is None:
+        body = b""
+    elif isinstance(request_body, str):
+        body = request_body.encode("utf-8")
+    else:
+        body = request_body
+    digest = hashlib.sha256()
+    for field in (
+        method.encode("ascii"),
+        url.encode("utf-8"),
+        hashlib.sha256(body).digest(),
+    ):
+        digest.update(len(field).to_bytes(8, "big"))
+        digest.update(field)
+    return digest.hexdigest()
+
+
+def _response_summary(
+    *,
+    method: str,
+    url: str,
+    request_body: bytes | str | None,
+    status: int,
+    raw_body: bytes,
+    truncated: bool,
+    observations: list[str],
+) -> dict[str, object]:
+    observation_results: list[dict[str, object]] = []
+    for value in observations:
+        needle = value.encode("utf-8")
+        match_count = raw_body.count(needle)
+        observation_results.append(
+            {
+                "count_capped": match_count > MAX_REPORTED_MATCH_COUNT,
+                "match_count": min(match_count, MAX_REPORTED_MATCH_COUNT),
+                "needle_sha256": hashlib.sha256(needle).hexdigest(),
+                "present": match_count > 0,
+            }
+        )
+    return {
+        "body_sha256": hashlib.sha256(raw_body).hexdigest(),
+        "kind": "ctfos_web_response",
+        "observations": observation_results,
+        "request_sha256": _request_sha256(method, url, request_body),
+        "saved_bytes": len(raw_body),
+        "schema_version": 1,
+        "status": status,
+        "truncated": truncated,
+    }
 
 
 def main() -> int:
@@ -438,6 +530,24 @@ def main() -> int:
         cookies_after,
     )
     atomic_write(output_descriptor, "response.json", metadata_payload)
+    summary = _response_summary(
+        method=args.method,
+        url=args.url,
+        request_body=request_body,
+        status=response.status_code,
+        raw_body=raw_body,
+        truncated=truncated,
+        observations=args.observe_text,
+    )
+    print(
+        WEB_RESPONSE_SUMMARY_PREFIX
+        + json.dumps(
+            summary,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
     print(metadata_payload.decode("utf-8").strip())
     return 0
 

@@ -29,7 +29,7 @@ from ctf_os.capabilities import (
     inspect_pinned_capabilities,
     required_managed_capabilities_for_category,
 )
-from ctf_os.codex import Role
+from ctf_os.codex import BatchResult, Role
 from ctf_os.codex.contracts import (
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
     MANAGED_DATA_TRANSCRIPT_ACTION_KIND,
@@ -75,6 +75,15 @@ from ctf_os.engine.challenge import (
     ChallengeEngine,
     EngineError,
     SessionAlreadyRunning,
+    managed_request_binding_errors,
+)
+from ctf_os.engine.checkpoint_projection import (
+    MANAGED_REGISTERED_SELECTION_KEY,
+    checkpoint_action_projection_metadata,
+    checkpoint_action_references,
+    managed_registered_contract_is_bounded,
+    managed_registered_selection_binding,
+    managed_registered_selection_matches,
 )
 from ctf_os.engine.failure_capsule import (
     bounded_pwn_crash_failure_reason,
@@ -119,11 +128,13 @@ from ctf_os.managed_continuity import (
 )
 from ctf_os.managed_budget import (
     MANAGED_WAVE_BUDGET_GUARD_KEY,
+    MANAGED_WAVE_BUDGET_GUARD_V2_KEY,
     ManagedWaveBudgetContractError,
-    build_managed_wave_budget_guard,
+    build_managed_wave_budget_guard_v2,
 )
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
+    MANAGED_SHELL_COMMAND_PROTOCOL,
     BudgetMode,
     ChallengeIdentity,
     ChallengeState,
@@ -136,6 +147,7 @@ from ctf_os.models import (
     FactKind,
     ManagedCycle,
     ManagedWave,
+    ModelValidationError,
     RunOrigin,
     RunReference,
     RunStatus,
@@ -146,18 +158,23 @@ from ctf_os.models import (
     WaveKind,
     utc_now,
 )
-from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION, STATE_SCHEMA_VERSION
+from ctf_os.schema import (
+    RUN_ENVELOPE_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    WORKER_RESULT_SCHEMA_VERSION,
+)
 from ctf_os.scaffold_binding import (
     SCAFFOLD_LAUNCH_METADATA_KEY,
     ScaffoldBindingError,
     managed_command_contract_sha256,
     validate_scaffold_launch_record,
 )
-from ctf_os.store import ChallengeLock, LockTimeout
+from ctf_os.store import ChallengeLock, LockTimeout, sha256_file
 from ctf_os.sandbox.files import SafeFileError, read_bounded_regular
 from ctf_os.store.atomic import (
     StrictJSONError,
     atomic_write_json,
+    canonical_json_bytes,
     read_json,
     strict_json_loads,
 )
@@ -194,6 +211,15 @@ _PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
 _PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
 _MANAGED_TYPED_GATE_ENGINE_COMMAND = "ctfos-engine:typed-gate-v1"
 _MANAGED_TYPED_GATE_ENGINE_EXECUTOR = "managed_typed_gate_v1"
+_MANAGED_LOCAL_PWN_TYPED_GATE_KINDS = frozenset(
+    {
+        MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+        MANAGED_PWN_INTERACTION_ACTION_KIND,
+    }
+)
+_MANAGED_PWN_REMOTE_TARGET_REJECTION = (
+    "typed_gate_pwn_local_only_with_remote_target"
+)
 _MAX_MANAGED_REJECTED_ACTIONS = 64
 _MAX_MANAGED_TYPED_GATE_PATHS = 4
 _MANAGED_TYPED_GATE_CATEGORIES = {
@@ -337,6 +363,10 @@ _MANAGED_TYPED_GATE_TIMEOUT_LIMITS = {
 
 class ManagedError(EngineError):
     """Managed execution failed without changing to another solve mode."""
+
+
+class ManagedRegisteredExperimentReferenceError(ManagedError):
+    """A Captain pending-experiment reference failed canonical binding."""
 
 
 class ManagedPreflightBlocked(ManagedError):
@@ -516,6 +546,33 @@ def _bounded_checkpoint_note(*parts: str | None) -> str:
     return (
         encoded[: 4096 - len(suffix)].decode("utf-8", errors="ignore")
         + suffix.decode("utf-8")
+    )
+
+
+def _captain_failure_checkpoint_reason(
+    result: BatchResult,
+) -> tuple[str, str]:
+    """Classify terminal Captain transport failures before contract errors."""
+
+    if any(
+        failure.kind == "challenge_budget_expired"
+        for failure in result.failures
+    ):
+        return (
+            "challenge_budget_expired",
+            "Challenge wall-clock budget expired during the Captain model call",
+        )
+    if result.attempts and result.attempts[-1].timed_out:
+        return (
+            "captain_timed_out",
+            (
+                "Captain model call timed out before producing a "
+                "contract-valid result"
+            ),
+        )
+    return (
+        "captain_contract_invalid",
+        "Captain result was not contract-valid",
     )
 
 
@@ -1682,8 +1739,20 @@ class ManagedOrchestrator:
         state: ChallengeState,
         wave_name: str,
     ) -> dict[str, object]:
-        """Decide admission from one finite clock sample and fixed config."""
+        """Decide admission from one provider and one finite clock sample."""
 
+        try:
+            provider_snapshot = self.engine.batch_runner.limiter.snapshot()
+            snapshot_capacity = provider_snapshot.capacity
+            snapshot_active = provider_snapshot.active
+            snapshot_waiting = provider_snapshot.waiting
+        except Exception as error:
+            raise ManagedError(
+                "managed wave provider snapshot failed"
+            ) from error
+
+        # Sample the budget only after snapshot acquisition, so time blocked
+        # on a shared limiter lock can never make the remainder optimistic.
         try:
             now_epoch = self.wall_clock()
         except Exception as error:
@@ -1702,12 +1771,15 @@ class ManagedOrchestrator:
                 now_epoch=float(now_epoch),
             )
             runtime = self.engine.config.runtime
-            return build_managed_wave_budget_guard(
+            return build_managed_wave_budget_guard_v2(
                 wave_kind=wave_name,
                 provider_max_concurrent_calls=(
                     self.engine.config.resources
                     .provider_max_concurrent_calls
                 ),
+                provider_snapshot_capacity=snapshot_capacity,
+                provider_snapshot_active=snapshot_active,
+                provider_snapshot_waiting=snapshot_waiting,
                 queue_reserve_seconds=(
                     runtime.managed_wave_queue_reserve_s
                 ),
@@ -1774,11 +1846,17 @@ class ManagedOrchestrator:
                         f"cycle {cycle_id} already has wave "
                         f"{cycle.wave_id}"
                     )
-                if MANAGED_WAVE_BUDGET_GUARD_KEY in cycle.extra:
+                if any(
+                    key in cycle.extra
+                    for key in (
+                        MANAGED_WAVE_BUDGET_GUARD_KEY,
+                        MANAGED_WAVE_BUDGET_GUARD_V2_KEY,
+                    )
+                ):
                     raise ManagedError(
                         "managed wave budget guard is already recorded"
                     )
-                cycle.extra[MANAGED_WAVE_BUDGET_GUARD_KEY] = (
+                cycle.extra[MANAGED_WAVE_BUDGET_GUARD_V2_KEY] = (
                     dict(budget_audit)
                 )
                 cycle.phase = "wave_budget_blocked"
@@ -1838,11 +1916,17 @@ class ManagedOrchestrator:
                     f"cycle {cycle_id} already has wave {cycle.wave_id}"
                 )
             if budget_audit is not None:
-                if MANAGED_WAVE_BUDGET_GUARD_KEY in cycle.extra:
+                if any(
+                    key in cycle.extra
+                    for key in (
+                        MANAGED_WAVE_BUDGET_GUARD_KEY,
+                        MANAGED_WAVE_BUDGET_GUARD_V2_KEY,
+                    )
+                ):
                     raise ManagedError(
                         "managed wave budget guard is already recorded"
                     )
-                cycle.extra[MANAGED_WAVE_BUDGET_GUARD_KEY] = dict(
+                cycle.extra[MANAGED_WAVE_BUDGET_GUARD_V2_KEY] = dict(
                     budget_audit
                 )
             anticipated_revision = state.revision + 1
@@ -1928,6 +2012,212 @@ class ManagedOrchestrator:
         return wave
 
     @staticmethod
+    def _captain_registered_experiment_reference(
+        captain_output: Mapping[str, object] | None,
+    ) -> Mapping[str, object] | None:
+        decision = (
+            captain_output.get("decision")
+            if isinstance(captain_output, Mapping)
+            else None
+        )
+        if not isinstance(decision, Mapping):
+            return None
+        reference = decision.get("selected_experiment")
+        if reference is None:
+            return None
+        if not isinstance(reference, Mapping):
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain selected_experiment is not a canonical object"
+            )
+        return reference
+
+    @staticmethod
+    def _validate_registered_experiment_reference(
+        state: ChallengeState,
+        reference: Mapping[str, object],
+        *,
+        next_stage: str | None = None,
+    ) -> Experiment:
+        expected_keys = {
+            "experiment_id",
+            "command_sha256",
+            "contract_sha256",
+        }
+        if set(reference) != expected_keys:
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain selected_experiment has invalid fields"
+            )
+        experiment_id = reference.get("experiment_id")
+        if not isinstance(experiment_id, str):
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain selected_experiment has an invalid experiment_id"
+            )
+        experiment = next(
+            (
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if experiment is None:
+            raise ManagedRegisteredExperimentReferenceError(
+                f"Captain selected unknown experiment: {experiment_id}"
+            )
+        if experiment.status is not ExperimentStatus.REGISTERED:
+            raise ManagedRegisteredExperimentReferenceError(
+                f"Captain selected non-REGISTERED experiment: {experiment_id}"
+            )
+        source_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == experiment.source_run_id
+            ),
+            None,
+        )
+        managed_contract_version = experiment.extra.get(
+            "managed_contract_version"
+        )
+        source_contract_version = (
+            source_run.extra.get("contract_version")
+            if source_run is not None
+            else None
+        )
+        ordinary_managed_command = (
+            source_run is not None
+            and source_run.origin is RunOrigin.MANAGED_MODEL
+            and source_run.status is RunStatus.COMPLETED
+            and type(source_contract_version) is int
+            and source_contract_version == 2
+            and source_run.extra.get("semantic_merge") is True
+            and type(managed_contract_version) is int
+            and managed_contract_version == 2
+            and experiment.extra.get("managed_command_protocol")
+            == MANAGED_SHELL_COMMAND_PROTOCOL
+            and experiment.extra.get("engine_executor") is None
+            and experiment.extra.get("adapter_seed") is None
+            and experiment.proof_recipe is None
+            and experiment.kind is not ExperimentKind.PROOF
+        )
+        if not ordinary_managed_command:
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain selected_experiment is not an ordinary v2 managed "
+                "command"
+            )
+        if next_stage == "proof":
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain cannot route an ordinary registered command through "
+                "the strict proof wave"
+            )
+        if not managed_registered_contract_is_bounded(experiment):
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain selected_experiment contract exceeds the bounded "
+                "worker projection"
+            )
+        try:
+            expected_binding = managed_registered_selection_binding(
+                experiment
+            )
+        except (ModelValidationError, UnicodeError) as error:
+            raise ManagedRegisteredExperimentReferenceError(
+                "Captain selected_experiment is not valid UTF-8"
+            ) from error
+        for field in ("command_sha256", "contract_sha256"):
+            if reference.get(field) != expected_binding[field]:
+                raise ManagedRegisteredExperimentReferenceError(
+                    f"Captain selected_experiment {field} mismatch"
+                )
+        return experiment
+
+    def _bind_captain_registered_experiment(
+        self,
+        identity: ChallengeIdentity,
+        session_id: str,
+        cycle_id: str,
+        captain_output: Mapping[str, object] | None,
+        *,
+        next_stage: str,
+    ) -> ChallengeState:
+        reference = self._captain_registered_experiment_reference(
+            captain_output
+        )
+        current = self.engine.store.load(identity)
+        if reference is None:
+            return current
+        self._validate_registered_experiment_reference(
+            current,
+            reference,
+            next_stage=next_stage,
+        )
+
+        def apply(state: ChallengeState) -> None:
+            self._require_epoch(state, session_id)
+            experiment = self._validate_registered_experiment_reference(
+                state,
+                reference,
+                next_stage=next_stage,
+            )
+            cycle = next(
+                item for item in state.cycles if item.id == cycle_id
+            )
+            if MANAGED_REGISTERED_SELECTION_KEY in cycle.extra:
+                raise ManagedRegisteredExperimentReferenceError(
+                    "Captain registered selection is already bound"
+                )
+            cycle.extra[MANAGED_REGISTERED_SELECTION_KEY] = (
+                managed_registered_selection_binding(experiment)
+            )
+            cycle.selected_action_ids = list(
+                dict.fromkeys(
+                    (*cycle.selected_action_ids, experiment.id)
+                )
+            )
+            cycle.phase = "action_selected"
+
+        return self.engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+
+    @staticmethod
+    def _bound_registered_experiment_id(
+        state: ChallengeState,
+        cycle: ManagedCycle | None,
+    ) -> str | None:
+        if cycle is None:
+            return None
+        binding = cycle.extra.get(MANAGED_REGISTERED_SELECTION_KEY)
+        if binding is None:
+            return None
+        if not isinstance(binding, Mapping):
+            raise ManagedRegisteredExperimentReferenceError(
+                "cycle registered selection binding is not canonical"
+            )
+        reference = {
+            key: binding.get(key)
+            for key in (
+                "experiment_id",
+                "command_sha256",
+                "contract_sha256",
+            )
+        }
+        experiment = ManagedOrchestrator._validate_registered_experiment_reference(
+            state,
+            reference,
+        )
+        if not managed_registered_selection_matches(experiment, binding):
+            raise ManagedRegisteredExperimentReferenceError(
+                "cycle registered selection binding changed"
+            )
+        if experiment.id not in cycle.selected_action_ids:
+            raise ManagedRegisteredExperimentReferenceError(
+                "cycle registered selection is not selected"
+            )
+        return experiment.id
+
+    @staticmethod
     def _frontier_routing_issue(
         state: ChallengeState,
         captain_output: Mapping[str, object] | None,
@@ -1957,6 +2247,35 @@ class ManagedOrchestrator:
         )
 
     @staticmethod
+    def _discovery_execution_fingerprint(
+        experiment: Experiment,
+    ) -> bytes:
+        """Project one role proposal onto its exact semantic execution.
+
+        Source-run provenance is intentionally absent, while every durable
+        field that can change either its hypothesis evaluation or sandbox
+        request is retained. Treat the full extra mapping and artifact
+        bindings as opaque exact values so a future execution-affecting field
+        fails safe by preventing deduplication.
+        """
+
+        return canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": experiment.kind.value,
+                "hypothesis_ids": sorted(experiment.hypothesis_ids),
+                "command": experiment.command,
+                "expected_observation": experiment.expected_observation,
+                "keep_if": experiment.keep_if,
+                "drop_if": experiment.drop_if,
+                "timeout_seconds": experiment.timeout_seconds,
+                "resource_class": experiment.resource_class,
+                "artifact_ids": list(experiment.artifact_ids),
+                "execution_metadata": experiment.extra,
+            }
+        )
+
+    @staticmethod
     def _select_actions(
         state: ChallengeState,
         wave: ManagedWave,
@@ -1969,6 +2288,17 @@ class ManagedOrchestrator:
             ),
             None,
         )
+        bound_registered_id = (
+            ManagedOrchestrator._bound_registered_experiment_id(
+                state,
+                cycle,
+            )
+        )
+        if bound_registered_id is not None:
+            # An explicit, hash-bound Captain reference is exclusive.  It is
+            # not part of the current-run candidate reducer and must never be
+            # duplicated as a freshly registered command.
+            return (bound_registered_id,)
         role_order = {
             run_id: index + 1
             for index, run_id in enumerate(wave.role_run_ids.values())
@@ -2028,9 +2358,29 @@ class ManagedOrchestrator:
             and item.drop_if.strip()
         ]
         if strategic:
+            builder_run_id = wave.role_run_ids.get(Role.BUILDER.value)
+
+            def bound_builder_priority(item: Experiment) -> int:
+                """Prefer an executable Builder publication over timeout."""
+
+                binding = item.extra.get("managed_action_input_binding")
+                is_current_bound_builder = (
+                    item.source_run_id == builder_run_id
+                    and item.extra.get("managed_command_protocol")
+                    == MANAGED_SHELL_COMMAND_PROTOCOL
+                    and isinstance(binding, Mapping)
+                    and binding.get("protocol")
+                    == "same_run_publications_v1"
+                    and binding.get("source_run_id") == builder_run_id
+                    and isinstance(binding.get("artifacts"), list)
+                    and bool(binding["artifacts"])
+                )
+                return 0 if is_current_bound_builder else 1
+
             strategic.sort(
                 key=lambda item: (
                     -len(set(item.hypothesis_ids) & open_hypotheses),
+                    bound_builder_priority(item),
                     item.timeout_seconds,
                     role_order.get(item.source_run_id or "", 999),
                     item.id,
@@ -2049,13 +2399,32 @@ class ManagedOrchestrator:
             )
         )
         selected: list[str] = []
-        approaches: set[tuple[str, str]] = set()
+        discovery_executions: set[bytes] = set()
+        role_approaches: set[tuple[str, str]] = set()
         for item in (*strategic, *probes):
             approach = (item.source_run_id or "", item.command)
-            if approach in approaches:
-                continue
+            if wave.kind is WaveKind.DISCOVERY:
+                execution = (
+                    ManagedOrchestrator._discovery_execution_fingerprint(
+                        item
+                    )
+                )
+                if execution in discovery_executions:
+                    continue
+                if approach in role_approaches:
+                    continue
+                # Only selected proposals consume either uniqueness key. A
+                # cross-role duplicate must not suppress a later, semantically
+                # distinct proposal from that duplicate's role.
+                discovery_executions.add(execution)
+                role_approaches.add(approach)
+            else:
+                # ATTACK retains independent cross-role reproduction, and
+                # PROOF has already returned through its strict recipe path.
+                if approach in role_approaches:
+                    continue
+                role_approaches.add(approach)
             selected.append(item.id)
-            approaches.add(approach)
             if len(selected) == 3:
                 break
         return tuple(selected)
@@ -3668,6 +4037,23 @@ class ManagedOrchestrator:
                 reject(run, index, shape_error)
                 return
 
+            # Both canonical Pwn gates deliberately run in a deny-all local
+            # sandbox.  A selected target makes either request semantically
+            # unexecutable, even though its provider schema is valid.  Reject
+            # before creating a durable execution intent; Builder publication
+            # has already completed, so the authored exploit/recipe remains
+            # available for a target-bound command in a later cycle.
+            if (
+                kind in _MANAGED_LOCAL_PWN_TYPED_GATE_KINDS
+                and state.primary_target_id is not None
+            ):
+                reject(
+                    run,
+                    index,
+                    _MANAGED_PWN_REMOTE_TARGET_REJECTION,
+                )
+                return
+
             artifact_bindings: dict[str, dict[str, object]] = {}
             locators: set[str] = set()
             for field in _MANAGED_TYPED_GATE_PATH_FIELDS[kind]:
@@ -4173,13 +4559,13 @@ class ManagedOrchestrator:
                 for artifact_id in item.artifact_ids
             )
         )
-        next_actions = [
-            item.command
+        next_actions = checkpoint_action_references(
+            item
             for item in current.experiments
             if item.status is ExperimentStatus.REGISTERED
-        ][:10]
-        do_not_repeat = [
-            item.command
+        )[:10]
+        do_not_repeat = checkpoint_action_references(
+            item
             for item in selected_experiments
             if item.status
             in {
@@ -4187,7 +4573,7 @@ class ManagedOrchestrator:
                 ExperimentStatus.AWAITING_EVALUATION,
                 ExperimentStatus.FAILED,
             }
-        ]
+        )
         checkpoint = Checkpoint(
             id=checkpoint_id,
             session_id=session_id,
@@ -4204,6 +4590,7 @@ class ManagedOrchestrator:
             artifact_ids=artifact_ids,
             receipt_ids=receipt_ids,
             note=note,
+            extra=checkpoint_action_projection_metadata(),
             failure_capsule=failure_capsule,
         )
 
@@ -4230,7 +4617,8 @@ class ManagedOrchestrator:
                 }
                 wave.status = (
                     "completed"
-                    if statuses == {RunStatus.COMPLETED}
+                    if failure_reason_code is None
+                    and statuses == {RunStatus.COMPLETED}
                     else "invalid"
                 )
                 wave.reduced_at = utc_now()
@@ -4509,6 +4897,37 @@ class ManagedOrchestrator:
             expected_revision=current.revision,
         )
 
+    def _pause_active_session_after_preflight_block(
+        self,
+        identity: ChallengeIdentity,
+        error: ManagedPreflightBlocked,
+        *,
+        expected_session_id: str | None = None,
+    ) -> ChallengeState | None:
+        """Close owned work when a later preflight can no longer proceed."""
+
+        current = self.engine.store.load(identity)
+        session_id = current.active_managed_session_id
+        if session_id is None:
+            return None
+        if (
+            expected_session_id is not None
+            and session_id != expected_session_id
+        ):
+            raise ManagedError(
+                "managed preflight block changed the active session"
+            ) from error
+        self._finish_session(
+            identity,
+            session_id,
+            status=SessionStatus.PAUSED,
+            reason=str(error),
+            challenge_target=ChallengeStatus.PAUSED,
+        )
+        # Preserve any already-written provider result while terminalizing an
+        # undispatched reservation or unfinished cycle as interrupted.
+        return self.reconcile(identity)
+
     def cancel_session(
         self,
         identity: ChallengeIdentity,
@@ -4547,14 +4966,24 @@ class ManagedOrchestrator:
         root = self.engine.store.challenge_paths(identity).root
         terminal_paths: dict[
             str,
-            tuple[str, str, str, RunStatus, bool],
+            tuple[
+                str,
+                str,
+                str,
+                RunStatus,
+                bool,
+                dict[str, Any],
+            ],
         ] = {}
         for run in orphaned:
             paths = self.engine.store.run_paths(identity, run_id=run.id)
             if not paths.root.exists():
                 paths.root.mkdir(parents=True, mode=0o700)
             paths.raw.mkdir(mode=0o700, exist_ok=True)
-            if not paths.request.exists():
+            request_was_missing = not paths.request.exists()
+            result_was_missing = not paths.result.exists()
+            validation_was_missing = not paths.validation.exists()
+            if request_was_missing:
                 atomic_write_json(
                     paths.request,
                     {
@@ -4570,15 +4999,168 @@ class ManagedOrchestrator:
                 )
             recovered_status = RunStatus.INTERRUPTED
             recovered_from_result = False
+            result_record: Mapping[str, Any] | None = None
+            recovery_document_errors: list[str] = [
+                label
+                for missing, label in (
+                    (request_was_missing, "request.missing"),
+                    (result_was_missing, "result.missing"),
+                    (validation_was_missing, "validation.missing"),
+                )
+                if missing
+            ]
+
+            def require_document_fields(
+                label: str,
+                record: Mapping[str, Any],
+                expected: Mapping[str, Any],
+            ) -> None:
+                for field, value in expected.items():
+                    observed = record.get(field)
+                    if (
+                        type(observed) is not type(value)
+                        or observed != value
+                    ):
+                        recovery_document_errors.append(
+                            f"{label}.{field}_mismatch"
+                        )
+
+            try:
+                request_record = read_json(paths.request)
+                if not isinstance(request_record, Mapping):
+                    recovery_document_errors.append(
+                        "request.not_an_object"
+                    )
+                else:
+                    recovery_document_errors.extend(
+                        managed_request_binding_errors(
+                            request_record,
+                            identity=identity,
+                            run=run,
+                        )
+                    )
+            except (OSError, StrictJSONError, TypeError, ValueError):
+                recovery_document_errors.append("request.invalid_json")
+
             if paths.result.exists() and paths.validation.exists():
                 try:
-                    result_record = read_json(paths.result)
+                    loaded_result_record = read_json(paths.result)
                     validation_record = read_json(paths.validation)
+                    if not isinstance(loaded_result_record, Mapping):
+                        recovery_document_errors.append(
+                            "result.not_an_object"
+                        )
+                    else:
+                        result_record = loaded_result_record
+                        require_document_fields(
+                            "result",
+                            result_record,
+                            {
+                                "schema_version": (
+                                    WORKER_RESULT_SCHEMA_VERSION
+                                ),
+                                "contest_id": identity.contest_id,
+                                "category": identity.category,
+                                "challenge_id": identity.challenge_id,
+                                "run_id": run.id,
+                                "base_revision": run.base_revision,
+                            },
+                        )
+                        if (
+                        "configuration_epoch" in result_record
+                            and (
+                                type(
+                                    result_record.get(
+                                        "configuration_epoch"
+                                    )
+                                )
+                                is not int
+                                or result_record.get(
+                                    "configuration_epoch"
+                                )
+                                != run.configuration_epoch
+                            )
+                        ):
+                            recovery_document_errors.append(
+                                "result.configuration_epoch_mismatch"
+                            )
+                        if (
+                            "role" in result_record
+                            and result_record.get("role") != run.role
+                        ):
+                            recovery_document_errors.append(
+                                "result.role_mismatch"
+                            )
+                        expected_contract_version = run.extra.get(
+                            "contract_version"
+                        )
+                        if (
+                            "role_contract_version" in result_record
+                            and type(expected_contract_version) is int
+                            and (
+                                type(
+                                    result_record.get(
+                                        "role_contract_version"
+                                    )
+                                )
+                                is not int
+                                or result_record.get(
+                                    "role_contract_version"
+                                )
+                                != expected_contract_version
+                            )
+                        ):
+                            recovery_document_errors.append(
+                                "result.contract_version_mismatch"
+                            )
+                        if "attempt_count" in result_record and (
+                            type(result_record.get("attempt_count")) is not int
+                            or result_record.get("attempt_count") < 0
+                        ):
+                            recovery_document_errors.append(
+                                "result.attempt_count_invalid"
+                            )
+                    if not isinstance(validation_record, Mapping):
+                        recovery_document_errors.append(
+                            "validation.not_an_object"
+                        )
+                    else:
+                        require_document_fields(
+                            "validation",
+                            validation_record,
+                            {
+                                "run_id": run.id,
+                                "base_revision": run.base_revision,
+                            },
+                        )
+                        for field, value in (
+                            ("contest_id", identity.contest_id),
+                            ("category", identity.category),
+                            ("challenge_id", identity.challenge_id),
+                            (
+                                "configuration_epoch",
+                                run.configuration_epoch,
+                            ),
+                        ):
+                            if (
+                                field in validation_record
+                                and (
+                                    type(validation_record.get(field))
+                                    is not type(value)
+                                    or validation_record.get(field) != value
+                                )
+                            ):
+                                recovery_document_errors.append(
+                                    f"validation.{field}_mismatch"
+                                )
+                        if type(validation_record.get("ok")) is not bool:
+                            recovery_document_errors.append(
+                                "validation.ok_invalid"
+                            )
+
                     if (
                         isinstance(result_record, Mapping)
                         and isinstance(validation_record, Mapping)
-                        and result_record.get("run_id") == run.id
-                        and validation_record.get("run_id") == run.id
                     ):
                         terminal = result_record.get("managed_terminal")
                         status_value = (
@@ -4591,17 +5173,34 @@ class ManagedOrchestrator:
                             is True
                             else None
                         )
-                        candidate_status = RunStatus(str(status_value))
-                        if candidate_status in _TERMINAL_RUN_STATUSES:
-                            recovered_status = candidate_status
-                            recovered_from_result = True
-                        if (
-                            recovered_status is RunStatus.COMPLETED
-                            and validation_record.get("ok") is not True
-                        ):
-                            recovered_status = RunStatus.INVALID
-                except (OSError, TypeError, ValueError):
-                    recovered_status = RunStatus.INTERRUPTED
+                        try:
+                            candidate_status = RunStatus(
+                                str(status_value)
+                            )
+                        except ValueError:
+                            recovery_document_errors.append(
+                                "result.terminal_status_invalid"
+                            )
+                        else:
+                            if candidate_status not in _TERMINAL_RUN_STATUSES:
+                                recovery_document_errors.append(
+                                    "result.terminal_status_invalid"
+                                )
+                            elif (
+                                validation_record.get("ok") is True
+                            ) != (
+                                candidate_status is RunStatus.COMPLETED
+                            ):
+                                recovery_document_errors.append(
+                                    "validation.result_status_mismatch"
+                                )
+                            elif not recovery_document_errors:
+                                recovered_status = candidate_status
+                                recovered_from_result = True
+                except (OSError, StrictJSONError, TypeError, ValueError):
+                    recovery_document_errors.append(
+                        "result_or_validation.invalid_json"
+                    )
             if not paths.result.exists():
                 self.engine.store.write_run_result(
                     identity,
@@ -4625,12 +5224,231 @@ class ManagedOrchestrator:
                         "error_type": "ManagedRecovery",
                     },
                 )
+
+            provider_path = paths.root / "provider.json"
+            provider_record: dict[str, Any] = {}
+            provider_record_existed = provider_path.exists()
+            if provider_record_existed:
+                try:
+                    loaded_provider_record = read_json(provider_path)
+                except (OSError, StrictJSONError) as error:
+                    raise ManagedError(
+                        f"managed provider recovery record is invalid: {run.id}"
+                    ) from error
+                if not isinstance(loaded_provider_record, Mapping):
+                    raise ManagedError(
+                        f"managed provider recovery record is invalid: {run.id}"
+                    )
+                provider_record = dict(loaded_provider_record)
+                recorded_schema_version = provider_record.get(
+                    "schema_version"
+                )
+                if (
+                    recorded_schema_version is not None
+                    and (
+                        type(recorded_schema_version) is not int
+                        or recorded_schema_version != 1
+                    )
+                ):
+                    raise ManagedError(
+                        "managed provider recovery schema version is invalid: "
+                        f"{run.id}"
+                    )
+                recorded_run_id = provider_record.get("run_id")
+                if recorded_run_id is not None and (
+                    type(recorded_run_id) is not str
+                    or recorded_run_id != run.id
+                ):
+                    raise ManagedError(
+                        f"managed provider recovery run id mismatch: {run.id}"
+                    )
+                recorded_configuration_epoch = provider_record.get(
+                    "configuration_epoch"
+                )
+                if (
+                    recorded_configuration_epoch is not None
+                    and (
+                        type(recorded_configuration_epoch) is not int
+                        or recorded_configuration_epoch
+                        != run.configuration_epoch
+                    )
+                ):
+                    raise ManagedError(
+                        "managed provider recovery configuration epoch "
+                        f"mismatch: {run.id}"
+                    )
+
+                existing_provider_status = provider_record.get("status")
+                terminal_provider_statuses = {
+                    item.value for item in _TERMINAL_RUN_STATUSES
+                }
+                if (
+                    type(existing_provider_status) is not str
+                    or existing_provider_status
+                    not in {"running", *terminal_provider_statuses}
+                ):
+                    recovery_document_errors.append(
+                        "provider.status_invalid"
+                    )
+                    recovered_status = RunStatus.INTERRUPTED
+                    recovered_from_result = False
+                elif (
+                    existing_provider_status != "running"
+                    and existing_provider_status != recovered_status.value
+                ):
+                    recovery_document_errors.append(
+                        "provider.result_status_mismatch"
+                    )
+                    recovered_status = RunStatus.INTERRUPTED
+                    recovered_from_result = False
+
+            recorded_started = provider_record.get("provider_started")
+            if recorded_started is not None and type(recorded_started) is not bool:
+                raise ManagedError(
+                    f"managed provider recovery start marker is invalid: {run.id}"
+                )
+            provider_started = (
+                recorded_started
+                if type(recorded_started) is bool
+                else provider_record.get("status") == "running"
+                and isinstance(provider_record.get("started_at"), str)
+            )
+            if provider_record_existed:
+                started_at = provider_record.get("started_at")
+                if (
+                    provider_started
+                    and (
+                        not isinstance(started_at, str)
+                        or not started_at
+                    )
+                ) or (not provider_started and started_at is not None):
+                    recovery_document_errors.append(
+                        "provider.start_binding_invalid"
+                    )
+                    recovered_status = RunStatus.INTERRUPTED
+                    recovered_from_result = False
+                    provider_started = False
+
+            def recovered_seconds(field: str) -> float | None:
+                value = provider_record.get(field)
+                if value is None:
+                    return None
+                if (
+                    type(value) not in {int, float}
+                    or not math.isfinite(float(value))
+                    or float(value) < 0
+                ):
+                    raise ManagedError(
+                        "managed provider recovery timing is invalid: "
+                        f"{run.id}:{field}"
+                    )
+                return float(value)
+
+            timing_metadata = {
+                field: recovered_seconds(field)
+                for field in (
+                    "provider_wait_seconds",
+                    "provider_process_span_seconds",
+                    "model_call_wall_seconds",
+                )
+            }
+            attempt_count = provider_record.get("attempt_count")
+            result_attempt_count = (
+                result_record.get("attempt_count")
+                if isinstance(result_record, Mapping)
+                else None
+            )
+            if (
+                attempt_count is not None
+                and result_attempt_count is not None
+                and (
+                    type(result_attempt_count) is not int
+                    or type(attempt_count) is not int
+                    or attempt_count != result_attempt_count
+                )
+            ):
+                recovery_document_errors.append(
+                    "provider.result_attempt_count_mismatch"
+                )
+                recovered_status = RunStatus.INTERRUPTED
+                recovered_from_result = False
+                attempt_count = None
+            if (
+                attempt_count is None
+                and recovered_from_result
+                and result_record is not None
+            ):
+                attempt_count = result_record.get("attempt_count")
+            if attempt_count is not None and (
+                type(attempt_count) is not int or attempt_count < 0
+            ):
+                raise ManagedError(
+                    f"managed provider recovery attempt count is invalid: {run.id}"
+                )
+            existing_provider_status = provider_record.get("status")
+            existing_finished_at = provider_record.get("finished_at")
+            provider_completed_at = (
+                existing_finished_at
+                if existing_provider_status != "running"
+                and isinstance(existing_finished_at, str)
+                and existing_finished_at
+                else utc_now()
+            )
+            provider_record.update(
+                {
+                    "schema_version": 1,
+                    "status": recovered_status.value,
+                    "run_id": run.id,
+                    "configuration_epoch": run.configuration_epoch,
+                    "started_at": (
+                        provider_record.get("started_at")
+                        if provider_started
+                        else None
+                    ),
+                    "finished_at": provider_completed_at,
+                    "provider_started": provider_started,
+                    "provider_wait_seconds": timing_metadata[
+                        "provider_wait_seconds"
+                    ],
+                    "provider_process_span_seconds": timing_metadata[
+                        "provider_process_span_seconds"
+                    ],
+                    "model_call_wall_seconds": timing_metadata[
+                        "model_call_wall_seconds"
+                    ],
+                    "attempt_count": attempt_count,
+                    "recovered_by": "managed_reconcile",
+                }
+            )
+            atomic_write_json(provider_path, provider_record)
+            recovery_extra: dict[str, Any] = {
+                "provider_started": provider_started,
+                "provider_outcome_status": recovered_status.value,
+                "provider_completed_at": provider_completed_at,
+                "request_sha256": sha256_file(paths.request),
+                "result_sha256": sha256_file(paths.result),
+                "validation_sha256": sha256_file(paths.validation),
+            }
+            if attempt_count is not None:
+                recovery_extra["attempt_count"] = attempt_count
+            if recovery_document_errors:
+                recovery_extra[
+                    "recovery_document_validation_errors"
+                ] = list(dict.fromkeys(recovery_document_errors))
+            recovery_extra.update(
+                {
+                    field: value
+                    for field, value in timing_metadata.items()
+                    if value is not None
+                }
+            )
             terminal_paths[run.id] = (
                 str(paths.request.relative_to(root)),
                 str(paths.result.relative_to(root)),
                 str(paths.validation.relative_to(root)),
                 recovered_status,
                 recovered_from_result,
+                recovery_extra,
             )
 
         if terminal_paths:
@@ -4647,6 +5465,7 @@ class ManagedOrchestrator:
                         validation_path,
                         recovered_status,
                         recovered_from_result,
+                        recovery_extra,
                     ) = paths
                     stale = (
                         run.configuration_epoch
@@ -4669,6 +5488,7 @@ class ManagedOrchestrator:
                     run.extra["recovered_from_durable_result"] = (
                         recovered_from_result
                     )
+                    run.extra.update(recovery_extra)
 
             state = self.engine.store.update(
                 identity,
@@ -4760,6 +5580,26 @@ class ManagedOrchestrator:
             interrupt_unfinished,
             expected_revision=current.revision,
         )
+
+    def reconcile_explicit(
+        self,
+        identity: ChallengeIdentity,
+    ) -> tuple[ChallengeState, ChallengeState]:
+        """Reconcile one operator-selected challenge only while it is idle."""
+
+        paths = self.engine.store.challenge_paths(identity)
+        lock = ChallengeLock(paths.runtime / "session.lock", timeout=0)
+        try:
+            lock.acquire()
+        except LockTimeout as error:
+            raise SessionAlreadyRunning(
+                f"another session already owns {identity.key}"
+            ) from error
+        try:
+            before = self.engine.store.read_snapshot(identity)
+            return before, self.reconcile(identity)
+        finally:
+            lock.release()
 
     def _checkpoint_invalid_cycle(
         self,
@@ -4899,12 +5739,15 @@ class ManagedOrchestrator:
                 _resume_thread_id=captain_resume_thread,
             )
             if not captain.completed or not captain.validation.valid:
+                reason_code, reason = _captain_failure_checkpoint_reason(
+                    captain
+                )
                 return self._checkpoint_invalid_cycle(
                     identity,
                     selected_session,
                     cycle.id,
-                    reason_code="captain_contract_invalid",
-                    reason="Captain result was not contract-valid",
+                    reason_code=reason_code,
+                    reason=reason,
                     note=note,
                 )
             latest = self.engine.store.load(identity)
@@ -4940,6 +5783,23 @@ class ManagedOrchestrator:
                     note=note,
                 )
             wave_name = self._wave_name(captain.output)
+            try:
+                self._bind_captain_registered_experiment(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    captain.output,
+                    next_stage=wave_name,
+                )
+            except ManagedRegisteredExperimentReferenceError as error:
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason_code="registered_action_reference_invalid",
+                    reason=str(error),
+                    note=note,
+                )
             try:
                 _state, wave, role_runs = self._reserve_wave(
                     identity,
@@ -4993,6 +5853,12 @@ class ManagedOrchestrator:
                 _semantic_barrier=True,
                 _managed_workspace=True,
                 _resume_thread_ids=wave_resume_threads,
+                # The managed cycle's bounded evidence unit includes the
+                # selected tool actions.  Evaluating the governor here can
+                # mark the challenge STALLED before those actions run, and
+                # the following preflight would then block the evidence that
+                # could resolve the stall.
+                _record_stall=False,
             )
             latest = self.engine.store.load(identity)
             self._require_epoch(latest, selected_session)
@@ -5058,6 +5924,15 @@ class ManagedOrchestrator:
             self._require_epoch(latest, selected_session)
             try:
                 selected = self._select_actions(latest, wave)
+            except ManagedRegisteredExperimentReferenceError as error:
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason_code="registered_action_reference_invalid",
+                    reason=str(error),
+                    note=note,
+                )
             except ManagedError:
                 return self._checkpoint_invalid_cycle(
                     identity,
@@ -5098,6 +5973,12 @@ class ManagedOrchestrator:
                         ),
                         note=note,
                     )
+            else:
+                # With no selected actions, the completed logical-role wave
+                # itself is the bounded evidence unit.
+                self.engine._record_stall_if_needed(
+                    self.engine.store.load(identity)
+                )
             state = self._checkpoint_selected_actions(
                 identity,
                 selected_session,
@@ -5106,6 +5987,20 @@ class ManagedOrchestrator:
                 selected,
                 note=note,
             )
+            if state.status in {
+                ChallengeStatus.STALLED,
+                ChallengeStatus.PAUSED,
+                ChallengeStatus.NEEDS_HUMAN,
+            }:
+                return self._finish_session(
+                    identity,
+                    selected_session,
+                    status=SessionStatus.PAUSED,
+                    reason=(
+                        f"challenge reached {state.status.value} after the "
+                        "bounded action wave"
+                    ),
+                )
             if state.status in {
                 ChallengeStatus.READY_TO_SUBMIT,
                 ChallengeStatus.SOLVED,
@@ -5126,6 +6021,15 @@ class ManagedOrchestrator:
                 reason="operator interrupt",
                 challenge_target=ChallengeStatus.PAUSED,
             )
+            raise
+        except ManagedPreflightBlocked as error:
+            paused = self._pause_active_session_after_preflight_block(
+                identity,
+                error,
+                expected_session_id=selected_session,
+            )
+            if paused is not None:
+                return paused
             raise
         except BaseException as error:
             try:
@@ -5167,12 +6071,22 @@ class ManagedOrchestrator:
             ) from error
         try:
             self.engine.refresh_ingest(identity)
-            return self._run_cycle_owned(
-                identity,
-                session_id=session_id,
-                note=note,
-                thread_continuity_policy=thread_continuity_policy,
-            )
+            try:
+                return self._run_cycle_owned(
+                    identity,
+                    session_id=session_id,
+                    note=note,
+                    thread_continuity_policy=thread_continuity_policy,
+                )
+            except ManagedPreflightBlocked as error:
+                paused = self._pause_active_session_after_preflight_block(
+                    identity,
+                    error,
+                    expected_session_id=session_id,
+                )
+                if paused is not None:
+                    return paused
+                raise
         finally:
             lock.release()
 
@@ -5199,12 +6113,24 @@ class ManagedOrchestrator:
         try:
             self.engine.refresh_ingest(identity)
             for _ in range(max_cycles):
-                state = self._run_cycle_owned(
-                    identity,
-                    session_id=selected_session,
-                    note=note,
-                    thread_continuity_policy=thread_continuity_policy,
-                )
+                try:
+                    state = self._run_cycle_owned(
+                        identity,
+                        session_id=selected_session,
+                        note=note,
+                        thread_continuity_policy=thread_continuity_policy,
+                    )
+                except ManagedPreflightBlocked as error:
+                    paused = (
+                        self._pause_active_session_after_preflight_block(
+                            identity,
+                            error,
+                            expected_session_id=selected_session,
+                        )
+                    )
+                    if paused is None:
+                        raise
+                    return paused
                 selected_session = state.active_managed_session_id
                 if state.status in _STOP_STATUSES:
                     return state

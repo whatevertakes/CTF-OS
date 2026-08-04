@@ -34,7 +34,12 @@ from ctf_os.store.atomic import canonical_json_bytes, strict_json_loads
 
 NYU_STAGE_RESULT_SCHEMA_VERSION = 1
 NYU_PARTIAL_MANIFEST_KIND = "nyu_ctf_bench_partial_promotion"
-NYU_DATASET_FILE = "test_dataset.json"
+NYU_SOURCE_DATASETS = ("test", "development")
+NYU_DATASET_FILES = {
+    "test": "test_dataset.json",
+    "development": "development_dataset.json",
+}
+NYU_DATASET_FILE = NYU_DATASET_FILES["test"]
 NYU_PUBLIC_METADATA_FILE = "nyu_public_metadata.json"
 NYU_CATEGORIES = frozenset({"pwn", "web", "rev", "crypto", "forensics", "misc"})
 NYU_PROMOTION_SPLITS = frozenset({"dev", "regression", "blind", "live", "hidden"})
@@ -48,6 +53,8 @@ MAX_CASE_FILE_BYTES = 256 * 1024 * 1024
 MAX_PUBLIC_TEXT_BYTES = 256 * 1024
 MAX_PUBLIC_METADATA_BYTES = 512 * 1024
 MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
+# Explicit public-blob reads may use this cap; ordinary Git queries stay smaller.
+MAX_PUBLIC_ASSET_BYTES = 32 * 1024 * 1024
 GIT_QUERY_TIMEOUT_SECONDS = 30.0
 _GIT_READ_CHUNK_BYTES = 64 * 1024
 _OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -70,7 +77,7 @@ _SENSITIVE_BASENAMES = frozenset(
 _FORBIDDEN_PUBLIC_BASENAMES = frozenset(
     {
         "challenge.json",
-        NYU_DATASET_FILE.casefold(),
+        *(name.casefold() for name in NYU_DATASET_FILES.values()),
         NYU_PUBLIC_METADATA_FILE.casefold(),
     }
 )
@@ -451,7 +458,25 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _git_query(source_root: Path, *arguments: str, label: str) -> bytes:
+def _git_query(
+    source_root: Path,
+    *arguments: str,
+    label: str,
+    maximum_stdout_bytes: int | None = None,
+) -> bytes:
+    stdout_limit = (
+        MAX_GIT_OUTPUT_BYTES
+        if maximum_stdout_bytes is None
+        else maximum_stdout_bytes
+    )
+    stderr_limit = MAX_GIT_OUTPUT_BYTES
+    if (
+        type(stdout_limit) is not int
+        or not 0 < stdout_limit <= MAX_PUBLIC_ASSET_BYTES
+        or type(stderr_limit) is not int
+        or not 0 < stderr_limit <= MAX_PUBLIC_ASSET_BYTES
+    ):
+        raise NYUStageError(f"{label} has an invalid output bound")
     process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
     succeeded = False
@@ -482,12 +507,12 @@ def _git_query(source_root: Path, *arguments: str, label: str) -> bytes:
         selector.register(
             process.stdout,
             selectors.EVENT_READ,
-            stdout_payload,
+            (stdout_payload, stdout_limit),
         )
         selector.register(
             process.stderr,
             selectors.EVENT_READ,
-            stderr_payload,
+            (stderr_payload, stderr_limit),
         )
         deadline = time.monotonic() + GIT_QUERY_TIMEOUT_SECONDS
         while selector.get_map():
@@ -502,12 +527,10 @@ def _git_query(source_root: Path, *arguments: str, label: str) -> bytes:
                 raise subprocess.TimeoutExpired(
                     process.args,
                     GIT_QUERY_TIMEOUT_SECONDS,
-                )
+            )
             for key, _mask in ready:
-                target = key.data
-                remaining_capacity = (
-                    MAX_GIT_OUTPUT_BYTES + 1 - len(target)
-                )
+                target, output_limit = key.data
+                remaining_capacity = output_limit + 1 - len(target)
                 chunk = os.read(
                     key.fileobj.fileno(),
                     min(_GIT_READ_CHUNK_BYTES, remaining_capacity),
@@ -516,7 +539,7 @@ def _git_query(source_root: Path, *arguments: str, label: str) -> bytes:
                     selector.unregister(key.fileobj)
                     continue
                 target.extend(chunk)
-                if len(target) > MAX_GIT_OUTPUT_BYTES:
+                if len(target) > output_limit:
                     raise NYUStageError(f"{label} failed")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -748,24 +771,25 @@ def _selected_cases(
     source_root: Path,
     requested_case_ids: tuple[str, ...],
     *,
+    dataset_file: str,
     release_commit: str,
     object_format: str,
 ) -> tuple[_SelectedCase, ...]:
     dataset = _load_json_payload(
         _read_committed_regular(
             source_root,
-            source_root / NYU_DATASET_FILE,
-            repository_path=NYU_DATASET_FILE,
+            source_root / dataset_file,
+            repository_path=dataset_file,
             release_commit=release_commit,
             object_format=object_format,
             maximum=MAX_DATASET_BYTES,
-            label=NYU_DATASET_FILE,
+            label=dataset_file,
         ),
         maximum=MAX_DATASET_BYTES,
-        label=NYU_DATASET_FILE,
+        label=dataset_file,
     )
     if type(dataset) is not dict or not 1 <= len(dataset) <= MAX_DATASET_CASES:
-        raise NYUStageError(f"{NYU_DATASET_FILE} must be a bounded non-empty object")
+        raise NYUStageError(f"{dataset_file} must be a bounded non-empty object")
     selected: list[_SelectedCase] = []
     for case_id in sorted(requested_case_ids):
         entry = dataset.get(case_id)
@@ -1169,6 +1193,7 @@ def stage_nyu_ctf_bench(
     wall_seconds: int,
     model_call_limit: int,
     total_token_limit: int,
+    source_dataset: str = "test",
 ) -> dict[str, object]:
     """Stage one explicitly selected NYU split without starting any session."""
 
@@ -1178,6 +1203,11 @@ def stage_nyu_ctf_bench(
     contest = _safe_identifier(contest, "--contest")
     if split not in NYU_PROMOTION_SPLITS:
         raise NYUStageError("--split is not a promotion split")
+    if type(source_dataset) is not str or source_dataset not in NYU_DATASET_FILES:
+        raise NYUStageError(
+            "--source-dataset must be one of: " + ", ".join(NYU_SOURCE_DATASETS)
+        )
+    dataset_file = NYU_DATASET_FILES[source_dataset]
     for value, label in (
         (wall_seconds, "wall_seconds"),
         (model_call_limit, "model_call_limit"),
@@ -1213,6 +1243,7 @@ def stage_nyu_ctf_bench(
     selected = _selected_cases(
         source_root,
         requested,
+        dataset_file=dataset_file,
         release_commit=release_commit,
         object_format=object_format,
     )
@@ -1373,7 +1404,7 @@ def stage_nyu_ctf_bench(
             "partial_manifest": True,
             "promotion_ready": False,
             "source_release_commit": release_commit,
-            "source_dataset": NYU_DATASET_FILE,
+            "source_dataset": dataset_file,
             "selected_split": split,
             "selected_case_ids": [case.case_id for case in selected],
             "automatic_challenge_start": False,

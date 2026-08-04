@@ -3,6 +3,32 @@ from __future__ import annotations
 from .base import ExperimentSpec, GenericAdapter, ProgressMarker, ProofPolicy
 
 
+_PRIMARY_MAGIC = (
+    "set -eu; target=$1; "
+    "if [ -L \"$target\" ]; then "
+    "printf '%s\\n' 'ctfos_primary_magic_error=symlink_source_binding' "
+    ">&2; exit 2; fi; "
+    "if [ ! -f \"$target\" ]; then "
+    "printf '%s\\n' 'ctfos_primary_magic_mode=skipped' "
+    "'ctfos_primary_magic_reason=no_regular_source_binding'; "
+    "exit 0; fi; "
+    "exec /usr/bin/file --brief --mime-type -- \"$target\""
+)
+
+_PRIMARY_STRINGS = (
+    "set -eu; target=$1; "
+    "if [ -L \"$target\" ]; then "
+    "printf '%s\\n' 'ctfos_primary_strings_error=symlink_source_binding' "
+    ">&2; exit 2; fi; "
+    "if [ ! -f \"$target\" ]; then "
+    "printf '%s\\n' 'ctfos_primary_strings_mode=skipped' "
+    "'ctfos_primary_strings_reason=no_regular_source_binding'; "
+    "exit 0; fi; "
+    "/usr/bin/strings -a -n 6 -- \"$target\" "
+    "| /usr/bin/head -c 65536"
+)
+
+
 class MiscAdapter(GenericAdapter):
     """Evidence-diverse intake for challenges whose modality is not known yet."""
 
@@ -47,10 +73,10 @@ class MiscAdapter(GenericAdapter):
                 "primary_magic",
                 "identify the primary artifact independently by libmagic",
                 (
-                    "/usr/bin/file",
-                    "--brief",
-                    "--mime-type",
-                    "--",
+                    "/bin/sh",
+                    "-lc",
+                    _PRIMARY_MAGIC,
+                    "ctfos-misc-primary-magic",
                     "{primary}",
                 ),
                 "one bounded MIME classification for the primary artifact",
@@ -71,8 +97,7 @@ class MiscAdapter(GenericAdapter):
                 (
                     "/bin/sh",
                     "-lc",
-                    "set -eu; /usr/bin/strings -a -n 6 -- \"$1\" "
-                    "| /usr/bin/head -c 65536",
+                    _PRIMARY_STRINGS,
                     "ctfos-misc-primary-strings",
                     "{primary}",
                 ),

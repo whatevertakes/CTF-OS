@@ -70,12 +70,16 @@ from ctf_os.migration import (
 )
 from ctf_os.models import (
     ChallengeIdentity,
+    ChallengeState,
     ChallengeStatus,
     ExperimentStatus,
     HypothesisStatus,
     Provenance,
+    RunOrigin,
+    RunStatus,
 )
-from ctf_os.nyu_stage import stage_nyu_ctf_bench
+from ctf_os.nyu_stage import NYU_SOURCE_DATASETS, stage_nyu_ctf_bench
+from ctf_os.operator_hash_verifier import verify_candidate
 from ctf_os.promotion_bundles import (
     capture_promotion_session,
     evaluate_promotion_bundles,
@@ -111,6 +115,18 @@ class CLIError(RuntimeError):
 
 
 MAX_PROMOTION_EVIDENCE_BYTES = 16 * 1024 * 1024
+MAX_RECONCILE_REPORT_RUN_IDS = 256
+
+_RECONCILE_TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.INVALID,
+        RunStatus.FAILED,
+        RunStatus.TIMED_OUT,
+        RunStatus.CANCELLED,
+        RunStatus.INTERRUPTED,
+    }
+)
 
 
 def _rev_runtime_timeout_argument(value: str) -> int:
@@ -757,6 +773,59 @@ def _print_json(value: object) -> None:
     )
 
 
+def _managed_reconcile_report(
+    before: ChallengeState,
+    after: ChallengeState,
+) -> dict[str, Any]:
+    """Return one bounded summary of an explicit challenge reconciliation."""
+
+    before_runs = {
+        run.id: run
+        for run in before.runs
+        if run.origin is RunOrigin.MANAGED_MODEL
+        and run.status not in _RECONCILE_TERMINAL_RUN_STATUSES
+    }
+    recovered_run_ids = sorted(
+        run.id
+        for run in after.runs
+        if run.id in before_runs
+        and run.status in _RECONCILE_TERMINAL_RUN_STATUSES
+        and run.extra.get("reconciled_at") is not None
+    )
+    displayed_run_ids = recovered_run_ids[
+        :MAX_RECONCILE_REPORT_RUN_IDS
+    ]
+    targets_changed = (
+        before.targets != after.targets
+        or before.primary_target_id != after.primary_target_id
+    )
+    submissions_changed = before.submissions != after.submissions
+    return {
+        "schema_version": 1,
+        "kind": "managed_challenge_reconcile",
+        "identity": after.identity.to_dict(),
+        "identity_key": after.identity.key,
+        "before_revision": before.revision,
+        "before_status": before.status.value,
+        "after_revision": after.revision,
+        "after_status": after.status.value,
+        "no_op": (
+            before.revision == after.revision
+            and before.status is after.status
+        ),
+        "recovered_run_count": len(recovered_run_ids),
+        "recovered_run_ids": displayed_run_ids,
+        "recovered_run_ids_omitted": (
+            len(recovered_run_ids) - len(displayed_run_ids)
+        ),
+        "model_calls_started": False,
+        "tools_executed": False,
+        "targets_changed": targets_changed,
+        "submissions_changed": submissions_changed,
+        "flags_submitted": len(after.submissions) > len(before.submissions),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ctfos",
@@ -962,6 +1031,13 @@ def build_parser() -> argparse.ArgumentParser:
     note_group.add_argument("--note-file", type=Path)
     managed_cycle.add_argument("--json", action="store_true")
 
+    reconcile = commands.add_parser(
+        "reconcile",
+        help="사람이 선택한 문제 하나의 orphan managed 상태만 보수적으로 복구",
+    )
+    _identity_values(reconcile)
+    reconcile.add_argument("--json", action="store_true")
+
     run = commands.add_parser(
         "run-challenge", help="결정적 Captain/3-role Batch 실행"
     )
@@ -998,6 +1074,23 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    cancel_stale = commands.add_parser(
+        "cancel-stale-experiments",
+        help=(
+            "operator-selected REGISTERED remote experiments whose exact "
+            "target/configuration pins are stale"
+        ),
+    )
+    _identity_values(cancel_stale)
+    cancel_stale.add_argument(
+        "--experiment",
+        dest="experiment_ids",
+        action="append",
+        required=True,
+        help="exact stale REGISTERED experiment id (repeatable)",
+    )
+    cancel_stale.add_argument("--reason", required=True)
+
     migrate = commands.add_parser("migrate", help="explicit state migration")
     migrate.add_argument(
         "migration_command",
@@ -1027,6 +1120,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="benchmark_command",
         required=True,
     )
+    ctftiny_verify = benchmark_commands.add_parser(
+        "ctftiny-verify",
+        help=(
+            "private hash reference로 canonical CTFTiny 후보를 읽기 전용 검증"
+        ),
+    )
+    _identity_values(ctftiny_verify)
+    ctftiny_verify.add_argument("--candidate-id", required=True)
+    ctftiny_verify.add_argument("--reference", type=Path, required=True)
     promotion = benchmark_commands.add_parser(
         "promotion",
         help="blind/live promotion evidence를 fail-closed로 평가",
@@ -1154,6 +1256,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="checkout HEAD와 정확히 같아야 하는 full Git object ID",
     )
     nyu_stage.add_argument(
+        "--source-dataset",
+        choices=NYU_SOURCE_DATASETS,
+        default="test",
+        help=(
+            "official source dataset selector: test_dataset.json(default) or "
+            "development_dataset.json"
+        ),
+    )
+    nyu_stage.add_argument(
         "--case",
         dest="cases",
         action="append",
@@ -1220,9 +1331,20 @@ def build_parser() -> argparse.ArgumentParser:
     _identity_values(wave)
     wave.add_argument("wave", choices=("discovery", "attack", "proof"))
 
-    pause = commands.add_parser("pause")
+    pause = commands.add_parser(
+        "pause",
+        help="문제를 일시정지하고 선택적으로 JSON handoff 파일 기록",
+    )
     _identity_values(pause)
-    pause.add_argument("--handoff", type=Path)
+    pause.add_argument(
+        "--handoff",
+        type=Path,
+        metavar="JSON_PATH",
+        help=(
+            "handoff 문구가 아닌 출력 JSON 파일 경로; 예측 가능한 "
+            "경로 오류는 상태 변경 전에 거부"
+        ),
+    )
     resume = commands.add_parser("resume")
     _identity_values(resume)
 
@@ -1980,6 +2102,17 @@ def main(
             return 0
 
         if args.command == "benchmark":
+            if args.benchmark_command == "ctftiny-verify":
+                result = verify_candidate(
+                    workspace_root=workspace,
+                    identity=_identity(args),
+                    candidate_id=args.candidate_id,
+                    reference_path=args.reference,
+                )
+                _print_json(result.to_dict())
+                if result.error is not None:
+                    return 2
+                return 0 if result.matched else 1
             if args.benchmark_command == "promotion":
                 payload = _read_bounded_regular_bytes(
                     args.evidence,
@@ -2060,6 +2193,7 @@ def main(
                         wall_seconds=args.budget_wall_seconds,
                         model_call_limit=args.budget_model_calls,
                         total_token_limit=args.budget_tokens,
+                        source_dataset=args.source_dataset,
                     )
                 )
                 return 0
@@ -2384,6 +2518,37 @@ def main(
                     print(f"- {terminal_safe(issue)}")
             return 0 if report.ok else 2
 
+        if args.command == "reconcile":
+            identity = _identity(args)
+            before, after = ManagedOrchestrator(engine).reconcile_explicit(
+                identity
+            )
+            report = _managed_reconcile_report(before, after)
+            if args.json:
+                _print_json(report)
+            else:
+                print(
+                    "managed reconcile: "
+                    f"{terminal_safe(report['identity_key'])} "
+                    f"{report['before_status']} rev={report['before_revision']} "
+                    f"-> {report['after_status']} rev={report['after_revision']}"
+                )
+                print(
+                    "recovered managed runs: "
+                    f"{report['recovered_run_count']}"
+                    + (
+                        " (shown="
+                        f"{len(report['recovered_run_ids'])}, "
+                        "omitted="
+                        f"{report['recovered_run_ids_omitted']})"
+                        if report["recovered_run_ids_omitted"]
+                        else ""
+                    )
+                )
+                for run_id in report["recovered_run_ids"]:
+                    print(f"- {terminal_safe(run_id)}")
+            return 0
+
         if args.command == "managed-cycle":
             thread_continuity = _effective_thread_continuity(args)
             note = (
@@ -2451,6 +2616,26 @@ def main(
                 target=ChallengeStatus(args.target),
             )
             print(f"session 취소: {state.status.value} rev={state.revision}")
+            return 0
+
+        if args.command == "cancel-stale-experiments":
+            state, cancelled_ids = engine.cancel_stale_registered_experiments(
+                _identity(args),
+                args.experiment_ids,
+                reason=args.reason,
+            )
+            _print_json(
+                {
+                    "schema_version": 1,
+                    "kind": "operator_stale_experiment_cancellation",
+                    "identity": state.identity.key,
+                    "state_revision": state.revision,
+                    "challenge_status": state.status.value,
+                    "cancelled_experiment_ids": list(cancelled_ids),
+                    "automatic_execution": False,
+                    "automatic_submission": False,
+                }
+            )
             return 0
 
         if args.command == "status":

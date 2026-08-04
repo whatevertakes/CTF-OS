@@ -45,8 +45,18 @@ MAX_RECEIPT_ARTIFACT_ID_CHARS = 256
 MAX_RECEIPT_STRUCTURE_JSON_BYTES = 1536
 MAX_RECEIPT_STRUCTURE_ITEMS = 16
 MAX_RECEIPT_DELIMITED_ROWS = 100_000
+MAX_RECEIPT_SALIENT_LINES = 4
+MAX_RECEIPT_SALIENT_LINE_JSON_CHARS = 240
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SALIENT_TEXT_MARKER = re.compile(
+    r"^(?:SUMMARY|ORACLE|RESULT|RECORD|REC|ERROR|FLAG_CANDIDATE)(?::| )"
+)
+# Keep generated HTML tag keys inside the receipt-state validation contract.
+# ``HTMLParser`` is deliberately best effort over arbitrary challenge output
+# and can interpret source-code fragments such as ``<snail_id; ...>`` as tag
+# names even though they are not safe structured identifiers.
+_HTML_SUMMARY_TAG = re.compile(r"^[a-z0-9:_-]{1,64}$")
 _CREDENTIAL_KEY = CREDENTIAL_KEY_PATTERN
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?im)"
@@ -354,6 +364,27 @@ def _bounded_json_text(
     return value[:low] + suffix, True
 
 
+def _bounded_ascii_json_text(
+    value: str,
+    maximum_json_chars: int,
+) -> tuple[str, bool]:
+    """Bound already-redacted ASCII text with an ASCII-only suffix."""
+
+    if _json_string_size(value) <= maximum_json_chars:
+        return value, False
+    suffix = "..."
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = value[:middle] + suffix
+        if _json_string_size(candidate) <= maximum_json_chars:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low] + suffix, True
+
+
 def _redact_credentials(value: str) -> tuple[str, int]:
     redactions = 0
 
@@ -550,8 +581,13 @@ def _structured_html_summary(
         # HTMLParser is intentionally best effort over hostile, malformed
         # challenge output. The raw immutable pointer remains authoritative.
         pass
+    valid_tags = [
+        (tag, count)
+        for tag, count in parser.tags.items()
+        if _HTML_SUMMARY_TAG.fullmatch(tag) is not None
+    ]
     retained_tags = sorted(
-        parser.tags.items(),
+        valid_tags,
         key=lambda item: (-item[1], item[0]),
     )[:MAX_RECEIPT_STRUCTURE_ITEMS]
     summary = _base_structured_summary(
@@ -704,7 +740,76 @@ def _structured_content_summary(
             "nonempty_line_count": nonempty_line_count,
         }
     )
+    salient_lines, salient_lines_omitted = _salient_text_lines(
+        text,
+        complete_stream=scope == "complete_stream",
+    )
+    if salient_lines:
+        # Structured-summary v1 remains frozen for replay compatibility.
+        # Only text summaries carrying bounded, explicitly marked records use
+        # v2; consumers and state validation accept both versions exactly.
+        summary["version"] = 2
+        summary["salient_lines"] = salient_lines
+        summary["salient_lines_omitted"] = salient_lines_omitted
     return _bounded_structured_summary(summary)
+
+
+def _salient_text_lines(
+    text: str,
+    *,
+    complete_stream: bool,
+) -> tuple[list[str], int]:
+    """Retain only explicit, redacted, bounded records from generic text.
+
+    This intentionally does not infer domain semantics.  A challenge-controlled
+    stream can contain arbitrary prose, so only anchored marker records are
+    eligible.  The immutable raw artifact remains authoritative.
+    """
+
+    redacted, _redactions = _redact_credentials(text)
+    edge = MAX_RECEIPT_SALIENT_LINES // 2
+    first: list[str] = []
+    tail: list[str] = []
+    eligible_count = 0
+    for raw_line in io.StringIO(redacted, newline=None):
+        terminated = raw_line.endswith(("\n", "\r"))
+        if not complete_stream and not terminated:
+            # A retained-prefix or otherwise incomplete snapshot can end
+            # inside a record. Never project that trailing fragment as
+            # complete evidence.
+            continue
+        line = raw_line.rstrip("\r\n")
+        if _SALIENT_TEXT_MARKER.match(line) is None:
+            continue
+        if not line.isascii() or any(
+            character != "\t" and not 0x20 <= ord(character) <= 0x7E
+            for character in line
+        ):
+            continue
+        # Credential redaction has already examined the complete line. Limit
+        # the terminal renderer's input so one adversarial marker line cannot
+        # amplify host memory through a per-character output list.
+        source_truncated = len(line) > MAX_RECEIPT_SALIENT_LINE_JSON_CHARS
+        safe = terminal_safe(
+            line[:MAX_RECEIPT_SALIENT_LINE_JSON_CHARS],
+            multiline=False,
+        )
+        bounded, _truncated = _bounded_ascii_json_text(
+            safe + ("..." if source_truncated else ""),
+            MAX_RECEIPT_SALIENT_LINE_JSON_CHARS,
+        )
+        eligible_count += 1
+        if bounded in first or bounded in tail:
+            continue
+        if len(first) < edge:
+            first.append(bounded)
+            continue
+        tail.append(bounded)
+        if len(tail) > edge:
+            tail.pop(0)
+
+    retained = first + tail
+    return retained, max(0, eligible_count - len(retained))
 
 
 def _text_sample(value: bytes) -> tuple[str | None, int]:

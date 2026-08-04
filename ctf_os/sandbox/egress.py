@@ -207,7 +207,10 @@ class RestrictedEgressBoundary:
             command.extend(["--allow-target", target.as_text()])
         return tuple(command)
 
-    def _verify_proxy(self, details: Mapping[str, Any]) -> None:
+    def _verify_proxy_binding(
+        self,
+        details: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
         config = details.get("Config")
         host_config = details.get("HostConfig")
         state = details.get("State")
@@ -246,7 +249,6 @@ class RestrictedEgressBoundary:
             or host_config.get("Privileged") is not False
             or not isinstance(networks, Mapping)
             or set(networks) != {self.internal_network, self.policy.docker_network}
-            or state.get("Running") is not True
         ):
             raise ScopeError(
                 "restricted egress proxy does not match its challenge policy"
@@ -258,6 +260,77 @@ class RestrictedEgressBoundary:
             raise ScopeError(
                 "restricted egress proxy is missing its internal-only alias"
             )
+        return state
+
+    def _verify_proxy(self, details: Mapping[str, Any]) -> None:
+        state = self._verify_proxy_binding(details)
+        if state.get("Running") is not True:
+            raise ScopeError(
+                "restricted egress proxy does not match its challenge policy"
+            )
+
+    def _verify_stopped_proxy(self, details: Mapping[str, Any]) -> None:
+        state = self._verify_proxy_binding(details)
+        if (
+            state.get("Status") != "exited"
+            or state.get("Running") is not False
+            or state.get("Paused") is not False
+            or state.get("Restarting") is not False
+            or state.get("Dead") is not False
+            or state.get("Pid") != 0
+        ):
+            raise ScopeError(
+                "restricted egress proxy is not in a recoverable stopped state"
+            )
+
+    def _restart_stopped_proxy(
+        self,
+        details: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        # A stopped container is untrusted until its immutable policy binding,
+        # network membership, and stopped state have all been re-attested.
+        self._verify_stopped_proxy(details)
+        container_id = details.get("Id")
+        if (
+            not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or details.get("Name") != f"/{self.proxy_container}"
+        ):
+            raise ScopeError(
+                "restricted egress proxy has an invalid immutable identity"
+            )
+        restarted = self._run(
+            [
+                self.docker,
+                "container",
+                "start",
+                container_id,
+            ],
+            timeout=60,
+        )
+        refreshed = self._inspect("container", self.proxy_container)
+        if refreshed is None:
+            raise SandboxError(
+                "restricted egress proxy disappeared during recovery"
+            )
+        if refreshed.get("Id") != container_id:
+            raise ScopeError(
+                "restricted egress proxy identity changed during recovery"
+            )
+        state = self._verify_proxy_binding(refreshed)
+        if state.get("Running") is True:
+            return refreshed
+        detail = self._bounded(
+            restarted.stderr or restarted.stdout or ""
+        ).strip()
+        if restarted.returncode != 0:
+            raise SandboxError(
+                "could not restart restricted egress proxy"
+                + (f": {detail}" if detail else "")
+            )
+        raise SandboxError(
+            "restricted egress proxy did not remain running after recovery"
+        )
 
     def _ensure_network(self) -> None:
         details = self._inspect("network", self.internal_network)
@@ -337,7 +410,13 @@ class RestrictedEgressBoundary:
         return argv
 
     def _ensure_proxy(self) -> None:
+        restarted_container_id: str | None = None
         details = self._inspect("container", self.proxy_container)
+        if details is not None:
+            state = details.get("State")
+            if isinstance(state, Mapping) and state.get("Running") is False:
+                details = self._restart_stopped_proxy(details)
+                restarted_container_id = str(details["Id"])
         if details is None:
             created = self._run(self._proxy_run_argv(), timeout=60)
             if created.returncode != 0:
@@ -350,17 +429,22 @@ class RestrictedEgressBoundary:
                         "could not start restricted egress proxy"
                         + (f": {detail}" if detail else "")
                     )
+                state = details.get("State")
+                if isinstance(state, Mapping) and state.get("Running") is False:
+                    details = self._restart_stopped_proxy(details)
+                    restarted_container_id = str(details["Id"])
+        proxy_reference = restarted_container_id or self.proxy_container
         attached = self._run(
             [
                 self.docker,
                 "network",
                 "connect",
                 self.policy.docker_network,
-                self.proxy_container,
+                proxy_reference,
             ]
         )
         if attached.returncode != 0:
-            refreshed = self._inspect("container", self.proxy_container)
+            refreshed = self._inspect("container", proxy_reference)
             network_settings = (
                 refreshed.get("NetworkSettings")
                 if isinstance(refreshed, Mapping)
@@ -380,10 +464,17 @@ class RestrictedEgressBoundary:
                     "could not attach restricted egress proxy upstream"
                     + (f": {detail}" if detail else "")
                 )
-        details = self._inspect("container", self.proxy_container)
+        details = self._inspect("container", proxy_reference)
         if details is None:
             raise SandboxError(
                 "restricted egress proxy disappeared during provisioning"
+            )
+        if restarted_container_id is not None and (
+            details.get("Id") != restarted_container_id
+            or details.get("Name") != f"/{self.proxy_container}"
+        ):
+            raise ScopeError(
+                "restricted egress proxy identity changed after recovery"
             )
         self._verify_proxy(details)
 
@@ -394,7 +485,7 @@ class RestrictedEgressBoundary:
                     self.docker,
                     "container",
                     "exec",
-                    self.proxy_container,
+                    proxy_reference,
                     "/usr/local/bin/ctf-egress-proxy",
                     "healthcheck",
                     "--listen-interface",

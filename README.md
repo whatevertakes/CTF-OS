@@ -71,9 +71,14 @@ ExploitGym/CyberGym-E2E/CVE 연구 축은 서로 분리해 평가합니다.
 - Codex CLI
 - `ctf-os:core` Docker 이미지
 
+새 장비에서 `main`만 받아 동일한 tracked source, 기본 engine 설정, 로컬
+검증 절차를 만드는 전체 순서는
+[team main bootstrap](docs/team-main-bootstrap.md)에 고정돼 있습니다.
+
 프로젝트 CLI를 설치합니다.
 
 ```sh
+uv sync --frozen
 uv tool install --editable .
 ctfos --help
 ```
@@ -105,8 +110,9 @@ ctfos init
 동일한 `gpt-5.6-sol`을 배정합니다. 역할 차이는 약한 모델 라우팅이 아니라
 artifact 계약으로 유지하며 Captain은 `ultra`, worker는 `max` reasoning
 effort를 사용합니다. provider 한도는 호출을 대기시킬 뿐 역할이나 wave 폭을
-줄이지 않습니다. 이 기본값은 설정과 local fixture에서 검증했지만, 실제
-계정으로 전체 solve end-to-end를 검증했다는 뜻은 아닙니다.
+줄이지 않습니다. 이 기본값과 managed 흐름은 고정된 local challenge
+smoke에서 실행됐지만, ignored 입력·receipt를 main에 싣지 않으므로 그 결과는
+release 성능 주장이나 서버 accepted 판정이 아닙니다.
 
 `pin-image`는 현재 `runtime.image`가 가리키는 로컬 Docker image ID를
 `runtime.image_digest`에 원자적으로 기록합니다. 이후 일반 도구와 clean
@@ -1160,8 +1166,16 @@ bounded scanner가 모델 또는 도구 출력에서 플래그 형식을 관측�
 flag{...}
 ```
 
-이 표시는 성공이나 제출을 뜻하지 않습니다. 후보는 상태에도 기록되며 다음
-명령으로 다시 확인할 수 있습니다.
+이 표시는 성공이나 제출을 뜻하지 않습니다. 일반 후보는 상태에도 기록되며
+아래 명령으로 다시 확인할 수 있습니다. 다만 자동 scan이 source-code,
+printf/f-string template, escaped diagnostic처럼 보이는 일치값을 찾은 경우에는
+값을 숨기지 않고 동일한 형식으로 즉시 출력하되 **notification-only**로
+분리합니다. 이 경로는 별도의 exact-value dedupe(기본 1,024개, 총 256 KiB)를
+사용하고 candidate quota, candidate-intent journal,
+`BatchResult.flag_candidates`, canonical `state.json`에는 들어가지 않습니다.
+원본 event는 bounded raw evidence로 `BatchResult.events`에 보존됩니다. 모델의
+구조화 출력이나 sidecar가 같은 값을 명시적으로 보고하면 그때는 일반 후보로
+정상 승격할 수 있습니다.
 
 Batch, foreground tool과 clean proof stream은 출력 전에 bounded
 candidate-intent journal을 원자 저장하고 `fsync`합니다. 정상 경로에서는
@@ -1173,7 +1187,8 @@ candidate-intent journal을 원자 저장하고 `fsync`합니다. 정상 경로�
 뒤 출력합니다.
 
 Batch model stream은 raw 파일 저장 상한 뒤에도 drain하며 scan하지만,
-candidate는 기본 1,024개와 총 256 KiB 문자 상한을 가집니다. Foreground
+candidate와 notification-only 관측은 각각 기본 1,024개와 총 256 KiB 문자
+상한을 가집니다. Foreground
 tool도 저장하는 16 MiB raw prefix와 별개로 drain되는 stdout/stderr 전체를
 `runtime.flag_patterns`로 rolling scan합니다. 일치값은
 `flag-candidates.jsonl`에 후보 1,024개, 총 256 KiB 문자, 파일 1 MiB

@@ -1768,6 +1768,22 @@ class CallTiming:
     finished_at: float
     provider_wait_seconds: float
 
+    @property
+    def provider_process_span_seconds(self) -> float:
+        """Gross first-provider-start to final-attempt-finish span.
+
+        This deliberately is not called generation time: schema-repair retries
+        and their intervening admission waits may occur inside the span.
+        """
+
+        return max(0.0, self.finished_at - self.started_at)
+
+    @property
+    def model_call_wall_seconds(self) -> float:
+        """Wall time from initial admission enqueue through final finish."""
+
+        return max(0.0, self.finished_at - self.queued_at)
+
 
 @dataclass(frozen=True)
 class BatchAttempt:
@@ -2722,13 +2738,14 @@ class BatchRunner:
         cancel_event: threading.Event | None,
         timeout: float | None = None,
     ) -> ModelCallSlot:
-        effective_timeout = self.limiter_wait_timeout
-        if timeout is not None:
-            effective_timeout = (
-                timeout
-                if effective_timeout is None
-                else min(effective_timeout, timeout)
-            )
+        # A challenge hard deadline is the admission bound when one exists.
+        # Applying the runner's fallback wait timeout as a stricter bound would
+        # turn a healthy, capacity-limited logical role into a terminal timeout
+        # before its challenge budget expires.  Invocations without a hard
+        # deadline retain the explicit fallback timeout.
+        effective_timeout = (
+            timeout if timeout is not None else self.limiter_wait_timeout
+        )
         return (
             self.limiter.slot(effective_timeout)
             if cancel_event is None
@@ -2760,6 +2777,7 @@ class BatchRunner:
         *,
         on_event: Callable[[CodexEvent], None] | None = None,
         on_flag: Callable[[FlagCandidate], None] | None = None,
+        on_flag_notice: Callable[[FlagCandidate], None] | None = None,
         before_provider_start: Callable[[], None] | None = None,
         session_created_at: float | None = None,
         _cancel_event: threading.Event | None = None,
@@ -2772,6 +2790,7 @@ class BatchRunner:
                 invocation,
                 on_event=on_event,
                 on_flag=on_flag,
+                on_flag_notice=on_flag_notice,
                 before_provider_start=before_provider_start,
                 session_created_at=session_created_at,
                 _cancel_event=_cancel_event,
@@ -2785,6 +2804,7 @@ class BatchRunner:
         *,
         on_event: Callable[[CodexEvent], None] | None = None,
         on_flag: Callable[[FlagCandidate], None] | None = None,
+        on_flag_notice: Callable[[FlagCandidate], None] | None = None,
         before_provider_start: Callable[[], None] | None = None,
         session_created_at: float | None = None,
         _cancel_event: threading.Event | None = None,
@@ -2828,12 +2848,14 @@ class BatchRunner:
                 candidate_limit=self.flag_candidate_limit,
                 candidate_chars_limit=self.flag_candidate_chars_limit,
                 suppress_generic_code_noise=True,
+                notice_callback=on_flag_notice,
             )
         else:
             detector = FlagDetector(
                 candidate_limit=self.flag_candidate_limit,
                 candidate_chars_limit=self.flag_candidate_chars_limit,
                 suppress_generic_code_noise=True,
+                notice_callback=on_flag_notice,
             )
         accumulator = EventAccumulator(
             detector=detector,
@@ -3368,9 +3390,19 @@ class BatchRunner:
                     "flag_scan": {
                         "candidate_limit": self.flag_candidate_limit,
                         "candidate_chars_limit": self.flag_candidate_chars_limit,
+                        "notice_limit": detector.notice_limit,
+                        "notice_chars_limit": detector.notice_chars_limit,
                         "candidates_stored": len(accumulator.flags),
                         "candidate_chars_stored": detector.accepted_chars,
                         "suppressed_matches": detector.suppressed_matches,
+                        "template_suppressed_matches": (
+                            detector.template_suppressed_matches
+                        ),
+                        "notice_count": detector.notice_count,
+                        "notice_chars": detector.notice_chars,
+                        "notice_suppressed_matches": (
+                            detector.notice_suppressed_matches
+                        ),
                     },
                 },
                 maximum_bytes=DEFAULT_CAPTURE_METADATA_LIMIT_BYTES,
@@ -3669,6 +3701,7 @@ class BatchWaveRunner:
         *,
         on_event: Callable[[CodexEvent], None] | None = None,
         on_flag: Callable[[FlagCandidate], None] | None = None,
+        on_flag_notice: Callable[[FlagCandidate], None] | None = None,
         before_provider_start: Callable[[], None] | None = None,
         before_invocation_provider_start: (
             Callable[[BatchInvocation], None] | None
@@ -3695,6 +3728,7 @@ class BatchWaveRunner:
                     invocation,
                     on_event=on_event,
                     on_flag=on_flag,
+                    on_flag_notice=on_flag_notice,
                     before_provider_start=before_start,
                     session_created_at=wave.created_at,
                     _cancel_event=cancel_event,

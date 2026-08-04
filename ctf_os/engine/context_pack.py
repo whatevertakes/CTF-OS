@@ -12,11 +12,22 @@ from ctf_os.adapters.base import CategoryAdapter
 from ctf_os.knowledge import MAX_CONTEXT_EXCERPT_CHARS, knowledge_context
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
+    MANAGED_SHELL_COMMAND_PROTOCOL,
     CandidateTier,
     ChallengeState,
+    ExperimentKind,
+    ExperimentStatus,
+    ModelValidationError,
     Provenance,
     PwnRuntimeSnapshotDisclosureEnvelope,
+    RunOrigin,
+    RunStatus,
     TargetStatus,
+)
+from ctf_os.engine.checkpoint_projection import (
+    MANAGED_REGISTERED_SELECTION_KEY,
+    managed_registered_contract_is_bounded,
+    managed_registered_selection_matches,
 )
 from ctf_os.engine.resume_capsule import (
     MAX_RESUME_CAPSULE_BYTES,
@@ -73,7 +84,30 @@ def _bounded_canonical_text(value: object, maximum: int = 160) -> str:
     return text[:low] + suffix
 
 
-def _compact_receipt_sample(value: object) -> dict[str, object] | None:
+def _bounded_canonical_suffix(value: object, maximum: int = 512) -> str:
+    """Bound escaped JSON text while retaining the end of a stream sample."""
+
+    text = str(value)
+    if len(canonical_json_record(text)) <= maximum:
+        return text
+    prefix = "…"
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = prefix + text[len(text) - middle :]
+        if len(canonical_json_record(candidate)) <= maximum:
+            low = middle
+        else:
+            high = middle - 1
+    return prefix + text[len(text) - low :]
+
+
+def _compact_receipt_sample(
+    value: object,
+    *,
+    preserve_suffix: bool = False,
+) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
     compact: dict[str, object] = {
@@ -82,10 +116,18 @@ def _compact_receipt_sample(value: object) -> dict[str, object] | None:
         "encoding": value.get("encoding"),
     }
     if value.get("encoding") == "utf-8":
-        compact["text"] = _bounded_canonical_text(
-            value.get("text", ""),
+        original_text = str(value.get("text", ""))
+        compact_text = (
+            _bounded_canonical_suffix(original_text)
+            if preserve_suffix
+            else _bounded_canonical_text(original_text, maximum=512)
         )
+        compact["text"] = compact_text
         compact["text_truncated"] = value.get("text_truncated", False)
+        compact["context_text_truncated"] = compact_text != original_text
+        compact["context_sample_view"] = (
+            "suffix" if preserve_suffix else "prefix"
+        )
     elif value.get("encoding") == "binary-omitted":
         compact["sample_sha256"] = value.get("sample_sha256")
     return compact
@@ -119,14 +161,84 @@ def _compact_receipt_streams(receipt: Any) -> dict[str, object]:
         structured_summary = evidence.get("structured_summary")
         if isinstance(structured_summary, dict):
             compact_stream["structured_summary"] = structured_summary
-        tail = _compact_receipt_sample(evidence.get("tail"))
+        tail = _compact_receipt_sample(
+            evidence.get("tail"),
+            preserve_suffix=True,
+        )
         if tail is not None:
             compact_stream["tail"] = tail
         compact[stream] = compact_stream
     return compact
 
 
+def _compact_web_response_summary(receipt: Any) -> dict[str, object] | None:
+    value = receipt.extra.get("web_response_summary")
+    if not isinstance(value, dict):
+        return None
+    raw_records = value.get("records")
+    records: list[dict[str, object]] = []
+    if isinstance(raw_records, list):
+        for raw_record in raw_records[:4]:
+            if not isinstance(raw_record, dict):
+                continue
+            raw_observations = raw_record.get("observations")
+            observations: list[dict[str, object]] = []
+            if isinstance(raw_observations, list):
+                for observation in raw_observations[:8]:
+                    if not isinstance(observation, dict):
+                        continue
+                    observations.append(
+                        {
+                            "needle_sha256": observation.get(
+                                "needle_sha256"
+                            ),
+                            "present": observation.get("present"),
+                            "match_count": observation.get("match_count"),
+                            "count_capped": observation.get("count_capped"),
+                        }
+                    )
+            records.append(
+                {
+                    "request_sha256": raw_record.get("request_sha256"),
+                    "status": raw_record.get("status"),
+                    "saved_bytes": raw_record.get("saved_bytes"),
+                    "truncated": raw_record.get("truncated"),
+                    "body_sha256": raw_record.get("body_sha256"),
+                    "observations": observations,
+                    "observations_omitted": max(
+                        0,
+                        len(raw_observations) - len(observations),
+                    )
+                    if isinstance(raw_observations, list)
+                    else 0,
+                }
+            )
+    record_count = value.get("record_count")
+    return {
+        "valid": value.get("valid"),
+        "reason_code": value.get("reason_code"),
+        "record_count": record_count,
+        "records": records,
+        "records_omitted": max(0, record_count - len(records))
+        if isinstance(record_count, int) and not isinstance(record_count, bool)
+        else 0,
+    }
+
+
 def _receipt_context_record(receipt: Any) -> str:
+    semantic_projection: dict[str, object] = {}
+    if "semantic_authority" in receipt.extra:
+        semantic_projection = {
+            "semantic_authority": receipt.extra.get(
+                "semantic_authority"
+            ),
+            "semantic_evaluation_contract_version": receipt.extra.get(
+                "semantic_evaluation_contract_version"
+            ),
+            "semantic_witness_available": receipt.extra.get(
+                "semantic_witness_available"
+            ),
+        }
     return _record(
         "recent_execution_receipt",
         trust="evidence",
@@ -137,6 +249,8 @@ def _receipt_context_record(receipt: Any) -> str:
         exit_code=receipt.exit_code,
         line_count_basis=receipt.extra.get("line_count_basis"),
         streams=_compact_receipt_streams(receipt),
+        web_response_summary=_compact_web_response_summary(receipt),
+        **semantic_projection,
     )
 
 
@@ -391,6 +505,113 @@ def _candidate_groups(state: ChallengeState) -> tuple[list[Any], list[Any]]:
     return high, generic
 
 
+def _selected_registered_experiment_records(
+    state: ChallengeState,
+    *,
+    role: str,
+) -> tuple[str, ...]:
+    """Project one cycle-bound contract without disclosing its command."""
+
+    if role == "captain":
+        return ()
+    waves = {item.id: item for item in state.waves}
+    runs = {item.id: item for item in state.runs}
+    experiments = {item.id: item for item in state.experiments}
+    for cycle in reversed(state.cycles):
+        binding = cycle.extra.get(MANAGED_REGISTERED_SELECTION_KEY)
+        if binding is None or cycle.completed_at is not None:
+            continue
+        wave = waves.get(cycle.wave_id or "")
+        if wave is None or role not in wave.role_run_ids:
+            continue
+        role_run = runs.get(wave.role_run_ids[role])
+        if role_run is None or role_run.status not in {
+            RunStatus.CREATED,
+            RunStatus.RUNNING,
+        }:
+            continue
+        if not isinstance(binding, dict):
+            raise ModelValidationError(
+                "managed registered selection binding is not canonical"
+            )
+        experiment_id = binding.get("experiment_id")
+        experiment = (
+            experiments.get(experiment_id)
+            if isinstance(experiment_id, str)
+            else None
+        )
+        source_run = (
+            runs.get(experiment.source_run_id or "")
+            if experiment is not None
+            else None
+        )
+        if (
+            experiment is None
+            or experiment.id not in cycle.selected_action_ids
+            or experiment.status is not ExperimentStatus.REGISTERED
+            or not managed_registered_selection_matches(
+                experiment,
+                binding,
+            )
+            or not managed_registered_contract_is_bounded(experiment)
+            or experiment.kind is ExperimentKind.PROOF
+            or experiment.proof_recipe is not None
+            or experiment.extra.get("engine_executor") is not None
+            or experiment.extra.get("adapter_seed") is not None
+            or experiment.extra.get("managed_command_protocol")
+            != MANAGED_SHELL_COMMAND_PROTOCOL
+            or experiment.extra.get("managed_contract_version") != 2
+            or source_run is None
+            or source_run.origin is not RunOrigin.MANAGED_MODEL
+            or source_run.status is not RunStatus.COMPLETED
+            or source_run.extra.get("contract_version") != 2
+            or source_run.extra.get("semantic_merge") is not True
+        ):
+            raise ModelValidationError(
+                "managed registered selection no longer binds one ordinary "
+                "v2 managed command"
+            )
+        target_id = experiment.extra.get("network_target_id")
+        target_generation = experiment.extra.get(
+            "network_target_generation"
+        )
+        return (
+            _record(
+                "selected_registered_experiment_policy",
+                trust="policy",
+                instruction=(
+                    "Review this one cycle-bound canonical experiment "
+                    "contract. Its command body remains engine-owned and is "
+                    "intentionally undisclosed; never reconstruct, quote, or "
+                    "replace it. The engine revalidates canonical status, "
+                    "hashes, sandbox profile, and target binding before "
+                    "execution."
+                ),
+            ),
+            _record(
+                "selected_registered_experiment_contract",
+                trust="engine_bound_model_contract",
+                experiment_id=experiment.id,
+                command_sha256=binding["command_sha256"],
+                contract_sha256=binding["contract_sha256"],
+                expected_observation=experiment.expected_observation,
+                keep_if=experiment.keep_if,
+                drop_if=experiment.drop_if,
+                timeout_seconds=experiment.timeout_seconds,
+                resource_class=experiment.resource_class,
+                execution_profile=(
+                    "target_bound"
+                    if target_id is not None
+                    else "network_denied"
+                ),
+                network_target_id=target_id,
+                network_target_generation=target_generation,
+                command_body_disclosed=False,
+            ),
+        )
+    return ()
+
+
 def build_context_pack(
     state: ChallengeState,
     adapter: CategoryAdapter,
@@ -526,6 +747,9 @@ def build_context_pack(
         policy=ResumeCapsulePolicy(max_bytes=capsule_budget),
     )
     mandatory.append(capsule.text)
+    mandatory.extend(
+        _selected_registered_experiment_records(state, role=role)
+    )
     for name, count in capsule.omitted_counts.items():
         if count:
             early_omitted[f"resume_{name}"] = count

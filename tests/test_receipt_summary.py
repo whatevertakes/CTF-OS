@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import stat
@@ -14,6 +15,12 @@ from ctf_os.engine.receipt_summary import (
     ReceiptSummaryError,
     build_receipt_preview,
     summarize_stream_snapshot,
+)
+from ctf_os.models import (
+    ArtifactReference,
+    ExecutionReceipt,
+    ReceiptOutcome,
+    _receipt_stream_evidence_errors,
 )
 from ctf_os.sandbox import SandboxResult
 
@@ -123,6 +130,265 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertIn("ORACLE route-count=7", first["head"]["text"])
         self.assertIn("TAIL accepted=false", first["tail"]["text"])
         self.assertNotIn("UNTRUSTED TRANSPORT TAIL", json.dumps(first))
+
+    def test_middle_salient_summary_is_redacted_and_bounded(self) -> None:
+        payload = (
+            b"head\n"
+            + (b"x" * 512)
+            + b"\nSUMMARY: addr=0x1337 api_key=must-not-leak\n"
+            + (b"y" * 512)
+            + b"\ntail\n"
+        )
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+            sample_bytes=16,
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["version"], 2)
+        self.assertEqual(structure["kind"], "text")
+        self.assertEqual(
+            structure["salient_lines"],
+            ["SUMMARY: addr=0x1337 api_key=[REDACTED]"],
+        )
+        self.assertEqual(structure["salient_lines_omitted"], 0)
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn("must-not-leak", serialized)
+        self.assertLessEqual(
+            len(
+                json.dumps(
+                    structure,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ),
+            MAX_RECEIPT_STRUCTURE_JSON_BYTES,
+        )
+
+        artifact = ArtifactReference(
+            id="A-run-stdout",
+            path="artifacts/snapshots/A-run-stdout.log",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            source_run_id="run-1",
+            size=len(payload),
+            extra={"stream": "stdout"},
+        )
+        receipt = ExecutionReceipt(
+            id="RCPT-1",
+            experiment_id="E-1",
+            run_id="run-1",
+            outcome=ReceiptOutcome.SUCCEEDED,
+            exit_code=0,
+            stdout_artifact_id=artifact.id,
+            stdout_bytes=len(payload),
+            extra={
+                "line_count_basis": "transport_summary_tail",
+                "stream_evidence": {"stdout": evidence},
+            },
+        )
+        self.assertEqual(
+            _receipt_stream_evidence_errors(receipt, {artifact.id: artifact}),
+            [],
+        )
+
+        malformed = copy.deepcopy(receipt)
+        malformed.extra["stream_evidence"]["stdout"][
+            "structured_summary"
+        ]["salient_lines"] = [{}]
+        errors = _receipt_stream_evidence_errors(
+            malformed,
+            {artifact.id: artifact},
+        )
+        self.assertTrue(
+            any("invalid salient lines" in error for error in errors),
+            errors,
+        )
+
+    def test_salient_lines_keep_bounded_stream_edges(self) -> None:
+        records = [
+            b"ORACLE first",
+            b"RESULT: second",
+            b"RECORD: middle-a",
+            b"RECORD: middle-a",
+            b"ERROR: middle-b",
+            b"SUMMARY: final",
+        ]
+        payload = b"\n".join(records) + b"\n"
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(
+            structure["salient_lines"],
+            [
+                "ORACLE first",
+                "RESULT: second",
+                "ERROR: middle-b",
+                "SUMMARY: final",
+            ],
+        )
+        self.assertEqual(structure["salient_lines_omitted"], 2)
+
+    def test_long_salient_line_stays_ascii_and_model_valid(self) -> None:
+        payload = (b"SUMMARY: " + (b"A" * 1000) + b"\n")
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+        )
+        line = evidence["structured_summary"]["salient_lines"][0]
+        self.assertTrue(line.isascii())
+        self.assertTrue(line.endswith("..."))
+
+        artifact = ArtifactReference(
+            id="A-run-stdout",
+            path="artifacts/snapshots/A-run-stdout.log",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            source_run_id="run-1",
+            size=len(payload),
+            extra={"stream": "stdout"},
+        )
+        receipt = ExecutionReceipt(
+            id="RCPT-long",
+            experiment_id="E-1",
+            run_id="run-1",
+            outcome=ReceiptOutcome.SUCCEEDED,
+            exit_code=0,
+            stdout_artifact_id=artifact.id,
+            stdout_bytes=len(payload),
+            extra={
+                "line_count_basis": "transport_summary_tail",
+                "stream_evidence": {"stdout": evidence},
+            },
+        )
+        self.assertEqual(
+            _receipt_stream_evidence_errors(receipt, {artifact.id: artifact}),
+            [],
+        )
+
+        malformed = copy.deepcopy(receipt)
+        malformed.extra["stream_evidence"]["stdout"][
+            "structured_summary"
+        ]["version"] = [2]
+        errors = _receipt_stream_evidence_errors(
+            malformed,
+            {artifact.id: artifact},
+        )
+        self.assertTrue(
+            any("invalid version" in error for error in errors),
+            errors,
+        )
+
+    def test_tab_separated_marker_is_not_salient(self) -> None:
+        payload = b"SUMMARY\tchallenge-controlled text\n"
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+        )
+        self.assertEqual(evidence["structured_summary"]["version"], 1)
+        self.assertNotIn(
+            "salient_lines",
+            evidence["structured_summary"],
+        )
+
+    def test_incomplete_trailing_salient_fragment_is_not_projected(
+        self,
+    ) -> None:
+        payload = b"RESULT: complete\nSUMMARY: partial"
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload) + 100,
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=True,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["scope"], "retained_prefix")
+        self.assertEqual(structure["salient_lines"], ["RESULT: complete"])
+        self.assertNotIn("partial", json.dumps(structure))
+
+    def test_cr_only_complete_record_preceding_partial_is_retained(self) -> None:
+        payload = b"RESULT: complete\rSUMMARY: partial"
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload) + 100,
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=True,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["salient_lines"], ["RESULT: complete"])
+        self.assertNotIn("partial", json.dumps(structure))
+
+    def test_unanchored_and_non_ascii_markers_are_not_salient(self) -> None:
+        payload = (
+            "prefix SUMMARY: inline\n"
+            "SUMMARY: non-ascii-값\n"
+            "ordinary text\n"
+        ).encode("utf-8")
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["version"], 1)
+        self.assertNotIn("salient_lines", structure)
 
     def test_credential_label_is_redacted_but_canary_reaches_preview(
         self,
@@ -601,6 +867,32 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertEqual(structure["title"], "Authorization: [REDACTED]")
         self.assertEqual(structure["tag_counts"]["a"], 2)
         self.assertNotIn("must-not-leak", json.dumps(structure))
+
+    def test_html_structure_omits_parser_tag_names_outside_contract(
+        self,
+    ) -> None:
+        payload = (
+            b"scan output before markup\n"
+            b"<html><snail_id; winner=1><int:winner>"
+            b"<script>x</script></html>"
+        )
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["kind"], "html")
+        self.assertEqual(structure["tag_counts"]["int:winner"], 1)
+        self.assertNotIn("snail_id;", structure["tag_counts"])
+        self.assertEqual(structure["tags_omitted"], 1)
 
     def test_tsv_structure_reports_columns_and_exact_row_count(self) -> None:
         payload = b"name\tstatus\tbytes\nalpha\tok\t12\nbeta\tfail\t99\n"

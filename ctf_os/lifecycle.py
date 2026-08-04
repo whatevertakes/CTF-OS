@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,10 @@ from ctf_os.engine.challenge import (
     ChallengeEngine,
     EngineError,
     SessionAlreadyRunning,
+)
+from ctf_os.engine.checkpoint_projection import (
+    checkpoint_action_projection_metadata,
+    checkpoint_action_references,
 )
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
@@ -44,6 +50,112 @@ from ctf_os.store.views import render_current_markdown
 
 
 MAX_PORTABLE_CLOSURE_BYTES = 64 * 1024 * 1024
+_HANDOFF_TEMPORARY_TOKEN_HEX_CHARS = 32
+
+
+def _nearest_existing_handoff_directory(path: Path) -> Path:
+    candidate = path.parent
+    while True:
+        try:
+            metadata = candidate.stat()
+        except OSError as error:
+            if error.errno not in {
+                errno.ENOENT,
+                errno.ENOTDIR,
+                errno.ENAMETOOLONG,
+            }:
+                raise EngineError(
+                    "handoff destination parent cannot be inspected"
+                ) from error
+        else:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise EngineError(
+                    "handoff destination parent is not a directory"
+                )
+            return candidate
+        parent = candidate.parent
+        if parent == candidate:
+            raise EngineError(
+                "handoff destination has no usable parent directory"
+            )
+        candidate = parent
+
+
+def _handoff_path_limit(directory: Path, name: str) -> int | None:
+    try:
+        value = os.pathconf(directory, name)
+    except (OSError, ValueError) as error:
+        raise EngineError(
+            "handoff destination filesystem limits cannot be inspected"
+        ) from error
+    return value if value >= 0 else None
+
+
+def _validate_handoff_path_limits(path: Path, directory: Path) -> None:
+    name_max = _handoff_path_limit(directory, "PC_NAME_MAX")
+    path_max = _handoff_path_limit(directory, "PC_PATH_MAX")
+    components = path.parts[1:] if path.anchor else path.parts
+    temporary_name = (
+        f".{path.name}."
+        f"{'0' * _HANDOFF_TEMPORARY_TOKEN_HEX_CHARS}.tmp"
+    )
+    if name_max is not None:
+        for component in components:
+            if len(os.fsencode(component)) > name_max:
+                raise EngineError(
+                    "handoff destination contains an overlong path component"
+                )
+        if len(os.fsencode(temporary_name)) > name_max:
+            raise EngineError(
+                "handoff destination filename is too long for atomic write"
+            )
+    if (
+        path_max is not None
+        and len(os.fsencode(os.fspath(path))) >= path_max
+    ):
+        raise EngineError("handoff destination path is too long")
+    temporary_path = path.with_name(temporary_name)
+    if (
+        path_max is not None
+        and len(os.fsencode(os.fspath(temporary_path))) >= path_max
+    ):
+        raise EngineError(
+            "handoff destination leaves no room for an atomic temporary file"
+        )
+
+
+def _preflight_handoff_destination(destination: Path) -> Path:
+    """Resolve predictable destination failures before canonical mutation."""
+
+    try:
+        expanded = Path(destination).expanduser()
+        if "\x00" in os.fspath(expanded):
+            raise EngineError("handoff destination contains a NUL byte")
+        # Match ``Path.resolve(strict=False)`` lexical ``..`` handling before
+        # inspecting ancestors; this keeps the established destination path
+        # semantics while avoiding filesystem access to overlong components.
+        absolute = Path(os.path.abspath(expanded))
+        lexical_parent = _nearest_existing_handoff_directory(absolute)
+        _validate_handoff_path_limits(absolute, lexical_parent)
+        resolved = expanded.resolve()
+        resolved_parent = _nearest_existing_handoff_directory(resolved)
+        _validate_handoff_path_limits(resolved, resolved_parent)
+        try:
+            destination_metadata = resolved.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISDIR(destination_metadata.st_mode):
+                raise EngineError(
+                    "handoff destination must be a file, not a directory"
+                )
+        return resolved
+    except EngineError:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise EngineError("invalid handoff destination") from error
+
+
 def _acquire_session_lock(
     engine: ChallengeEngine,
     identity: ChallengeIdentity,
@@ -371,13 +483,13 @@ def create_checkpoint(
             for item in current.facts
             if item.kind is FactKind.OBSERVATION
         ][-50:],
-        next_actions=[
-            item.command
+        next_actions=checkpoint_action_references(
+            item
             for item in current.experiments
             if item.status is ExperimentStatus.REGISTERED
-        ][:20],
-        do_not_repeat=[
-            item.command
+        )[:20],
+        do_not_repeat=checkpoint_action_references(
+            item
             for item in current.experiments
             if item.status
             in {
@@ -387,10 +499,11 @@ def create_checkpoint(
                 ExperimentStatus.DROPPED,
                 ExperimentStatus.FAILED,
             }
-        ][-20:],
+        )[-20:],
         artifact_ids=[item.id for item in current.artifacts[-50:]],
         receipt_ids=[item.id for item in current.receipts[-50:]],
         note=note,
+        extra=checkpoint_action_projection_metadata(),
     )
 
     def apply(state: Any) -> None:
@@ -413,6 +526,7 @@ def pause_with_handoff(
     *,
     note: str | None = None,
 ) -> Any:
+    destination = _preflight_handoff_destination(destination)
     state, checkpoint = create_checkpoint(engine, identity, note=note)
     state = engine.pause(identity)
     payload = {
@@ -424,7 +538,7 @@ def pause_with_handoff(
         "state_path": str(engine.store.challenge_paths(identity).state),
         "created_at": utc_now(),
     }
-    atomic_write_json(destination.expanduser().resolve(), payload)
+    atomic_write_json(destination, payload)
     return state
 
 
