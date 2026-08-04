@@ -330,6 +330,7 @@ def _base_payload(role: Role) -> dict[str, object]:
         payload["decision"] = {
             "next_stage": "attack",
             "reason": "execute the managed Rev accepted-input gate",
+            "selected_experiment": None,
         }
     return payload
 
