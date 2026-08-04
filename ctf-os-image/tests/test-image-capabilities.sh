@@ -224,6 +224,13 @@ gem list --local --exact zsteg --version 0.2.14 \
     */site-packages/nvidia/cu13/lib/libnvrtc.so.13 ]]
 [[ "$(readlink -f /usr/local/lib/ctf-cuda/libcudart.so)" == \
     */site-packages/nvidia/cu13/lib/libcudart.so.13 ]]
+mapfile -t nvrtc_builtins_links < <(
+    find /usr/local/lib/ctf-cuda -maxdepth 1 -type l \
+        -name 'libnvrtc-builtins.so.*' -print
+)
+[[ "${#nvrtc_builtins_links[@]}" -eq 1 ]]
+[[ "$(readlink -f "${nvrtc_builtins_links[0]}")" == \
+    */site-packages/nvidia/cu13/lib/libnvrtc-builtins.so.* ]]
 
 sage-python - <<'PY'
 import cuso

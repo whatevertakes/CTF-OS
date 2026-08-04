@@ -103,6 +103,7 @@ required_dockerfile_tokens = {
     'qemu-system-${architecture}.real',
     "/usr/local/lib/ctf-cuda",
     "libnvrtc.so.13",
+    "libnvrtc-builtins.so.",
 }
 missing_tokens = sorted(
     token for token in required_dockerfile_tokens if token not in dockerfile

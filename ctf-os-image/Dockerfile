@@ -837,19 +837,25 @@ RUN uv venv /opt/venvs/ml \
  && VIRTUAL_ENV=/opt/venvs/ml uv pip install transformers scikit-learn \
  && ln -sf /opt/venvs/ml/bin/python /usr/local/bin/ml-python
 # Hashcat은 CUDA 드라이버와 함께 libnvrtc.so의 비버전 이름을 찾는다.
-# PyTorch CUDA 휠의 기존 런타임을 재사용해 별도 CUDA toolkit은 설치하지 않는다.
+# NVRTC는 컴파일 시 versioned builtins를 basename으로 다시 연다. 두 파일을
+# 모두 PyTorch CUDA 휠에서 노출해 별도 CUDA toolkit 없이 같은 런타임을 쓴다.
 RUN set -eux; \
     CUDA_WHEEL_LIB="$(find /opt/venvs/ml -type f -name libnvrtc.so.13 \
       -printf '%h\n' -quit)"; \
     test -n "${CUDA_WHEEL_LIB}"; \
     test -f "${CUDA_WHEEL_LIB}/libcudart.so.13"; \
+    CUDA_NVRTC_BUILTINS="$(find "${CUDA_WHEEL_LIB}" -maxdepth 1 -type f \
+      -name 'libnvrtc-builtins.so.*' -print -quit)"; \
+    test -n "${CUDA_NVRTC_BUILTINS}"; \
     install -d -m 0755 /usr/local/lib/ctf-cuda; \
     ln -s "${CUDA_WHEEL_LIB}/libnvrtc.so.13" \
       /usr/local/lib/ctf-cuda/libnvrtc.so; \
     ln -s "${CUDA_WHEEL_LIB}/libnvrtc.so.13" \
       /usr/local/lib/ctf-cuda/libnvrtc.so.1; \
     ln -s "${CUDA_WHEEL_LIB}/libcudart.so.13" \
-      /usr/local/lib/ctf-cuda/libcudart.so
+      /usr/local/lib/ctf-cuda/libcudart.so; \
+    ln -s "${CUDA_NVRTC_BUILTINS}" \
+      "/usr/local/lib/ctf-cuda/$(basename "${CUDA_NVRTC_BUILTINS}")"
 ENV LD_LIBRARY_PATH="/usr/local/lib/ctf-cuda"
 RUN unlink /usr/local/bin/ml-python \
  && printf '#!/bin/sh\nexec /opt/venvs/ml/bin/python "$@"\n' > /usr/local/bin/ml-python \
