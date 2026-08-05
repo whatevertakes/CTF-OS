@@ -4,6 +4,10 @@ CTF-OS는 사람이 고른 문제 하나를 Live 또는 Batch 모드로 푸는
 challenge-scoped Codex 엔진입니다. 대회 문제를 자동으로 고르는 스케줄러와
 CTF 사이트 자동 제출 기능은 없습니다.
 
+> **팀원이 처음 클론했다면 [QUICKSTART](QUICKSTART.md)부터 보십시오.**
+> `scripts/team-setup.sh` 한 줄로 설치·이미지·등급·pin·doctor가 끝납니다.
+> 이 README는 그 다음에 읽는 운영 매뉴얼입니다.
+
 사람이 담당하는 일은 명확합니다.
 
 1. 문제 폴더를 만든다.
@@ -65,8 +69,10 @@ ExploitGym/CyberGym-E2E/CVE 연구 축은 서로 분리해 평가합니다.
 ## 요구 환경
 
 - Linux 또는 WSL2
-- Python 3.13
 - `uv`
+- Python 3.13 — **호스트에 미리 설치할 필요는 없습니다.** `uv sync`가 3.13
+  인터프리터를 `.venv`에 직접 provision 합니다. Ubuntu 24.04의 기본
+  `python3`는 3.12이며 그대로 두어도 됩니다
 - Docker daemon
 - Codex CLI
 - `ctf-os:core` Docker 이미지
@@ -88,6 +94,11 @@ ctfos --help
 
 도구 이미지는 대회 전에 빌드합니다. 대회 중 hot path에서 다시 빌드하는
 운용은 권장하지 않습니다.
+
+**이 빌드는 릴리스 권위 머신 한 대에서만 실행합니다.** 베이스가 digest가 아닌
+태그이고 `apt-get install` 블록과 대부분의 `pip install`에 버전 핀이 없어서,
+서로 다른 시점·호스트의 빌드는 image ID도 내용물도 달라집니다. 팀원 머신은
+그 이미지를 받아 load/pull 하십시오 ([QUICKSTART](QUICKSTART.md)).
 
 ```sh
 DOCKER_BUILDKIT=1 docker build -t ctf-os:core ./ctf-os-image

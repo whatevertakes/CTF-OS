@@ -4,6 +4,11 @@
 CTF-OS engine 설정을 재현합니다. Git은 challenge 입력, canonical state,
 benchmark 결과, 모델 계정, 로컬 Docker image를 복제하지 않습니다.
 
+> 아래는 단계별 참고 문서입니다. 팀원이 실제로 셋업할 때는
+> [QUICKSTART](../QUICKSTART.md)의 `scripts/team-setup.sh` 한 줄을 쓰십시오.
+> 그 스크립트가 §1~§2를 수행하고, 이 문서가 다루지 않는 호스트 등급별
+> `[resources]` 설정까지 처리합니다.
+
 ## 1. Source와 Python 환경
 
 ```sh
@@ -25,8 +30,18 @@ tracked `uv.lock`을 바꾸지 않고 개발·테스트 환경을 만듭니다. 
 
 ## 2. Managed image와 기본 설정
 
+이미지는 팀에서 **한 대**(릴리스 권위 머신)만 빌드하고, 나머지 호스트는 그
+이미지를 받아 load 또는 pull 합니다.
+
 ```sh
+# 릴리스 권위 머신에서만
 DOCKER_BUILDKIT=1 docker build -t ctf-os:core ./ctf-os-image
+
+# 그 외 모든 호스트 — 운영자가 배포한 이미지를 그대로 가져온다.
+# 로드 전에 아카이브 해시를 먼저 검사한다 (깨진 12 GB 전송을 여기서 잡는다).
+sha256sum -c ctf-os-core.tar.gz.sha256
+gunzip -c ctf-os-core.tar.gz | docker load
+
 ctfos init
 ctfos pin-image
 ctfos doctor
@@ -37,10 +52,13 @@ ctfos doctor
 동시성은 역할 또는 wave 폭과 독립적입니다. `pin-image` 뒤에는 tag가 아니라
 그 호스트의 exact image ID가 실행 기준입니다.
 
-Dockerfile의 일부 upstream package source는 floating하므로 서로 다른 시점에
-각자 build한 image byte가 같다는 보장은 없습니다. exact image 동일성이
-필요하면 운영자가 별도로 배포한 동일 OCI image ID를 load한 다음
-`ctfos pin-image`를 실행해야 합니다. GitHub `main`만으로 보장하는 범위는
+Dockerfile의 upstream package source는 상당 부분이 floating합니다 — 베이스가
+digest가 아닌 `ubuntu:24.04` 태그이고, `apt-get install` 10개 블록에 버전 핀이
+없으며, `pip install` 26줄 중 22줄이 무핀입니다. 따라서 서로 다른 시점에 각자
+build한 image는 byte뿐 아니라 **도구 버전 자체가** 다를 수 있고, `ctfos doctor`는
+capability의 존재만 확인하고 버전은 보지 않으므로 그 차이가 초록불에 가려집니다.
+exact image 동일성이 필요하면 운영자가 별도로 배포한 동일 OCI image ID를 load한
+다음 `ctfos pin-image`를 실행해야 합니다. GitHub `main`만으로 보장하는 범위는
 tracked source, lockfile, engine default와 검증 절차입니다.
 
 ## 3. 현재 checkout 수용성 검증
