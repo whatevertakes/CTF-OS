@@ -1,15 +1,1547 @@
 {
   "expected": "68rgsm",
-  "predictions": [
+  "api": {
+    "DdddOcr_signature": "(ocr: bool = True, det: bool = False, old: bool = False, beta: bool = False, use_gpu: bool = False, device_id: int = 0, show_ad: bool = True, import_onnx_path: str = '', charsets_path: str = '')",
+    "classification_signature": "(img: Union[bytes, str, pathlib.PurePath, PIL.Image.Image], png_fix: bool = False, probability: bool = False, color_filter_colors: Optional[List[str]] = None, color_filter_custom_ranges: Optional[List[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]] = None) -> Union[str, Dict[str, Any]]",
+    "set_ranges_signature": "(charset_range: Union[int, str, List[str]]) -> None"
+  },
+  "results": [
     {
       "model": "standard",
+      "variant": "original",
       "prediction": "69c99",
-      "seconds": 0.09597086906433105
+      "seconds": 0.02556
+    },
+    {
+      "model": "standard",
+      "variant": "crop155",
+      "prediction": "6999",
+      "seconds": 0.00957
+    },
+    {
+      "model": "standard",
+      "variant": "crop165",
+      "prediction": "6999",
+      "seconds": 0.00981
+    },
+    {
+      "model": "standard",
+      "variant": "crop175",
+      "prediction": "6999",
+      "seconds": 0.0104
+    },
+    {
+      "model": "standard",
+      "variant": "crop185",
+      "prediction": "69c99",
+      "seconds": 0.01057
+    },
+    {
+      "model": "standard",
+      "variant": "crop200",
+      "prediction": "69c99",
+      "seconds": 0.01134
+    },
+    {
+      "model": "standard",
+      "variant": "crop220",
+      "prediction": "69c99",
+      "seconds": 0.01213
+    },
+    {
+      "model": "standard",
+      "variant": "crop240",
+      "prediction": "69c99",
+      "seconds": 0.01283
+    },
+    {
+      "model": "standard",
+      "variant": "th45",
+      "prediction": "s8r9",
+      "seconds": 0.01227
+    },
+    {
+      "model": "standard",
+      "variant": "th45_crop175",
+      "prediction": "S89",
+      "seconds": 0.00966
+    },
+    {
+      "model": "standard",
+      "variant": "th45_up2",
+      "prediction": "s89",
+      "seconds": 0.01353
+    },
+    {
+      "model": "standard",
+      "variant": "th45_up3",
+      "prediction": "S89",
+      "seconds": 0.01409
+    },
+    {
+      "model": "standard",
+      "variant": "th50",
+      "prediction": "s8r9",
+      "seconds": 0.01278
+    },
+    {
+      "model": "standard",
+      "variant": "th50_crop175",
+      "prediction": "s89",
+      "seconds": 0.01015
+    },
+    {
+      "model": "standard",
+      "variant": "th50_up2",
+      "prediction": "s8r9S",
+      "seconds": 0.01369
+    },
+    {
+      "model": "standard",
+      "variant": "th50_up3",
+      "prediction": "s8r9",
+      "seconds": 0.01442
+    },
+    {
+      "model": "standard",
+      "variant": "th55",
+      "prediction": "s8R9S",
+      "seconds": 0.01283
+    },
+    {
+      "model": "standard",
+      "variant": "th55_crop175",
+      "prediction": "s89",
+      "seconds": 0.00943
+    },
+    {
+      "model": "standard",
+      "variant": "th55_up2",
+      "prediction": "s8R9S",
+      "seconds": 0.01341
+    },
+    {
+      "model": "standard",
+      "variant": "th55_up3",
+      "prediction": "s89S",
+      "seconds": 0.01485
+    },
+    {
+      "model": "standard",
+      "variant": "th60",
+      "prediction": "s8r9",
+      "seconds": 0.01271
+    },
+    {
+      "model": "standard",
+      "variant": "th60_crop175",
+      "prediction": "S89",
+      "seconds": 0.01036
+    },
+    {
+      "model": "standard",
+      "variant": "th60_up2",
+      "prediction": "s89S",
+      "seconds": 0.01386
+    },
+    {
+      "model": "standard",
+      "variant": "th60_up3",
+      "prediction": "s8R9S",
+      "seconds": 0.01612
+    },
+    {
+      "model": "standard",
+      "variant": "th65",
+      "prediction": "s8r9",
+      "seconds": 0.01284
+    },
+    {
+      "model": "standard",
+      "variant": "th65_crop175",
+      "prediction": "589",
+      "seconds": 0.01101
+    },
+    {
+      "model": "standard",
+      "variant": "th65_up2",
+      "prediction": "S8r9S",
+      "seconds": 0.01311
+    },
+    {
+      "model": "standard",
+      "variant": "th65_up3",
+      "prediction": "s8rg",
+      "seconds": 0.01385
+    },
+    {
+      "model": "standard",
+      "variant": "th70",
+      "prediction": "s8r9S",
+      "seconds": 0.01248
+    },
+    {
+      "model": "standard",
+      "variant": "th70_crop175",
+      "prediction": "S8r9",
+      "seconds": 0.00946
+    },
+    {
+      "model": "standard",
+      "variant": "th70_up2",
+      "prediction": "s8r9",
+      "seconds": 0.01327
+    },
+    {
+      "model": "standard",
+      "variant": "th70_up3",
+      "prediction": "s8rg",
+      "seconds": 0.01418
+    },
+    {
+      "model": "standard",
+      "variant": "th75",
+      "prediction": "s8r9",
+      "seconds": 0.01246
+    },
+    {
+      "model": "standard",
+      "variant": "th75_crop175",
+      "prediction": "S8r9",
+      "seconds": 0.0095
+    },
+    {
+      "model": "standard",
+      "variant": "th75_up2",
+      "prediction": "s8r9",
+      "seconds": 0.01288
+    },
+    {
+      "model": "standard",
+      "variant": "th75_up3",
+      "prediction": "s8r9",
+      "seconds": 0.01412
+    },
+    {
+      "model": "standard",
+      "variant": "th80",
+      "prediction": "s8rg",
+      "seconds": 0.01288
+    },
+    {
+      "model": "standard",
+      "variant": "th80_crop175",
+      "prediction": "s8rg",
+      "seconds": 0.00961
+    },
+    {
+      "model": "standard",
+      "variant": "th80_up2",
+      "prediction": "s8rg",
+      "seconds": 0.01367
+    },
+    {
+      "model": "standard",
+      "variant": "th80_up3",
+      "prediction": "s8r9",
+      "seconds": 0.01427
+    },
+    {
+      "model": "standard",
+      "variant": "th85",
+      "prediction": "s8rg",
+      "seconds": 0.0126
+    },
+    {
+      "model": "standard",
+      "variant": "th85_crop175",
+      "prediction": "s8rg",
+      "seconds": 0.00958
+    },
+    {
+      "model": "standard",
+      "variant": "th85_up2",
+      "prediction": "s8rg",
+      "seconds": 0.01325
+    },
+    {
+      "model": "standard",
+      "variant": "th85_up3",
+      "prediction": "s8rg",
+      "seconds": 0.01426
+    },
+    {
+      "model": "standard",
+      "variant": "th90",
+      "prediction": "s8rg",
+      "seconds": 0.01297
+    },
+    {
+      "model": "standard",
+      "variant": "th90_crop175",
+      "prediction": "s8rg",
+      "seconds": 0.00968
+    },
+    {
+      "model": "standard",
+      "variant": "th90_up2",
+      "prediction": "s8rg",
+      "seconds": 0.01336
+    },
+    {
+      "model": "standard",
+      "variant": "th90_up3",
+      "prediction": "s8rg",
+      "seconds": 0.01433
+    },
+    {
+      "model": "standard",
+      "variant": "th95",
+      "prediction": "s8rg",
+      "seconds": 0.01279
+    },
+    {
+      "model": "standard",
+      "variant": "th95_crop175",
+      "prediction": "s8rg",
+      "seconds": 0.00958
+    },
+    {
+      "model": "standard",
+      "variant": "th95_up2",
+      "prediction": "s8rg",
+      "seconds": 0.01324
+    },
+    {
+      "model": "standard",
+      "variant": "th95_up3",
+      "prediction": "s8rg",
+      "seconds": 0.01425
+    },
+    {
+      "model": "standard",
+      "variant": "th100",
+      "prediction": "s8r9",
+      "seconds": 0.01268
+    },
+    {
+      "model": "standard",
+      "variant": "th100_crop175",
+      "prediction": "s8r9",
+      "seconds": 0.01181
+    },
+    {
+      "model": "standard",
+      "variant": "th100_up2",
+      "prediction": "s8rg9",
+      "seconds": 0.01664
+    },
+    {
+      "model": "standard",
+      "variant": "th100_up3",
+      "prediction": "serg9",
+      "seconds": 0.01814
+    },
+    {
+      "model": "standard",
+      "variant": "th105",
+      "prediction": "s9r99",
+      "seconds": 0.0157
+    },
+    {
+      "model": "standard",
+      "variant": "th105_crop175",
+      "prediction": "S89",
+      "seconds": 0.01201
+    },
+    {
+      "model": "standard",
+      "variant": "th105_up2",
+      "prediction": "serg9",
+      "seconds": 0.01562
+    },
+    {
+      "model": "standard",
+      "variant": "th105_up3",
+      "prediction": "s8rg9",
+      "seconds": 0.01801
+    },
+    {
+      "model": "standard",
+      "variant": "th110",
+      "prediction": "s8rg9",
+      "seconds": 0.01594
+    },
+    {
+      "model": "standard",
+      "variant": "th110_crop175",
+      "prediction": "68g9",
+      "seconds": 0.01216
+    },
+    {
+      "model": "standard",
+      "variant": "th110_up2",
+      "prediction": "S8rg9",
+      "seconds": 0.01696
+    },
+    {
+      "model": "standard",
+      "variant": "th110_up3",
+      "prediction": "s8rg9",
+      "seconds": 0.01811
+    },
+    {
+      "model": "standard",
+      "variant": "th115",
+      "prediction": "68cg9",
+      "seconds": 0.01718
+    },
+    {
+      "model": "standard",
+      "variant": "th115_crop175",
+      "prediction": "68cg9",
+      "seconds": 0.01339
+    },
+    {
+      "model": "standard",
+      "variant": "th115_up2",
+      "prediction": "68cg9",
+      "seconds": 0.01614
+    },
+    {
+      "model": "standard",
+      "variant": "th115_up3",
+      "prediction": "6ecg9",
+      "seconds": 0.01804
+    },
+    {
+      "model": "standard",
+      "variant": "th120",
+      "prediction": "68cg",
+      "seconds": 0.01566
+    },
+    {
+      "model": "standard",
+      "variant": "th120_crop175",
+      "prediction": "68cg",
+      "seconds": 0.01255
+    },
+    {
+      "model": "standard",
+      "variant": "th120_up2",
+      "prediction": "6ecgs",
+      "seconds": 0.01652
+    },
+    {
+      "model": "standard",
+      "variant": "th120_up3",
+      "prediction": "6ecgs",
+      "seconds": 0.01749
+    },
+    {
+      "model": "standard",
+      "variant": "th125",
+      "prediction": "69Rg9",
+      "seconds": 0.01581
+    },
+    {
+      "model": "standard",
+      "variant": "th125_crop175",
+      "prediction": "69g",
+      "seconds": 0.01183
+    },
+    {
+      "model": "standard",
+      "variant": "th125_up2",
+      "prediction": "69rg9",
+      "seconds": 0.01621
+    },
+    {
+      "model": "standard",
+      "variant": "th125_up3",
+      "prediction": "69rgsm",
+      "seconds": 0.01771
+    },
+    {
+      "model": "standard",
+      "variant": "th130",
+      "prediction": "69rg9",
+      "seconds": 0.01275
+    },
+    {
+      "model": "standard",
+      "variant": "th130_crop175",
+      "prediction": "69",
+      "seconds": 0.0095
+    },
+    {
+      "model": "standard",
+      "variant": "th130_up2",
+      "prediction": "69Fg9",
+      "seconds": 0.01341
+    },
+    {
+      "model": "standard",
+      "variant": "th130_up3",
+      "prediction": "69rgs",
+      "seconds": 0.01444
+    },
+    {
+      "model": "standard",
+      "variant": "th135",
+      "prediction": "69Fg9",
+      "seconds": 0.0126
+    },
+    {
+      "model": "standard",
+      "variant": "th135_crop175",
+      "prediction": "69g9",
+      "seconds": 0.00959
+    },
+    {
+      "model": "standard",
+      "variant": "th135_up2",
+      "prediction": "69rg9",
+      "seconds": 0.01349
+    },
+    {
+      "model": "standard",
+      "variant": "th135_up3",
+      "prediction": "69rg9",
+      "seconds": 0.01454
+    },
+    {
+      "model": "standard",
+      "variant": "th140",
+      "prediction": "69Fg9",
+      "seconds": 0.01243
+    },
+    {
+      "model": "standard",
+      "variant": "th140_crop175",
+      "prediction": "69g9",
+      "seconds": 0.00942
+    },
+    {
+      "model": "standard",
+      "variant": "th140_up2",
+      "prediction": "69Fg9",
+      "seconds": 0.01298
+    },
+    {
+      "model": "standard",
+      "variant": "th140_up3",
+      "prediction": "69rg9",
+      "seconds": 0.01445
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th50",
+      "prediction": "s99",
+      "seconds": 0.01293
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th50_up3",
+      "prediction": "s99",
+      "seconds": 0.01408
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th60",
+      "prediction": "s8r9",
+      "seconds": 0.01241
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th60_up3",
+      "prediction": "s9r9",
+      "seconds": 0.01401
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th70",
+      "prediction": "sorgS",
+      "seconds": 0.01241
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th70_up3",
+      "prediction": "5orgS",
+      "seconds": 0.01412
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th80",
+      "prediction": "s8r9S",
+      "seconds": 0.01233
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th80_up3",
+      "prediction": "s8rgS",
+      "seconds": 0.01419
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th90",
+      "prediction": "s9rg",
+      "seconds": 0.01229
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th90_up3",
+      "prediction": "s9rg",
+      "seconds": 0.01443
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th100",
+      "prediction": "s8rg9",
+      "seconds": 0.01282
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th100_up3",
+      "prediction": "s8rg9",
+      "seconds": 0.01394
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th110",
+      "prediction": "s8rg",
+      "seconds": 0.01278
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th110_up3",
+      "prediction": "s8rgs",
+      "seconds": 0.01432
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th120",
+      "prediction": "6ecgs",
+      "seconds": 0.01261
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th120_up3",
+      "prediction": "6ecgs",
+      "seconds": 0.01409
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th130",
+      "prediction": "69cgs",
+      "seconds": 0.01336
+    },
+    {
+      "model": "standard",
+      "variant": "med3_th130_up3",
+      "prediction": "69cgs",
+      "seconds": 0.01426
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th50",
+      "prediction": "o9",
+      "seconds": 0.01276
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th50_up3",
+      "prediction": "o9",
+      "seconds": 0.01432
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th60",
+      "prediction": "S99",
+      "seconds": 0.01272
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th60_up3",
+      "prediction": "S99E",
+      "seconds": 0.01436
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th70",
+      "prediction": "Ssr9e",
+      "seconds": 0.01248
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th70_up3",
+      "prediction": "Sorge",
+      "seconds": 0.01406
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th80",
+      "prediction": "s9rg9",
+      "seconds": 0.01251
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th80_up3",
+      "prediction": "s9rg9",
+      "seconds": 0.01436
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th90",
+      "prediction": "s9rgs",
+      "seconds": 0.01262
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th90_up3",
+      "prediction": "s9rgs",
+      "seconds": 0.01408
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th100",
+      "prediction": "s9rgs",
+      "seconds": 0.01303
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th100_up3",
+      "prediction": "s9rgs",
+      "seconds": 0.01403
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th110",
+      "prediction": "69r99",
+      "seconds": 0.01248
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th110_up3",
+      "prediction": "69r99",
+      "seconds": 0.01416
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th120",
+      "prediction": "68rg9",
+      "seconds": 0.01247
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th120_up3",
+      "prediction": "68r99",
+      "seconds": 0.01438
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th130",
+      "prediction": "68r98",
+      "seconds": 0.01233
+    },
+    {
+      "model": "standard",
+      "variant": "med5_th130_up3",
+      "prediction": "68rga",
+      "seconds": 0.01408
+    },
+    {
+      "model": "standard",
+      "variant": "open2x2",
+      "prediction": "68cg9",
+      "seconds": 0.0125
+    },
+    {
+      "model": "standard",
+      "variant": "open2x3",
+      "prediction": "68cgs",
+      "seconds": 0.01258
+    },
+    {
+      "model": "standard",
+      "variant": "open3x2",
+      "prediction": "6erg9",
+      "seconds": 0.01272
+    },
+    {
+      "model": "standard",
+      "variant": "open3x3",
+      "prediction": "68r9",
+      "seconds": 0.01215
     },
     {
       "model": "beta",
+      "variant": "original",
       "prediction": "68gm",
-      "seconds": 0.09517574310302734
+      "seconds": 0.01945
+    },
+    {
+      "model": "beta",
+      "variant": "crop155",
+      "prediction": "68g",
+      "seconds": 0.01402
+    },
+    {
+      "model": "beta",
+      "variant": "crop165",
+      "prediction": "68gm",
+      "seconds": 0.01433
+    },
+    {
+      "model": "beta",
+      "variant": "crop175",
+      "prediction": "68gm",
+      "seconds": 0.01496
+    },
+    {
+      "model": "beta",
+      "variant": "crop185",
+      "prediction": "68gm",
+      "seconds": 0.01561
+    },
+    {
+      "model": "beta",
+      "variant": "crop200",
+      "prediction": "68gm",
+      "seconds": 0.01659
+    },
+    {
+      "model": "beta",
+      "variant": "crop220",
+      "prediction": "58gm",
+      "seconds": 0.01791
+    },
+    {
+      "model": "beta",
+      "variant": "crop240",
+      "prediction": "68gm",
+      "seconds": 0.01874
+    },
+    {
+      "model": "beta",
+      "variant": "th45",
+      "prediction": "8gm",
+      "seconds": 0.01816
+    },
+    {
+      "model": "beta",
+      "variant": "th45_crop175",
+      "prediction": "89m",
+      "seconds": 0.01429
+    },
+    {
+      "model": "beta",
+      "variant": "th45_up2",
+      "prediction": "8gm",
+      "seconds": 0.01962
+    },
+    {
+      "model": "beta",
+      "variant": "th45_up3",
+      "prediction": "8gm",
+      "seconds": 0.02037
+    },
+    {
+      "model": "beta",
+      "variant": "th50",
+      "prediction": "S8gm",
+      "seconds": 0.01879
+    },
+    {
+      "model": "beta",
+      "variant": "th50_crop175",
+      "prediction": "89m",
+      "seconds": 0.01481
+    },
+    {
+      "model": "beta",
+      "variant": "th50_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01956
+    },
+    {
+      "model": "beta",
+      "variant": "th50_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02006
+    },
+    {
+      "model": "beta",
+      "variant": "th55",
+      "prediction": "S8gm",
+      "seconds": 0.01823
+    },
+    {
+      "model": "beta",
+      "variant": "th55_crop175",
+      "prediction": "S8gm",
+      "seconds": 0.01429
+    },
+    {
+      "model": "beta",
+      "variant": "th55_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01895
+    },
+    {
+      "model": "beta",
+      "variant": "th55_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02
+    },
+    {
+      "model": "beta",
+      "variant": "th60",
+      "prediction": "S8gm",
+      "seconds": 0.01849
+    },
+    {
+      "model": "beta",
+      "variant": "th60_crop175",
+      "prediction": "S8gm",
+      "seconds": 0.01439
+    },
+    {
+      "model": "beta",
+      "variant": "th60_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01846
+    },
+    {
+      "model": "beta",
+      "variant": "th60_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02006
+    },
+    {
+      "model": "beta",
+      "variant": "th65",
+      "prediction": "S8gm",
+      "seconds": 0.01835
+    },
+    {
+      "model": "beta",
+      "variant": "th65_crop175",
+      "prediction": "58gm",
+      "seconds": 0.01448
+    },
+    {
+      "model": "beta",
+      "variant": "th65_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01887
+    },
+    {
+      "model": "beta",
+      "variant": "th65_up3",
+      "prediction": "S8gm",
+      "seconds": 0.01991
+    },
+    {
+      "model": "beta",
+      "variant": "th70",
+      "prediction": "S8gm",
+      "seconds": 0.01851
+    },
+    {
+      "model": "beta",
+      "variant": "th70_crop175",
+      "prediction": "58gm",
+      "seconds": 0.01461
+    },
+    {
+      "model": "beta",
+      "variant": "th70_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01861
+    },
+    {
+      "model": "beta",
+      "variant": "th70_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02004
+    },
+    {
+      "model": "beta",
+      "variant": "th75",
+      "prediction": "S8gm",
+      "seconds": 0.01797
+    },
+    {
+      "model": "beta",
+      "variant": "th75_crop175",
+      "prediction": "58gm",
+      "seconds": 0.01467
+    },
+    {
+      "model": "beta",
+      "variant": "th75_up2",
+      "prediction": "S8gm",
+      "seconds": 0.0193
+    },
+    {
+      "model": "beta",
+      "variant": "th75_up3",
+      "prediction": "S8gm",
+      "seconds": 0.01969
+    },
+    {
+      "model": "beta",
+      "variant": "th80",
+      "prediction": "S8gm",
+      "seconds": 0.01879
+    },
+    {
+      "model": "beta",
+      "variant": "th80_crop175",
+      "prediction": "S8gm",
+      "seconds": 0.01438
+    },
+    {
+      "model": "beta",
+      "variant": "th80_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01851
+    },
+    {
+      "model": "beta",
+      "variant": "th80_up3",
+      "prediction": "S8gm",
+      "seconds": 0.01987
+    },
+    {
+      "model": "beta",
+      "variant": "th85",
+      "prediction": "S8gm",
+      "seconds": 0.01822
+    },
+    {
+      "model": "beta",
+      "variant": "th85_crop175",
+      "prediction": "S8gm",
+      "seconds": 0.01446
+    },
+    {
+      "model": "beta",
+      "variant": "th85_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01908
+    },
+    {
+      "model": "beta",
+      "variant": "th85_up3",
+      "prediction": "S8gm",
+      "seconds": 0.01974
+    },
+    {
+      "model": "beta",
+      "variant": "th90",
+      "prediction": "S8gm",
+      "seconds": 0.0183
+    },
+    {
+      "model": "beta",
+      "variant": "th90_crop175",
+      "prediction": "s8gm",
+      "seconds": 0.01478
+    },
+    {
+      "model": "beta",
+      "variant": "th90_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01861
+    },
+    {
+      "model": "beta",
+      "variant": "th90_up3",
+      "prediction": "S8gm",
+      "seconds": 0.0202
+    },
+    {
+      "model": "beta",
+      "variant": "th95",
+      "prediction": "S8gm",
+      "seconds": 0.01915
+    },
+    {
+      "model": "beta",
+      "variant": "th95_crop175",
+      "prediction": "58gm",
+      "seconds": 0.01474
+    },
+    {
+      "model": "beta",
+      "variant": "th95_up2",
+      "prediction": "S8gm",
+      "seconds": 0.01925
+    },
+    {
+      "model": "beta",
+      "variant": "th95_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02035
+    },
+    {
+      "model": "beta",
+      "variant": "th100",
+      "prediction": "S8ggm",
+      "seconds": 0.01826
+    },
+    {
+      "model": "beta",
+      "variant": "th100_crop175",
+      "prediction": "s8gm",
+      "seconds": 0.01482
+    },
+    {
+      "model": "beta",
+      "variant": "th100_up2",
+      "prediction": "S8ggm",
+      "seconds": 0.01929
+    },
+    {
+      "model": "beta",
+      "variant": "th100_up3",
+      "prediction": "S8ggm",
+      "seconds": 0.02075
+    },
+    {
+      "model": "beta",
+      "variant": "th105",
+      "prediction": "S8ggm",
+      "seconds": 0.01885
+    },
+    {
+      "model": "beta",
+      "variant": "th105_crop175",
+      "prediction": "88gm",
+      "seconds": 0.01481
+    },
+    {
+      "model": "beta",
+      "variant": "th105_up2",
+      "prediction": "S8gm",
+      "seconds": 0.0189
+    },
+    {
+      "model": "beta",
+      "variant": "th105_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02014
+    },
+    {
+      "model": "beta",
+      "variant": "th110",
+      "prediction": "88ggm",
+      "seconds": 0.01856
+    },
+    {
+      "model": "beta",
+      "variant": "th110_crop175",
+      "prediction": "88gm",
+      "seconds": 0.01467
+    },
+    {
+      "model": "beta",
+      "variant": "th110_up2",
+      "prediction": "88ggm",
+      "seconds": 0.01901
+    },
+    {
+      "model": "beta",
+      "variant": "th110_up3",
+      "prediction": "88ggm",
+      "seconds": 0.01972
+    },
+    {
+      "model": "beta",
+      "variant": "th115",
+      "prediction": "88g9m",
+      "seconds": 0.01849
+    },
+    {
+      "model": "beta",
+      "variant": "th115_crop175",
+      "prediction": "88gm",
+      "seconds": 0.01433
+    },
+    {
+      "model": "beta",
+      "variant": "th115_up2",
+      "prediction": "88ggm",
+      "seconds": 0.01901
+    },
+    {
+      "model": "beta",
+      "variant": "th115_up3",
+      "prediction": "88ggm",
+      "seconds": 0.02026
+    },
+    {
+      "model": "beta",
+      "variant": "th120",
+      "prediction": "68g9m",
+      "seconds": 0.01856
+    },
+    {
+      "model": "beta",
+      "variant": "th120_crop175",
+      "prediction": "68gm",
+      "seconds": 0.01494
+    },
+    {
+      "model": "beta",
+      "variant": "th120_up2",
+      "prediction": "68gm",
+      "seconds": 0.01872
+    },
+    {
+      "model": "beta",
+      "variant": "th120_up3",
+      "prediction": "68gm",
+      "seconds": 0.02035
+    },
+    {
+      "model": "beta",
+      "variant": "th125",
+      "prediction": "68gm",
+      "seconds": 0.01877
+    },
+    {
+      "model": "beta",
+      "variant": "th125_crop175",
+      "prediction": "68gm",
+      "seconds": 0.0147
+    },
+    {
+      "model": "beta",
+      "variant": "th125_up2",
+      "prediction": "68gm",
+      "seconds": 0.01903
+    },
+    {
+      "model": "beta",
+      "variant": "th125_up3",
+      "prediction": "68gm",
+      "seconds": 0.01962
+    },
+    {
+      "model": "beta",
+      "variant": "th130",
+      "prediction": "68gsm",
+      "seconds": 0.0185
+    },
+    {
+      "model": "beta",
+      "variant": "th130_crop175",
+      "prediction": "68gsm",
+      "seconds": 0.01478
+    },
+    {
+      "model": "beta",
+      "variant": "th130_up2",
+      "prediction": "68gsm",
+      "seconds": 0.01887
+    },
+    {
+      "model": "beta",
+      "variant": "th130_up3",
+      "prediction": "68gsm",
+      "seconds": 0.02012
+    },
+    {
+      "model": "beta",
+      "variant": "th135",
+      "prediction": "68g9M",
+      "seconds": 0.0183
+    },
+    {
+      "model": "beta",
+      "variant": "th135_crop175",
+      "prediction": "68gm",
+      "seconds": 0.01458
+    },
+    {
+      "model": "beta",
+      "variant": "th135_up2",
+      "prediction": "68gM",
+      "seconds": 0.01903
+    },
+    {
+      "model": "beta",
+      "variant": "th135_up3",
+      "prediction": "68gM",
+      "seconds": 0.02002
+    },
+    {
+      "model": "beta",
+      "variant": "th140",
+      "prediction": "68Rg9M",
+      "seconds": 0.01877
+    },
+    {
+      "model": "beta",
+      "variant": "th140_crop175",
+      "prediction": "68gm",
+      "seconds": 0.01447
+    },
+    {
+      "model": "beta",
+      "variant": "th140_up2",
+      "prediction": "68RgM",
+      "seconds": 0.01878
+    },
+    {
+      "model": "beta",
+      "variant": "th140_up3",
+      "prediction": "68Rgm",
+      "seconds": 0.02028
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th50",
+      "prediction": "agEm",
+      "seconds": 0.01853
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th50_up3",
+      "prediction": "agEm",
+      "seconds": 0.02018
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th60",
+      "prediction": "S8gm",
+      "seconds": 0.01854
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th60_up3",
+      "prediction": "S8gm",
+      "seconds": 0.01996
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th70",
+      "prediction": "agm",
+      "seconds": 0.01826
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th70_up3",
+      "prediction": "agm",
+      "seconds": 0.01993
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th80",
+      "prediction": "8gm",
+      "seconds": 0.01837
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th80_up3",
+      "prediction": "8gm",
+      "seconds": 0.01987
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th90",
+      "prediction": "S8gm",
+      "seconds": 0.01845
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th90_up3",
+      "prediction": "8gm",
+      "seconds": 0.01969
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th100",
+      "prediction": "8gem",
+      "seconds": 0.01865
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th100_up3",
+      "prediction": "8gm",
+      "seconds": 0.02016
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th110",
+      "prediction": "S8gm",
+      "seconds": 0.01856
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th110_up3",
+      "prediction": "S8gm",
+      "seconds": 0.02004
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th120",
+      "prediction": "68ga",
+      "seconds": 0.01828
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th120_up3",
+      "prediction": "68ga",
+      "seconds": 0.02015
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th130",
+      "prediction": "68g8",
+      "seconds": 0.01816
+    },
+    {
+      "model": "beta",
+      "variant": "med3_th130_up3",
+      "prediction": "68g8",
+      "seconds": 0.0196
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th50",
+      "prediction": "o9",
+      "seconds": 0.01812
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th50_up3",
+      "prediction": "o9",
+      "seconds": 0.01981
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th60",
+      "prediction": "osS",
+      "seconds": 0.01891
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th60_up3",
+      "prediction": "ogS",
+      "seconds": 0.02026
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th70",
+      "prediction": "ogS",
+      "seconds": 0.019
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th70_up3",
+      "prediction": "ogS",
+      "seconds": 0.02067
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th80",
+      "prediction": "8gm",
+      "seconds": 0.01861
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th80_up3",
+      "prediction": "8gm",
+      "seconds": 0.02032
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th90",
+      "prediction": "8go",
+      "seconds": 0.01814
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th90_up3",
+      "prediction": "8go",
+      "seconds": 0.0203
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th100",
+      "prediction": "8so",
+      "seconds": 0.01827
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th100_up3",
+      "prediction": "8ga",
+      "seconds": 0.02032
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th110",
+      "prediction": "sogs",
+      "seconds": 0.0184
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th110_up3",
+      "prediction": "sogs",
+      "seconds": 0.02001
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th120",
+      "prediction": "6oga",
+      "seconds": 0.01847
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th120_up3",
+      "prediction": "6oga",
+      "seconds": 0.0204
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th130",
+      "prediction": "68g",
+      "seconds": 0.01863
+    },
+    {
+      "model": "beta",
+      "variant": "med5_th130_up3",
+      "prediction": "68g",
+      "seconds": 0.02034
+    },
+    {
+      "model": "beta",
+      "variant": "open2x2",
+      "prediction": "68gSM",
+      "seconds": 0.01817
+    },
+    {
+      "model": "beta",
+      "variant": "open2x3",
+      "prediction": "68gM",
+      "seconds": 0.01867
+    },
+    {
+      "model": "beta",
+      "variant": "open3x2",
+      "prediction": "68gSm",
+      "seconds": 0.01885
+    },
+    {
+      "model": "beta",
+      "variant": "open3x3",
+      "prediction": "68ggm",
+      "seconds": 0.01838
     }
-  ]
+  ],
+  "exact": []
 }
