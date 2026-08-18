@@ -1,0 +1,180 @@
+name: tmp-captcha-probe
+
+on:
+  push:
+    branches:
+      - 'tmp/captcha-probe-20260818'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe CAPTCHA service
+        shell: bash
+        run: |
+          set -u
+          mkdir -p probe
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import http.cookiejar
+          import json
+          import os
+          import re
+          import socket
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from html.parser import HTMLParser
+
+          TARGET = 'http://3.35.97.192:39111'
+          OUT = 'probe'
+          os.makedirs(OUT, exist_ok=True)
+
+          class Parser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.refs = []
+                  self.forms = []
+                  self.current_form = None
+              def handle_starttag(self, tag, attrs):
+                  d = dict(attrs)
+                  for key in ('src', 'href'):
+                      if key in d:
+                          self.refs.append((tag, key, d[key]))
+                  if tag == 'form':
+                      self.current_form = {'attrs': d, 'inputs': []}
+                      self.forms.append(self.current_form)
+                  elif tag in ('input', 'button', 'textarea', 'select') and self.current_form is not None:
+                      self.current_form['inputs'].append({'tag': tag, **d})
+              def handle_endtag(self, tag):
+                  if tag == 'form':
+                      self.current_form = None
+
+          cj = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+          opener.addheaders = [
+              ('User-Agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'),
+              ('Accept', 'text/html,application/xhtml+xml,application/json,image/avif,image/webp,*/*;q=0.8'),
+          ]
+
+          records = []
+          fetched = set()
+
+          def safe_name(url):
+              p = urllib.parse.urlparse(url)
+              raw = (p.path.strip('/') or 'root') + (('_' + p.query) if p.query else '')
+              raw = re.sub(r'[^A-Za-z0-9._-]+', '_', raw)[:120]
+              return raw + '_' + hashlib.sha256(url.encode()).hexdigest()[:10]
+
+          def fetch(url, label=None):
+              if url in fetched:
+                  return None
+              fetched.add(url)
+              name = safe_name(url)
+              rec = {'url': url, 'label': label, 'name': name}
+              start = time.time()
+              try:
+                  req = urllib.request.Request(url, method='GET')
+                  with opener.open(req, timeout=12) as r:
+                      body = r.read(2_000_000)
+                      rec.update({
+                          'status': getattr(r, 'status', None),
+                          'final_url': r.geturl(),
+                          'headers': dict(r.headers.items()),
+                          'elapsed': round(time.time() - start, 4),
+                          'body_len': len(body),
+                      })
+              except urllib.error.HTTPError as e:
+                  body = e.read(2_000_000)
+                  rec.update({
+                      'status': e.code,
+                      'final_url': e.geturl(),
+                      'headers': dict(e.headers.items()),
+                      'elapsed': round(time.time() - start, 4),
+                      'body_len': len(body),
+                      'http_error': str(e),
+                  })
+              except Exception as e:
+                  rec.update({'error': repr(e), 'elapsed': round(time.time() - start, 4)})
+                  records.append(rec)
+                  print('FETCH_ERROR', json.dumps(rec, ensure_ascii=False))
+                  return rec
+
+              body_path = os.path.join(OUT, name + '.body')
+              hdr_path = os.path.join(OUT, name + '.headers.json')
+              open(body_path, 'wb').write(body)
+              open(hdr_path, 'w', encoding='utf-8').write(json.dumps(rec, ensure_ascii=False, indent=2))
+              records.append(rec)
+              print('FETCH_OK', json.dumps(rec, ensure_ascii=False))
+              ctype = rec.get('headers', {}).get('Content-Type', '')
+              if ('text' in ctype or 'json' in ctype or 'javascript' in ctype or 'xml' in ctype or body[:1] in (b'{', b'[', b'<')):
+                  print('----- BODY', url, '-----')
+                  print(body[:25000].decode('utf-8', 'replace'))
+                  print('----- END BODY -----')
+              else:
+                  print('BODY_BASE64_PREFIX', base64.b64encode(body[:3000]).decode())
+              return rec, body
+
+          print('DNS', socket.gethostbyaddr('3.35.97.192') if True else None)
+          root = fetch(TARGET + '/', 'root')
+          dynamic = []
+          if isinstance(root, tuple):
+              rec, body = root
+              text = body.decode('utf-8', 'replace')
+              parser = Parser()
+              try:
+                  parser.feed(text)
+              except Exception as e:
+                  print('HTML_PARSE_ERROR', repr(e))
+              print('FORMS', json.dumps(parser.forms, ensure_ascii=False, indent=2))
+              print('REFS', json.dumps(parser.refs, ensure_ascii=False, indent=2))
+              open(os.path.join(OUT, 'forms.json'), 'w', encoding='utf-8').write(json.dumps(parser.forms, ensure_ascii=False, indent=2))
+              open(os.path.join(OUT, 'refs.json'), 'w', encoding='utf-8').write(json.dumps(parser.refs, ensure_ascii=False, indent=2))
+              for tag, key, ref in parser.refs:
+                  u = urllib.parse.urljoin(rec.get('final_url') or TARGET + '/', ref)
+                  p = urllib.parse.urlparse(u)
+                  if p.scheme in ('http', 'https') and p.netloc == urllib.parse.urlparse(TARGET).netloc:
+                      dynamic.append((u, f'{tag}:{key}'))
+              # Extract URL-looking strings from inline JS/HTML as well.
+              for m in re.finditer(r'''(?i)(?:fetch|axios\.(?:get|post)|url\s*[:=])\s*\(?\s*["']([^"']+)["']''', text):
+                  u = urllib.parse.urljoin(TARGET + '/', m.group(1))
+                  if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(TARGET).netloc:
+                      dynamic.append((u, 'inline-js'))
+
+          common = [
+              '/robots.txt', '/favicon.ico', '/sitemap.xml',
+              '/captcha', '/captcha/', '/captcha/new', '/captcha/generate', '/captcha/image', '/captcha/verify',
+              '/api/captcha', '/api/captcha/new', '/api/captcha/generate', '/api/captcha/verify',
+              '/verify', '/api/verify', '/protected', '/api/protected', '/flag', '/api/flag', '/admin', '/secret',
+              '/static/app.js', '/app.js', '/main.js', '/script.js', '/static/js/app.js',
+          ]
+          for u, label in dynamic[:60]:
+              fetch(u, label)
+          for path in common:
+              fetch(urllib.parse.urljoin(TARGET + '/', path), 'common-path')
+
+          cookies = []
+          for c in cj:
+              cookies.append({k: getattr(c, k) for k in ('name','value','domain','path','secure','expires')})
+          open(os.path.join(OUT, 'cookies.json'), 'w', encoding='utf-8').write(json.dumps(cookies, ensure_ascii=False, indent=2))
+          open(os.path.join(OUT, 'records.json'), 'w', encoding='utf-8').write(json.dumps(records, ensure_ascii=False, indent=2))
+          print('COOKIES', json.dumps(cookies, ensure_ascii=False, indent=2))
+          print('RECORDS', json.dumps(records, ensure_ascii=False, indent=2))
+          PY
+
+          echo '=== artifact inventory ==='
+          find probe -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: captcha-probe
+          path: probe/
+          if-no-files-found: warn
+          retention-days: 1
