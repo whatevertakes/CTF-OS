@@ -1,4 +1,4 @@
-name: tmp-captcha-ocr-solve
+name: tmp-captcha-offline-ensemble-analysis
 
 on:
   push:
@@ -10,256 +10,196 @@ permissions:
   contents: write
 
 jobs:
-  solve:
+  analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
         with:
           ref: tmp/captcha-probe-20260818
-
-      - name: Install CAPTCHA OCR runtime
+      - name: Analyze labeled OCR predictions
         shell: bash
         run: |
-          python3 -m pip install --disable-pip-version-check --quiet ddddocr opencv-python-headless requests
-
-      - name: Evaluate OCR and solve
-        shell: bash
-        run: |
-          rm -rf captcha-ocr-results
-          mkdir -p captcha-ocr-results
+          rm -rf captcha-analysis
+          mkdir -p captcha-analysis
           python3 - <<'PY'
-          import collections
-          import io
-          import json
-          import os
-          import re
-          import time
+          import collections, itertools, json, math
           from pathlib import Path
 
-          import cv2
-          import ddddocr
-          import numpy as np
-          import requests
-          from PIL import Image
+          events=json.loads(Path('captcha-ocr-results/events.json').read_text())
+          rows=[]
+          for ev in events:
+              if ev.get('type')=='known_sample':
+                  rows.append({'expected':ev['expected'],'details':ev['details'],'origin':'known'})
+              if ev.get('type')=='evaluation':
+                  for r in ev.get('rows',[]):
+                      if r.get('expected'):
+                          rows.append({'expected':r['expected'],'details':r['prediction']['details'],'origin':'eval'})
 
-          BASE = 'http://3.35.97.192:39111'
-          OUT = Path('captcha-ocr-results')
-          OUT.mkdir(exist_ok=True)
-          ALLOWED = set('abcdefghjkmnpqrstuvwxyz23456789')
-          log = []
+          def lev(a,b):
+              prev=list(range(len(b)+1))
+              for i,ca in enumerate(a,1):
+                  cur=[i]
+                  for j,cb in enumerate(b,1):
+                      cur.append(min(cur[-1]+1,prev[j]+1,prev[j-1]+(ca!=cb)))
+                  prev=cur
+              return prev[-1]
 
-          def emit(obj):
-              log.append(obj)
-              print(json.dumps(obj, ensure_ascii=False), flush=True)
-              (OUT / 'events.json').write_text(json.dumps(log, ensure_ascii=False, indent=2))
-
-          def clean(text):
-              text = (text or '').strip().lower()
-              return ''.join(ch for ch in text if ch in ALLOWED)
-
-          # One standard model and the package's beta model; initialize before a timed session.
-          models = []
-          for name, kwargs in [('standard', {}), ('beta', {'beta': True})]:
-              try:
-                  models.append((name, ddddocr.DdddOcr(show_ad=False, **kwargs)))
-                  emit({'type':'model_loaded','name':name})
-              except Exception as e:
-                  emit({'type':'model_load_error','name':name,'error':repr(e)})
-          if not models:
-              raise SystemExit('no OCR model loaded')
-
-          def enc(arr):
-              ok, buf = cv2.imencode('.png', arr)
-              if not ok:
-                  raise RuntimeError('png encoding failed')
-              return buf.tobytes()
-
-          def variants(raw):
-              arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-              if arr is None:
-                  return [('original', raw)]
-              h, w = arr.shape[:2]
-              result = [('original', raw)]
-              # Text is confined to the left/central area; right edge mostly carries long distractor lines.
-              for crop_name, crop in [
-                  ('crop190', arr[max(0,2):min(h,76), 2:min(w,190)]),
-                  ('crop175', arr[max(0,2):min(h,76), 2:min(w,175)]),
-                  ('crop160', arr[max(0,2):min(h,76), 2:min(w,160)]),
-              ]:
-                  result.append((crop_name, enc(crop)))
-              gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-              med = cv2.medianBlur(gray, 3)
-              gauss = cv2.GaussianBlur(gray, (3,3), 0)
-              for name, src in [('gray', gray), ('median', med), ('gauss', gauss)]:
-                  result.append((name, enc(src)))
-                  _, otsu = cv2.threshold(src, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                  result.append((name+'_otsu', enc(otsu)))
-                  # 3x enlargement helps OCR retain thick glyph strokes after thin-line suppression.
-                  up = cv2.resize(otsu, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-                  result.append((name+'_otsu_up3', enc(up)))
-              # Remove one-pixel dark lines while retaining thicker character strokes.
-              dark = cv2.threshold(gray, 190, 255, cv2.THRESH_BINARY_INV)[1]
-              opened = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
-              cleaned = 255 - opened
-              result.append(('stroke_open2', enc(cleaned)))
-              result.append(('stroke_open2_up3', enc(cv2.resize(cleaned, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC))))
-              return result
-
-          def predict(raw):
-              votes = []
-              details = []
-              vars_ = variants(raw)
-              for mname, model in models:
-                  for vname, data in vars_:
-                      try:
-                          p = clean(model.classification(data))
-                      except Exception as e:
-                          details.append({'model':mname,'variant':vname,'error':repr(e)})
-                          continue
-                      details.append({'model':mname,'variant':vname,'prediction':p})
-                      if 4 <= len(p) <= 7:
-                          votes.append(p)
-              counts = collections.Counter(votes)
-              ranked = counts.most_common()
-              best = ranked[0][0] if ranked else ''
-              best_count = ranked[0][1] if ranked else 0
-              second_count = ranked[1][1] if len(ranked) > 1 else 0
-              return {
-                  'best': best, 'best_count': best_count, 'second_count': second_count,
-                  'valid_votes': len(votes), 'ranked': ranked[:8], 'details': details,
+          sources=sorted({(d['model'],d['variant']) for r in rows for d in r['details'] if d.get('prediction') is not None})
+          stats={}
+          for src in sources:
+              vals=[]
+              for r in rows:
+                  p=next((d['prediction'] for d in r['details'] if (d['model'],d['variant'])==src), '')
+                  vals.append((p,r['expected']))
+              stats['/'.join(src)]={
+                  'exact':sum(p==e for p,e in vals),
+                  'total':len(vals),
+                  'accuracy':sum(p==e for p,e in vals)/len(vals),
+                  'mean_edit':sum(lev(p,e) for p,e in vals)/len(vals),
+                  'mean_len_delta':sum(len(p)-len(e) for p,e in vals)/len(vals),
               }
 
-          known_raw = Path('captcha-exploit-results/042.body').read_bytes()
-          known = predict(known_raw)
-          emit({'type':'known_sample','expected':'68rgsm', **known})
+          # Global alignment returning anchor columns and insertion slots.
+          def align(anchor,s):
+              n,m=len(anchor),len(s)
+              dp=[[0]*(m+1) for _ in range(n+1)]
+              bt=[[None]*(m+1) for _ in range(n+1)]
+              for i in range(1,n+1): dp[i][0]=i; bt[i][0]='D'
+              for j in range(1,m+1): dp[0][j]=j; bt[0][j]='I'
+              for i in range(1,n+1):
+                  for j in range(1,m+1):
+                      opts=[(dp[i-1][j-1]+(anchor[i-1]!=s[j-1]),'M'),(dp[i-1][j]+1,'D'),(dp[i][j-1]+1,'I')]
+                      # Prefer match/substitution, then insertion, then deletion for stable alignment.
+                      cost,op=min(opts,key=lambda x:(x[0], {'M':0,'I':1,'D':2}[x[1]]))
+                      dp[i][j]=cost; bt[i][j]=op
+              cols=['']*n; ins=['']*(n+1)
+              i,j=n,m
+              rev=[]
+              while i or j:
+                  op=bt[i][j]
+                  if op=='M': rev.append(('M',i-1,s[j-1])); i-=1;j-=1
+                  elif op=='D': rev.append(('D',i-1,'')); i-=1
+                  else: rev.append(('I',i,s[j-1])); j-=1
+              for op,pos,ch in reversed(rev):
+                  if op=='M': cols[pos]=ch
+                  elif op=='I': ins[pos]+=ch
+              return cols,ins
 
-          http = requests.Session()
-          http.headers.update({'User-Agent':'captcha-ctf-solver/1.0','Connection':'close'})
+          def source_weights(exclude_idx=None, alpha=2.0):
+              w={}
+              train=[r for i,r in enumerate(rows) if i!=exclude_idx]
+              for src in sources:
+                  ds=[]
+                  for r in train:
+                      p=next((d['prediction'] for d in r['details'] if (d['model'],d['variant'])==src), '')
+                      ds.append(lev(p,r['expected'])/max(1,len(r['expected'])))
+                  q=sum(ds)/len(ds)
+                  w[src]=math.exp(-alpha*q)
+              return w
 
-          def start_session():
-              r = http.post(BASE + '/start', timeout=10)
-              r.raise_for_status()
-              return r.json()
+          def predictions(r):
+              return [((d['model'],d['variant']),d.get('prediction','')) for d in r['details'] if d.get('prediction')]
 
-          def get_captcha(token):
-              r = http.get(BASE + '/captcha', headers={'Authorization':f'Bearer {token}'}, timeout=10)
-              return r
+          def medoid(r,w):
+              ps=predictions(r)
+              uniq=list(dict.fromkeys(p for _,p in ps))
+              def score(c): return sum(w[src]*lev(c,p) for src,p in ps)
+              return min(uniq,key=lambda c:(score(c),-len(c),c))
 
-          def submit(token, nonce, answer):
-              return http.post(BASE + '/submit', headers={'Authorization':f'Bearer {token}'},
-                               json={'token':token,'answer':answer,'round_nonce':nonce}, timeout=10)
+          def aligned_consensus(r,w):
+              ps=predictions(r)
+              anchor=medoid(r,w)
+              colvotes=[collections.Counter() for _ in anchor]
+              insvotes=[collections.Counter() for _ in range(len(anchor)+1)]
+              for src,p in ps:
+                  wt=w[src]
+                  cols,ins=align(anchor,p)
+                  for i,ch in enumerate(cols): colvotes[i][ch]+=wt
+                  for i,s in enumerate(ins): insvotes[i][s]+=wt
+              out=''
+              for i in range(len(anchor)+1):
+                  if insvotes[i]:
+                      s,sw=insvotes[i].most_common(1)[0]
+                      blank=sum(wt for src,wt in w.items())-sw
+                      if s and sw>blank*0.28: out+=s
+                  if i<len(anchor):
+                      votes=colvotes[i]
+                      if votes:
+                          ch,cw=votes.most_common(1)[0]
+                          if ch: out+=ch
+              return out
 
-          # Labeled evaluation from the service's own wrong-answer disclosure.
-          eval_rows = []
-          try:
-              sess = start_session(); tok = sess['token']
-              # Determine whether a pending CAPTCHA can be replaced without penalty.
-              r1 = get_captcha(tok)
-              r2 = get_captcha(tok)
-              emit({'type':'double_get_test','first_status':r1.status_code,'second_status':r2.status_code,
-                    'second_text':r2.text[:300] if r2.status_code != 200 else None,
-                    'nonce1':r1.headers.get('X-Round-Nonce'),'nonce2':r2.headers.get('X-Round-Nonce')})
-              if r2.status_code == 200:
-                  rr, active = r2, r2.content
-              else:
-                  rr, active = r1, r1.content
-              nonce = rr.headers.get('X-Round-Nonce')
-              pred = predict(active)
-              sr = submit(tok, nonce, '!')
-              js = sr.json() if sr.headers.get('content-type','').startswith('application/json') else {'text':sr.text}
-              expected = js.get('expected_answer')
-              eval_rows.append({'expected':expected,'prediction':pred,'status':sr.status_code})
-              for i in range(23):
-                  cr = get_captcha(tok)
-                  if cr.status_code != 200:
-                      emit({'type':'eval_get_error','index':i,'status':cr.status_code,'text':cr.text[:300]})
-                      break
-                  nonce = cr.headers.get('X-Round-Nonce')
-                  pred = predict(cr.content)
-                  sr = submit(tok, nonce, '!')
-                  try: js = sr.json()
-                  except Exception: js = {'text':sr.text}
-                  expected = js.get('expected_answer')
-                  eval_rows.append({'expected':expected,'prediction':pred,'status':sr.status_code})
-              exact = sum(1 for x in eval_rows if x['expected'] and x['prediction']['best'] == x['expected'])
-              consensus_exact = sum(1 for x in eval_rows if x['expected'] and x['prediction']['best'] == x['expected'] and x['prediction']['best_count'] >= 2)
-              emit({'type':'evaluation','samples':len(eval_rows),'exact':exact,
-                    'accuracy':exact/len(eval_rows) if eval_rows else 0,
-                    'consensus_exact':consensus_exact,
-                    'rows':eval_rows})
-          except Exception as e:
-              emit({'type':'evaluation_exception','error':repr(e)})
+          ALPH='abcdefghjkmnpqrstuvwxyz23456789'
+          def neighbors1(s):
+              yield s
+              for i in range(len(s)):
+                  yield s[:i]+s[i+1:]
+                  for ch in ALPH:
+                      if ch!=s[i]: yield s[:i]+ch+s[i+1:]
+              if len(s)<7:
+                  for i in range(len(s)+1):
+                      for ch in ALPH: yield s[:i]+ch+s[i:]
 
-          # Attempt several fresh 120-second sessions. Skip uncertain images only when double GET is supported.
-          double_get_allowed = any(x.get('type') == 'double_get_test' and x.get('second_status') == 200 for x in log)
-          flag = None
-          for attempt in range(1, 4):
-              try:
-                  sess = start_session(); token = sess['token']
-              except Exception as e:
-                  emit({'type':'start_error','attempt':attempt,'error':repr(e)})
-                  continue
-              deadline = time.monotonic() + min(float(sess.get('deadline_in',120)), 120) - 1.5
-              streak = 0
-              submitted = 0
-              skipped = 0
-              emit({'type':'solve_start','attempt':attempt,'deadline_in':sess.get('deadline_in')})
-              while time.monotonic() < deadline and streak < int(sess.get('target',60)):
-                  try:
-                      cr = get_captcha(token)
-                  except Exception as e:
-                      emit({'type':'captcha_exception','attempt':attempt,'error':repr(e)})
-                      break
-                  if cr.status_code != 200:
-                      emit({'type':'captcha_error','attempt':attempt,'status':cr.status_code,'text':cr.text[:300]})
-                      break
-                  nonce = cr.headers.get('X-Round-Nonce')
-                  pred = predict(cr.content)
-                  # Strict consensus when replacement is possible; otherwise use best available vote.
-                  confident = bool(pred['best']) and (
-                      not double_get_allowed or
-                      (pred['best_count'] >= 3 and pred['best_count'] >= pred['second_count'] + 2)
-                  )
-                  if not confident and double_get_allowed:
-                      skipped += 1
-                      if skipped <= 10 or skipped % 20 == 0:
-                          emit({'type':'skip','attempt':attempt,'streak':streak,'prediction':pred})
-                      continue
-                  answer = pred['best']
-                  if not answer:
-                      emit({'type':'empty_prediction','attempt':attempt,'prediction':pred})
-                      break
-                  sr = submit(token, nonce, answer)
-                  try: js = sr.json()
-                  except Exception: js = {'text':sr.text}
-                  submitted += 1
-                  emit({'type':'solve_round','attempt':attempt,'submitted':submitted,'skipped':skipped,
-                        'answer':answer,'prediction':pred,'status':sr.status_code,'response':js})
-                  if sr.status_code != 200:
-                      break
-                  streak = int(js.get('streak',0))
-                  if js.get('solved'):
-                      fr = http.get(BASE + '/flag', headers={'Authorization':f'Bearer {token}'}, timeout=10)
-                      try: fj = fr.json()
-                      except Exception: fj = {'text':fr.text}
-                      emit({'type':'flag_result','attempt':attempt,'status':fr.status_code,'response':fj})
-                      flag = fj.get('flag')
-                      break
-              emit({'type':'solve_end','attempt':attempt,'streak':streak,'submitted':submitted,
-                    'skipped':skipped,'flag':flag})
-              if flag:
-                  break
+          def neighborhood_consensus(r,w,topn=8,lenpen=0.25):
+              ps=predictions(r)
+              # Start from globally strong and diverse predictions.
+              ranked=sorted(ps,key=lambda x:(-w[x[0]],-len(x[1])))[:topn]
+              cands=set()
+              for _,p in ranked: cands.update(neighbors1(p))
+              lengths=[len(p) for _,p in ps]
+              # Weighted median-ish target length.
+              lscore=collections.Counter()
+              for src,p in ps: lscore[len(p)]+=w[src]
+              target_len=max(lscore,key=lscore.get)
+              def score(c):
+                  return sum(w[src]*lev(c,p) for src,p in ps)+lenpen*abs(len(c)-target_len)
+              return min(cands,key=lambda c:(score(c),abs(len(c)-target_len),c))
 
-          (OUT / 'RESULT.txt').write_text(flag or 'NO_FLAG')
+          alg_results=[]
+          for alpha in [0.5,1.0,1.5,2.0,3.0,4.0,6.0]:
+              for loo in [False,True]:
+                  preds_by_alg={'medoid':[],'aligned':[]}
+                  for i,r in enumerate(rows):
+                      w=source_weights(i if loo else None,alpha)
+                      preds_by_alg['medoid'].append(medoid(r,w))
+                      preds_by_alg['aligned'].append(aligned_consensus(r,w))
+                  for name,preds in preds_by_alg.items():
+                      alg_results.append({'algorithm':name,'alpha':alpha,'loo':loo,
+                          'exact':sum(p==r['expected'] for p,r in zip(preds,rows)),
+                          'total':len(rows),'predictions':[{'expected':r['expected'],'predicted':p} for p,r in zip(preds,rows)]})
+          for alpha in [0.5,1.0,1.5,2.0,3.0,4.0]:
+              for topn in [3,5,8,12,20]:
+                  for lenpen in [0,0.1,0.25,0.5,1.0]:
+                      preds=[]
+                      for i,r in enumerate(rows):
+                          w=source_weights(i,alpha)
+                          preds.append(neighborhood_consensus(r,w,topn,lenpen))
+                      alg_results.append({'algorithm':'neighbor1','alpha':alpha,'topn':topn,'lenpen':lenpen,'loo':True,
+                          'exact':sum(p==r['expected'] for p,r in zip(preds,rows)),
+                          'total':len(rows),'predictions':[{'expected':r['expected'],'predicted':p} for p,r in zip(preds,rows)]})
+
+          best=sorted(alg_results,key=lambda x:(-x['exact'], x.get('loo') is not True))[0:20]
+          report={
+              'row_count':len(rows),
+              'source_ranking':sorted(stats.items(),key=lambda kv:(-kv[1]['accuracy'],kv[1]['mean_edit'])),
+              'best_algorithms':best,
+          }
+          Path('captcha-analysis/report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+          Path('captcha-analysis/summary.txt').write_text('\n'.join([
+              f'rows={len(rows)}',
+              'top_sources:',
+              *[f"{k} exact={v['exact']}/{v['total']} mean_edit={v['mean_edit']:.3f} len_delta={v['mean_len_delta']:.3f}" for k,v in report['source_ranking'][:12]],
+              'top_algorithms:',
+              *[f"{x['algorithm']} exact={x['exact']}/{x['total']} alpha={x.get('alpha')} loo={x.get('loo')} topn={x.get('topn')} lenpen={x.get('lenpen')}" for x in best[:12]],
+          ]))
+          print(Path('captcha-analysis/summary.txt').read_text())
           PY
-
-      - name: Commit OCR results
-        if: always()
+      - name: Commit analysis
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f captcha-ocr-results
-          git commit -m 'chore: store temporary CAPTCHA OCR solve results' || exit 0
+          git add -f captcha-analysis
+          git commit -m 'chore: analyze CAPTCHA OCR ensemble' || exit 0
           git push origin HEAD:tmp/captcha-probe-20260818
