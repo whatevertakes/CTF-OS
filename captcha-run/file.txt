@@ -1,0 +1,1 @@
+captcha-image-artifact/known-68rgsm.png: PNG image data, 240 x 80, 8-bit/color RGB, non-interlaced

@@ -1,0 +1,24 @@
+{
+  "label": "68rgsm",
+  "byte_length": 14631,
+  "base64_length": 19508,
+  "part_size": 6000,
+  "part_count": 4,
+  "png_chunks": [
+    {
+      "type": "IHDR",
+      "length": 13,
+      "preview_hex": "000000f0000000500802000000"
+    },
+    {
+      "type": "IDAT",
+      "length": 14574,
+      "preview_hex": "789ced7d779c55d5b5ff5a7b9f7aeb74a6014307912655b120d8b0602fd8a2444d4cf4694c31467dfef29298a7bec4a8d1688cddd8bb62576c2845da80d48161"
+    },
+    {
+      "type": "IEND",
+      "length": 0,
+      "preview_hex": ""
+    }
+  ]
+}

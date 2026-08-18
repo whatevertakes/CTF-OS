@@ -1,0 +1,19 @@
+{
+  "url": "http://3.35.97.192:39111/docs",
+  "label": "a:href",
+  "name": "docs_aa7be36d94",
+  "status": 200,
+  "final_url": "http://3.35.97.192:39111/docs",
+  "headers": {
+    "date": "Tue, 18 Aug 2026 06:20:17 GMT",
+    "server": "uvicorn",
+    "content-length": "935",
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store, max-age=0",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+    "connection": "close"
+  },
+  "elapsed": 0.3726,
+  "body_len": 935
+}

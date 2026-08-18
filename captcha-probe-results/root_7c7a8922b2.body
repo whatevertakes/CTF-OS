@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>CAPTCHA</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <p class="eyebrow">KISIA CTF · MISC</p>
+        <h1>CAPTCHA</h1>
+        <p class="subtitle">
+          120초 안에 60개의 문자열을 연속으로 해독하세요.
+          한 번 틀리면 streak는 0으로 돌아갑니다.
+        </p>
+      </header>
+
+      <section class="status-grid" aria-label="도전 상태">
+        <div class="metric">
+          <span class="metric-label">STREAK</span>
+          <strong><span id="streak">0</span><span class="muted"> / </span><span id="target">60</span></strong>
+        </div>
+        <div class="metric">
+          <span class="metric-label">TIME LEFT</span>
+          <strong id="timer">02:00</strong>
+        </div>
+        <div class="metric connection">
+          <span class="metric-label">SESSION</span>
+          <strong id="session-state">READY</strong>
+        </div>
+      </section>
+
+      <section class="challenge-card">
+        <div id="idle-panel" class="idle-panel">
+          <p>세션은 시작 버튼을 누르는 순간부터 120초 동안 유지됩니다.</p>
+          <button id="start-button" class="primary" type="button">도전 시작</button>
+        </div>
+
+        <div id="round-panel" class="round-panel hidden">
+          <div class="image-frame">
+            <span id="image-placeholder">CAPTCHA를 불러오는 중…</span>
+            <img id="captcha-image" alt="현재 CAPTCHA" hidden>
+          </div>
+
+          <form id="answer-form" autocomplete="off">
+            <label for="answer">해독한 문자열</label>
+            <div class="answer-row">
+              <input
+                id="answer"
+                name="answer"
+                type="text"
+                minlength="4"
+                maxlength="7"
+                pattern="[abcdefghjkmnpqrstuvwxyz23456789]{4,7}"
+                placeholder="4~7 characters"
+                autocapitalize="none"
+                autocomplete="off"
+                spellcheck="false"
+                required
+              >
+              <button id="submit-button" class="primary" type="submit">제출</button>
+            </div>
+          </form>
+
+          <button id="next-button" class="secondary hidden" type="button">다음 CAPTCHA</button>
+          <p id="message" class="message" role="status" aria-live="polite"></p>
+          <pre id="flag" class="flag hidden"></pre>
+        </div>
+      </section>
+
+      <footer>
+        API를 직접 사용하려면 <a href="/docs">Swagger UI</a>를 확인하세요.
+      </footer>
+    </main>
+  </body>
+</html>

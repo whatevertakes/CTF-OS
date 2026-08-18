@@ -1,0 +1,205 @@
+name: tmp-captcha-offline-ensemble-analysis
+
+on:
+  push:
+    branches:
+      - 'tmp/captcha-probe-20260818'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/captcha-probe-20260818
+      - name: Analyze labeled OCR predictions
+        shell: bash
+        run: |
+          rm -rf captcha-analysis
+          mkdir -p captcha-analysis
+          python3 - <<'PY'
+          import collections, itertools, json, math
+          from pathlib import Path
+
+          events=json.loads(Path('captcha-ocr-results/events.json').read_text())
+          rows=[]
+          for ev in events:
+              if ev.get('type')=='known_sample':
+                  rows.append({'expected':ev['expected'],'details':ev['details'],'origin':'known'})
+              if ev.get('type')=='evaluation':
+                  for r in ev.get('rows',[]):
+                      if r.get('expected'):
+                          rows.append({'expected':r['expected'],'details':r['prediction']['details'],'origin':'eval'})
+
+          def lev(a,b):
+              prev=list(range(len(b)+1))
+              for i,ca in enumerate(a,1):
+                  cur=[i]
+                  for j,cb in enumerate(b,1):
+                      cur.append(min(cur[-1]+1,prev[j]+1,prev[j-1]+(ca!=cb)))
+                  prev=cur
+              return prev[-1]
+
+          sources=sorted({(d['model'],d['variant']) for r in rows for d in r['details'] if d.get('prediction') is not None})
+          stats={}
+          for src in sources:
+              vals=[]
+              for r in rows:
+                  p=next((d['prediction'] for d in r['details'] if (d['model'],d['variant'])==src), '')
+                  vals.append((p,r['expected']))
+              stats['/'.join(src)]={
+                  'exact':sum(p==e for p,e in vals),
+                  'total':len(vals),
+                  'accuracy':sum(p==e for p,e in vals)/len(vals),
+                  'mean_edit':sum(lev(p,e) for p,e in vals)/len(vals),
+                  'mean_len_delta':sum(len(p)-len(e) for p,e in vals)/len(vals),
+              }
+
+          # Global alignment returning anchor columns and insertion slots.
+          def align(anchor,s):
+              n,m=len(anchor),len(s)
+              dp=[[0]*(m+1) for _ in range(n+1)]
+              bt=[[None]*(m+1) for _ in range(n+1)]
+              for i in range(1,n+1): dp[i][0]=i; bt[i][0]='D'
+              for j in range(1,m+1): dp[0][j]=j; bt[0][j]='I'
+              for i in range(1,n+1):
+                  for j in range(1,m+1):
+                      opts=[(dp[i-1][j-1]+(anchor[i-1]!=s[j-1]),'M'),(dp[i-1][j]+1,'D'),(dp[i][j-1]+1,'I')]
+                      # Prefer match/substitution, then insertion, then deletion for stable alignment.
+                      cost,op=min(opts,key=lambda x:(x[0], {'M':0,'I':1,'D':2}[x[1]]))
+                      dp[i][j]=cost; bt[i][j]=op
+              cols=['']*n; ins=['']*(n+1)
+              i,j=n,m
+              rev=[]
+              while i or j:
+                  op=bt[i][j]
+                  if op=='M': rev.append(('M',i-1,s[j-1])); i-=1;j-=1
+                  elif op=='D': rev.append(('D',i-1,'')); i-=1
+                  else: rev.append(('I',i,s[j-1])); j-=1
+              for op,pos,ch in reversed(rev):
+                  if op=='M': cols[pos]=ch
+                  elif op=='I': ins[pos]+=ch
+              return cols,ins
+
+          def source_weights(exclude_idx=None, alpha=2.0):
+              w={}
+              train=[r for i,r in enumerate(rows) if i!=exclude_idx]
+              for src in sources:
+                  ds=[]
+                  for r in train:
+                      p=next((d['prediction'] for d in r['details'] if (d['model'],d['variant'])==src), '')
+                      ds.append(lev(p,r['expected'])/max(1,len(r['expected'])))
+                  q=sum(ds)/len(ds)
+                  w[src]=math.exp(-alpha*q)
+              return w
+
+          def predictions(r):
+              return [((d['model'],d['variant']),d.get('prediction','')) for d in r['details'] if d.get('prediction')]
+
+          def medoid(r,w):
+              ps=predictions(r)
+              uniq=list(dict.fromkeys(p for _,p in ps))
+              def score(c): return sum(w[src]*lev(c,p) for src,p in ps)
+              return min(uniq,key=lambda c:(score(c),-len(c),c))
+
+          def aligned_consensus(r,w):
+              ps=predictions(r)
+              anchor=medoid(r,w)
+              colvotes=[collections.Counter() for _ in anchor]
+              insvotes=[collections.Counter() for _ in range(len(anchor)+1)]
+              for src,p in ps:
+                  wt=w[src]
+                  cols,ins=align(anchor,p)
+                  for i,ch in enumerate(cols): colvotes[i][ch]+=wt
+                  for i,s in enumerate(ins): insvotes[i][s]+=wt
+              out=''
+              for i in range(len(anchor)+1):
+                  if insvotes[i]:
+                      s,sw=insvotes[i].most_common(1)[0]
+                      blank=sum(wt for src,wt in w.items())-sw
+                      if s and sw>blank*0.28: out+=s
+                  if i<len(anchor):
+                      votes=colvotes[i]
+                      if votes:
+                          ch,cw=votes.most_common(1)[0]
+                          if ch: out+=ch
+              return out
+
+          ALPH='abcdefghjkmnpqrstuvwxyz23456789'
+          def neighbors1(s):
+              yield s
+              for i in range(len(s)):
+                  yield s[:i]+s[i+1:]
+                  for ch in ALPH:
+                      if ch!=s[i]: yield s[:i]+ch+s[i+1:]
+              if len(s)<7:
+                  for i in range(len(s)+1):
+                      for ch in ALPH: yield s[:i]+ch+s[i:]
+
+          def neighborhood_consensus(r,w,topn=8,lenpen=0.25):
+              ps=predictions(r)
+              # Start from globally strong and diverse predictions.
+              ranked=sorted(ps,key=lambda x:(-w[x[0]],-len(x[1])))[:topn]
+              cands=set()
+              for _,p in ranked: cands.update(neighbors1(p))
+              lengths=[len(p) for _,p in ps]
+              # Weighted median-ish target length.
+              lscore=collections.Counter()
+              for src,p in ps: lscore[len(p)]+=w[src]
+              target_len=max(lscore,key=lscore.get)
+              def score(c):
+                  return sum(w[src]*lev(c,p) for src,p in ps)+lenpen*abs(len(c)-target_len)
+              return min(cands,key=lambda c:(score(c),abs(len(c)-target_len),c))
+
+          alg_results=[]
+          for alpha in [0.5,1.0,1.5,2.0,3.0,4.0,6.0]:
+              for loo in [False,True]:
+                  preds_by_alg={'medoid':[],'aligned':[]}
+                  for i,r in enumerate(rows):
+                      w=source_weights(i if loo else None,alpha)
+                      preds_by_alg['medoid'].append(medoid(r,w))
+                      preds_by_alg['aligned'].append(aligned_consensus(r,w))
+                  for name,preds in preds_by_alg.items():
+                      alg_results.append({'algorithm':name,'alpha':alpha,'loo':loo,
+                          'exact':sum(p==r['expected'] for p,r in zip(preds,rows)),
+                          'total':len(rows),'predictions':[{'expected':r['expected'],'predicted':p} for p,r in zip(preds,rows)]})
+          for alpha in [0.5,1.0,1.5,2.0,3.0,4.0]:
+              for topn in [3,5,8,12,20]:
+                  for lenpen in [0,0.1,0.25,0.5,1.0]:
+                      preds=[]
+                      for i,r in enumerate(rows):
+                          w=source_weights(i,alpha)
+                          preds.append(neighborhood_consensus(r,w,topn,lenpen))
+                      alg_results.append({'algorithm':'neighbor1','alpha':alpha,'topn':topn,'lenpen':lenpen,'loo':True,
+                          'exact':sum(p==r['expected'] for p,r in zip(preds,rows)),
+                          'total':len(rows),'predictions':[{'expected':r['expected'],'predicted':p} for p,r in zip(preds,rows)]})
+
+          best=sorted(alg_results,key=lambda x:(-x['exact'], x.get('loo') is not True))[0:20]
+          report={
+              'row_count':len(rows),
+              'source_ranking':sorted(stats.items(),key=lambda kv:(-kv[1]['accuracy'],kv[1]['mean_edit'])),
+              'best_algorithms':best,
+          }
+          Path('captcha-analysis/report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+          Path('captcha-analysis/summary.txt').write_text('\n'.join([
+              f'rows={len(rows)}',
+              'top_sources:',
+              *[f"{k} exact={v['exact']}/{v['total']} mean_edit={v['mean_edit']:.3f} len_delta={v['mean_len_delta']:.3f}" for k,v in report['source_ranking'][:12]],
+              'top_algorithms:',
+              *[f"{x['algorithm']} exact={x['exact']}/{x['total']} alpha={x.get('alpha')} loo={x.get('loo')} topn={x.get('topn')} lenpen={x.get('lenpen')}" for x in best[:12]],
+          ]))
+          print(Path('captcha-analysis/summary.txt').read_text())
+          PY
+      - name: Commit analysis
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f captcha-analysis
+          git commit -m 'chore: analyze CAPTCHA OCR ensemble' || exit 0
+          git push origin HEAD:tmp/captcha-probe-20260818

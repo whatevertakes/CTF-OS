@@ -1,0 +1,20 @@
+{
+  "url": "http://3.35.97.192:39111/captcha",
+  "label": "common-path",
+  "name": "captcha_3a96d1b156",
+  "status": 401,
+  "final_url": "http://3.35.97.192:39111/captcha",
+  "headers": {
+    "date": "Tue, 18 Aug 2026 06:20:18 GMT",
+    "server": "uvicorn",
+    "content-length": "34",
+    "content-type": "application/json",
+    "cache-control": "no-store, max-age=0",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+    "connection": "close"
+  },
+  "elapsed": 0.3734,
+  "body_len": 34,
+  "http_error": "HTTP Error 401: Unauthorized"
+}

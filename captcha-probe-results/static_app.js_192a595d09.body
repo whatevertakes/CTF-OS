@@ -1,0 +1,186 @@
+"use strict";
+
+const elements = {
+  answer: document.querySelector("#answer"),
+  form: document.querySelector("#answer-form"),
+  flag: document.querySelector("#flag"),
+  idlePanel: document.querySelector("#idle-panel"),
+  image: document.querySelector("#captcha-image"),
+  imagePlaceholder: document.querySelector("#image-placeholder"),
+  message: document.querySelector("#message"),
+  nextButton: document.querySelector("#next-button"),
+  roundPanel: document.querySelector("#round-panel"),
+  sessionState: document.querySelector("#session-state"),
+  startButton: document.querySelector("#start-button"),
+  streak: document.querySelector("#streak"),
+  submitButton: document.querySelector("#submit-button"),
+  target: document.querySelector("#target"),
+  timer: document.querySelector("#timer"),
+};
+
+const state = {
+  token: null,
+  roundNonce: null,
+  imageUrl: null,
+  deadlineAt: null,
+  timerId: null,
+};
+
+function setMessage(text, kind = "") {
+  elements.message.textContent = text;
+  elements.message.className = `message ${kind}`.trim();
+}
+
+async function errorMessage(response) {
+  try {
+    const payload = await response.json();
+    return payload.detail || `HTTP ${response.status}`;
+  } catch {
+    return `HTTP ${response.status}`;
+  }
+}
+
+function authHeaders() {
+  return { Authorization: `Bearer ${state.token}` };
+}
+
+function updateTimer() {
+  if (state.deadlineAt === null) {
+    return;
+  }
+  const remaining = Math.max(0, state.deadlineAt - performance.now());
+  const seconds = Math.ceil(remaining / 1000);
+  const minutesPart = String(Math.floor(seconds / 60)).padStart(2, "0");
+  const secondsPart = String(seconds % 60).padStart(2, "0");
+  elements.timer.textContent = `${minutesPart}:${secondsPart}`;
+  if (remaining <= 0) {
+    clearInterval(state.timerId);
+    elements.answer.disabled = true;
+    elements.submitButton.disabled = true;
+    elements.nextButton.disabled = true;
+    elements.sessionState.textContent = "EXPIRED";
+    setMessage("세션 시간이 만료되었습니다. 페이지를 새로고침해 다시 시작하세요.", "error");
+  }
+}
+
+async function loadCaptcha() {
+  elements.nextButton.classList.add("hidden");
+  elements.answer.disabled = true;
+  elements.submitButton.disabled = true;
+  elements.image.hidden = true;
+  elements.imagePlaceholder.hidden = false;
+  elements.imagePlaceholder.textContent = "CAPTCHA를 불러오는 중…";
+
+  const response = await fetch("/captcha", { headers: authHeaders(), cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+  const nonce = response.headers.get("X-Round-Nonce");
+  if (!nonce) {
+    throw new Error("서버 응답에 round nonce가 없습니다.");
+  }
+  const blob = await response.blob();
+  if (state.imageUrl !== null) {
+    URL.revokeObjectURL(state.imageUrl);
+  }
+  state.imageUrl = URL.createObjectURL(blob);
+  state.roundNonce = nonce;
+  elements.image.src = state.imageUrl;
+  elements.image.hidden = false;
+  elements.imagePlaceholder.hidden = true;
+  elements.answer.value = "";
+  elements.answer.disabled = false;
+  elements.submitButton.disabled = false;
+  elements.answer.focus();
+}
+
+async function fetchFlag() {
+  const response = await fetch("/flag", { headers: authHeaders(), cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+  const payload = await response.json();
+  elements.flag.textContent = payload.flag;
+  elements.flag.classList.remove("hidden");
+  elements.sessionState.textContent = "SOLVED";
+  elements.answer.disabled = true;
+  elements.submitButton.disabled = true;
+  setMessage("60연속 정답을 달성했습니다.", "success");
+}
+
+async function startSession() {
+  elements.startButton.disabled = true;
+  try {
+    const response = await fetch("/start", { method: "POST", cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(await errorMessage(response));
+    }
+    const payload = await response.json();
+    state.token = payload.token;
+    state.deadlineAt = performance.now() + Number(payload.deadline_in) * 1000;
+    elements.streak.textContent = String(payload.streak);
+    elements.target.textContent = String(payload.target);
+    elements.sessionState.textContent = "ACTIVE";
+    elements.idlePanel.classList.add("hidden");
+    elements.roundPanel.classList.remove("hidden");
+    state.timerId = setInterval(updateTimer, 250);
+    updateTimer();
+    await loadCaptcha();
+  } catch (error) {
+    elements.startButton.disabled = false;
+    setMessage(error.message, "error");
+  }
+}
+
+async function submitAnswer(event) {
+  event.preventDefault();
+  if (!elements.form.reportValidity()) {
+    return;
+  }
+  elements.answer.disabled = true;
+  elements.submitButton.disabled = true;
+  setMessage("정답을 확인하는 중…");
+
+  try {
+    const response = await fetch("/submit", {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: state.token,
+        answer: elements.answer.value.toLowerCase(),
+        round_nonce: state.roundNonce,
+      }),
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(await errorMessage(response));
+    }
+    const payload = await response.json();
+    elements.streak.textContent = String(payload.streak);
+    if (payload.solved) {
+      await fetchFlag();
+      return;
+    }
+    if (payload.correct) {
+      setMessage("정답입니다. 다음 문제를 불러옵니다.", "success");
+      await loadCaptcha();
+      return;
+    }
+    const expected = payload.expected_answer || "알 수 없음";
+    setMessage(`오답입니다. 정답은 ${expected}였습니다. streak가 초기화됐습니다.`, "error");
+    elements.nextButton.classList.remove("hidden");
+  } catch (error) {
+    setMessage(error.message, "error");
+    elements.nextButton.classList.remove("hidden");
+  }
+}
+
+elements.startButton.addEventListener("click", startSession);
+elements.form.addEventListener("submit", submitAnswer);
+elements.nextButton.addEventListener("click", async () => {
+  try {
+    await loadCaptcha();
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+});
