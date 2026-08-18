@@ -1,0 +1,15 @@
+{
+  "expected": "68rgsm",
+  "predictions": [
+    {
+      "model": "standard",
+      "prediction": "69c99",
+      "seconds": 0.09597086906433105
+    },
+    {
+      "model": "beta",
+      "prediction": "68gm",
+      "seconds": 0.09517574310302734
+    }
+  ]
+}
