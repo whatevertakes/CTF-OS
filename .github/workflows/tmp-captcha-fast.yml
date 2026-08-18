@@ -1,0 +1,50 @@
+name: tmp-captcha-fast-ocr
+
+on:
+  push:
+    branches:
+      - 'tmp/captcha-fast-20260818'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/captcha-fast-20260818
+      - name: Install and test ddddocr once
+        shell: bash
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet ddddocr
+          rm -rf captcha-fast-results
+          mkdir -p captcha-fast-results
+          python3 - <<'PY'
+          import json, pathlib, time
+          import ddddocr
+          raw=pathlib.Path('captcha-exploit-results/042.body').read_bytes()
+          out={'expected':'68rgsm','predictions':[]}
+          for name, kw in [('standard',{}),('beta',{'beta':True})]:
+              t=time.time()
+              try:
+                  o=ddddocr.DdddOcr(show_ad=False,**kw)
+                  p=o.classification(raw)
+                  out['predictions'].append({'model':name,'prediction':p,'seconds':time.time()-t})
+              except Exception as e:
+                  out['predictions'].append({'model':name,'error':repr(e),'seconds':time.time()-t})
+          pathlib.Path('captcha-fast-results/result.json').write_text(json.dumps(out,indent=2))
+          print(json.dumps(out))
+          PY
+      - name: Commit quick result
+        if: always()
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f captcha-fast-results
+          git commit -m 'chore: store fast CAPTCHA OCR result' || exit 0
+          git push origin HEAD:tmp/captcha-fast-20260818
