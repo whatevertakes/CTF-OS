@@ -1,4 +1,4 @@
-name: tmp-captcha-fast-ocr
+name: tmp-captcha-fast-preprocess
 
 on:
   push:
@@ -17,27 +17,57 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: tmp/captcha-fast-20260818
-      - name: Install and test ddddocr once
+      - name: Test preprocessing variants
         shell: bash
         run: |
-          python3 -m pip install --disable-pip-version-check --quiet ddddocr
+          python3 -m pip install --disable-pip-version-check --quiet ddddocr opencv-python-headless
           rm -rf captcha-fast-results
           mkdir -p captcha-fast-results
           python3 - <<'PY'
-          import json, pathlib, time
-          import ddddocr
+          import inspect, json, pathlib, time
+          import cv2, ddddocr, numpy as np
           raw=pathlib.Path('captcha-exploit-results/042.body').read_bytes()
-          out={'expected':'68rgsm','predictions':[]}
-          for name, kw in [('standard',{}),('beta',{'beta':True})]:
-              t=time.time()
-              try:
-                  o=ddddocr.DdddOcr(show_ad=False,**kw)
-                  p=o.classification(raw)
-                  out['predictions'].append({'model':name,'prediction':p,'seconds':time.time()-t})
-              except Exception as e:
-                  out['predictions'].append({'model':name,'error':repr(e),'seconds':time.time()-t})
+          arr=cv2.imdecode(np.frombuffer(raw,np.uint8),cv2.IMREAD_COLOR)
+          gray=cv2.cvtColor(arr,cv2.COLOR_BGR2GRAY)
+          def enc(a):
+              ok,b=cv2.imencode('.png',a)
+              return b.tobytes()
+          variants={'original':raw}
+          for x2 in [155,165,175,185,200,220,240]:
+              variants[f'crop{x2}']=enc(arr[:,0:x2])
+          for th in range(45,141,5):
+              _,bw=cv2.threshold(gray,th,255,cv2.THRESH_BINARY)
+              variants[f'th{th}']=enc(bw)
+              variants[f'th{th}_crop175']=enc(bw[:,0:175])
+              variants[f'th{th}_up2']=enc(cv2.resize(bw,None,fx=2,fy=2,interpolation=cv2.INTER_NEAREST))
+              variants[f'th{th}_up3']=enc(cv2.resize(bw,None,fx=3,fy=3,interpolation=cv2.INTER_CUBIC))
+          for k in [3,5]:
+              med=cv2.medianBlur(gray,k)
+              for th in range(50,131,10):
+                  _,bw=cv2.threshold(med,th,255,cv2.THRESH_BINARY)
+                  variants[f'med{k}_th{th}']=enc(bw)
+                  variants[f'med{k}_th{th}_up3']=enc(cv2.resize(bw,None,fx=3,fy=3,interpolation=cv2.INTER_CUBIC))
+          inv=cv2.threshold(gray,120,255,cv2.THRESH_BINARY_INV)[1]
+          for ky,kx in [(2,2),(2,3),(3,2),(3,3)]:
+              opened=cv2.morphologyEx(inv,cv2.MORPH_OPEN,np.ones((ky,kx),np.uint8))
+              variants[f'open{ky}x{kx}']=enc(255-opened)
+          models=[]
+          for name,kw in [('standard',{}),('beta',{'beta':True})]:
+              o=ddddocr.DdddOcr(show_ad=False,**kw)
+              models.append((name,o))
+          out={'expected':'68rgsm','api':{},'results':[]}
+          out['api']['DdddOcr_signature']=str(inspect.signature(ddddocr.DdddOcr))
+          out['api']['classification_signature']=str(inspect.signature(models[0][1].classification))
+          out['api']['set_ranges_signature']=str(inspect.signature(models[0][1].set_ranges)) if hasattr(models[0][1],'set_ranges') else None
+          for mname,o in models:
+              for vname,data in variants.items():
+                  t=time.time()
+                  try:p=o.classification(data)
+                  except Exception as e:p='ERR:'+repr(e)
+                  out['results'].append({'model':mname,'variant':vname,'prediction':p,'seconds':round(time.time()-t,5)})
+          out['exact']=[r for r in out['results'] if r['prediction']=='68rgsm']
           pathlib.Path('captcha-fast-results/result.json').write_text(json.dumps(out,indent=2))
-          print(json.dumps(out))
+          print(json.dumps({'api':out['api'],'exact':out['exact'],'count':len(out['results'])}))
           PY
       - name: Commit quick result
         if: always()
@@ -46,5 +76,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -f captcha-fast-results
-          git commit -m 'chore: store fast CAPTCHA OCR result' || exit 0
+          git commit -m 'chore: store CAPTCHA preprocessing sweep' || exit 0
           git push origin HEAD:tmp/captcha-fast-20260818
