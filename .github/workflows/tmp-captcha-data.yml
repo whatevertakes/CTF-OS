@@ -1,0 +1,38 @@
+name: tmp-captcha-data-export
+
+on:
+  push:
+    branches:
+      - 'tmp/captcha-data-20260818'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/captcha-data-20260818
+      - name: Prepare run id
+        shell: bash
+        run: |
+          mkdir -p captcha-data-run
+          printf '%s\n' "$GITHUB_RUN_ID" > captcha-data-run/run-id.txt
+      - name: Upload OCR event data
+        uses: actions/upload-artifact@v4
+        with:
+          name: captcha-ocr-events
+          path: captcha-ocr-results/events.json
+          retention-days: 1
+      - name: Commit run id
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f captcha-data-run
+          git commit -m 'chore: store CAPTCHA data export run id' || exit 0
+          git push origin HEAD:tmp/captcha-data-20260818
