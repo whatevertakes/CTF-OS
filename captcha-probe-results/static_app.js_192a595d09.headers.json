@@ -1,0 +1,22 @@
+{
+  "url": "http://3.35.97.192:39111/static/app.js",
+  "label": "script:src",
+  "name": "static_app.js_192a595d09",
+  "status": 200,
+  "final_url": "http://3.35.97.192:39111/static/app.js",
+  "headers": {
+    "date": "Tue, 18 Aug 2026 06:20:16 GMT",
+    "server": "uvicorn",
+    "content-type": "text/javascript; charset=utf-8",
+    "accept-ranges": "bytes",
+    "content-length": "6162",
+    "last-modified": "Wed, 12 Aug 2026 18:31:31 GMT",
+    "etag": "\"3f25a5efffb59c749f8056fd40120dcf\"",
+    "cache-control": "no-store, max-age=0",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+    "connection": "close"
+  },
+  "elapsed": 0.3736,
+  "body_len": 6162
+}

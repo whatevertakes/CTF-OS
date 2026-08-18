@@ -1,0 +1,22 @@
+{
+  "url": "http://3.35.97.192:39111/static/style.css",
+  "label": "link:href",
+  "name": "static_style.css_c264690026",
+  "status": 200,
+  "final_url": "http://3.35.97.192:39111/static/style.css",
+  "headers": {
+    "date": "Tue, 18 Aug 2026 06:20:16 GMT",
+    "server": "uvicorn",
+    "content-type": "text/css; charset=utf-8",
+    "accept-ranges": "bytes",
+    "content-length": "4470",
+    "last-modified": "Wed, 12 Aug 2026 18:31:31 GMT",
+    "etag": "\"2eb0ccbc1fa1301d2e63eae87a3e386c\"",
+    "cache-control": "no-store, max-age=0",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+    "connection": "close"
+  },
+  "elapsed": 0.3774,
+  "body_len": 4470
+}

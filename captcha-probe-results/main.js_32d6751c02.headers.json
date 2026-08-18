@@ -1,0 +1,20 @@
+{
+  "url": "http://3.35.97.192:39111/main.js",
+  "label": "common-path",
+  "name": "main.js_32d6751c02",
+  "status": 404,
+  "final_url": "http://3.35.97.192:39111/main.js",
+  "headers": {
+    "date": "Tue, 18 Aug 2026 06:20:26 GMT",
+    "server": "uvicorn",
+    "content-length": "22",
+    "content-type": "application/json",
+    "cache-control": "no-store, max-age=0",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+    "connection": "close"
+  },
+  "elapsed": 0.3734,
+  "body_len": 22,
+  "http_error": "HTTP Error 404: Not Found"
+}

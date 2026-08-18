@@ -1,0 +1,602 @@
+{
+  "network": {
+    "target": "http://3.35.97.192:39111",
+    "reverse_dns": [
+      "ec2-3-35-97-192.ap-northeast-2.compute.amazonaws.com",
+      [],
+      [
+        "3.35.97.192"
+      ]
+    ],
+    "tcp": "connected"
+  },
+  "cookies": [],
+  "records": [
+    {
+      "url": "http://3.35.97.192:39111/",
+      "label": "root",
+      "name": "root_7c7a8922b2",
+      "status": 200,
+      "final_url": "http://3.35.97.192:39111/",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:16 GMT",
+        "server": "uvicorn",
+        "content-security-policy": "default-src 'self'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src 'self'",
+        "content-type": "text/html; charset=utf-8",
+        "accept-ranges": "bytes",
+        "content-length": "2897",
+        "last-modified": "Wed, 12 Aug 2026 18:31:31 GMT",
+        "etag": "\"ee45a7e5045e1f8f598655f28688a4a1\"",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.374,
+      "body_len": 2897
+    },
+    {
+      "url": "http://3.35.97.192:39111/static/style.css",
+      "label": "link:href",
+      "name": "static_style.css_c264690026",
+      "status": 200,
+      "final_url": "http://3.35.97.192:39111/static/style.css",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:16 GMT",
+        "server": "uvicorn",
+        "content-type": "text/css; charset=utf-8",
+        "accept-ranges": "bytes",
+        "content-length": "4470",
+        "last-modified": "Wed, 12 Aug 2026 18:31:31 GMT",
+        "etag": "\"2eb0ccbc1fa1301d2e63eae87a3e386c\"",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3774,
+      "body_len": 4470
+    },
+    {
+      "url": "http://3.35.97.192:39111/static/app.js",
+      "label": "script:src",
+      "name": "static_app.js_192a595d09",
+      "status": 200,
+      "final_url": "http://3.35.97.192:39111/static/app.js",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:16 GMT",
+        "server": "uvicorn",
+        "content-type": "text/javascript; charset=utf-8",
+        "accept-ranges": "bytes",
+        "content-length": "6162",
+        "last-modified": "Wed, 12 Aug 2026 18:31:31 GMT",
+        "etag": "\"3f25a5efffb59c749f8056fd40120dcf\"",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3736,
+      "body_len": 6162
+    },
+    {
+      "url": "http://3.35.97.192:39111/docs",
+      "label": "a:href",
+      "name": "docs_aa7be36d94",
+      "status": 200,
+      "final_url": "http://3.35.97.192:39111/docs",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:17 GMT",
+        "server": "uvicorn",
+        "content-length": "935",
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3726,
+      "body_len": 935
+    },
+    {
+      "url": "http://3.35.97.192:39111/robots.txt",
+      "label": "common-path",
+      "name": "robots.txt_744a7b62ea",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/robots.txt",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:17 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3734,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/favicon.ico",
+      "label": "common-path",
+      "name": "favicon.ico_8e8739b26b",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/favicon.ico",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:17 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3736,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/sitemap.xml",
+      "label": "common-path",
+      "name": "sitemap.xml_22f851716d",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/sitemap.xml",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:18 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3714,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/captcha",
+      "label": "common-path",
+      "name": "captcha_3a96d1b156",
+      "status": 401,
+      "final_url": "http://3.35.97.192:39111/captcha",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:18 GMT",
+        "server": "uvicorn",
+        "content-length": "34",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3734,
+      "body_len": 34,
+      "http_error": "HTTP Error 401: Unauthorized"
+    },
+    {
+      "url": "http://3.35.97.192:39111/captcha/",
+      "label": "common-path",
+      "name": "captcha_a752892143",
+      "status": 401,
+      "final_url": "http://3.35.97.192:39111/captcha",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:19 GMT",
+        "server": "uvicorn",
+        "content-length": "34",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.7442,
+      "body_len": 34,
+      "http_error": "HTTP Error 401: Unauthorized"
+    },
+    {
+      "url": "http://3.35.97.192:39111/captcha/new",
+      "label": "common-path",
+      "name": "captcha_new_840976b812",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/captcha/new",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:19 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.373,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/captcha/generate",
+      "label": "common-path",
+      "name": "captcha_generate_9b700041f3",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/captcha/generate",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:20 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3722,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/captcha/image",
+      "label": "common-path",
+      "name": "captcha_image_0c814021f0",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/captcha/image",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:20 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3737,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/captcha/verify",
+      "label": "common-path",
+      "name": "captcha_verify_3a92770f5a",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/captcha/verify",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:20 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3774,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/captcha",
+      "label": "common-path",
+      "name": "api_captcha_323d7dd70a",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/captcha",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:21 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3751,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/captcha/new",
+      "label": "common-path",
+      "name": "api_captcha_new_b100c3ee14",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/captcha/new",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:21 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3726,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/captcha/generate",
+      "label": "common-path",
+      "name": "api_captcha_generate_049215d08d",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/captcha/generate",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:22 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3759,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/captcha/verify",
+      "label": "common-path",
+      "name": "api_captcha_verify_89d9646ca6",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/captcha/verify",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:22 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.372,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/verify",
+      "label": "common-path",
+      "name": "verify_501af5842a",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/verify",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:22 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3737,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/verify",
+      "label": "common-path",
+      "name": "api_verify_b21e2230e0",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/verify",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:23 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3729,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/protected",
+      "label": "common-path",
+      "name": "protected_11d28bf988",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/protected",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:23 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3741,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/protected",
+      "label": "common-path",
+      "name": "api_protected_2f1084e4c2",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/protected",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:23 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3721,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/flag",
+      "label": "common-path",
+      "name": "flag_3062258811",
+      "status": 401,
+      "final_url": "http://3.35.97.192:39111/flag",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:24 GMT",
+        "server": "uvicorn",
+        "content-length": "34",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3736,
+      "body_len": 34,
+      "http_error": "HTTP Error 401: Unauthorized"
+    },
+    {
+      "url": "http://3.35.97.192:39111/api/flag",
+      "label": "common-path",
+      "name": "api_flag_709732467b",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/api/flag",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:24 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3776,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/admin",
+      "label": "common-path",
+      "name": "admin_8a9c6aef0b",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/admin",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:25 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3742,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/secret",
+      "label": "common-path",
+      "name": "secret_e84e71b6cd",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/secret",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:25 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3718,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/app.js",
+      "label": "common-path",
+      "name": "app.js_d9e1e14c22",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/app.js",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:25 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3723,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/main.js",
+      "label": "common-path",
+      "name": "main.js_32d6751c02",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/main.js",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:26 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3734,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/script.js",
+      "label": "common-path",
+      "name": "script.js_18c2a24033",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/script.js",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:26 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3729,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    },
+    {
+      "url": "http://3.35.97.192:39111/static/js/app.js",
+      "label": "common-path",
+      "name": "static_js_app.js_b2a1708ca5",
+      "status": 404,
+      "final_url": "http://3.35.97.192:39111/static/js/app.js",
+      "headers": {
+        "date": "Tue, 18 Aug 2026 06:20:26 GMT",
+        "server": "uvicorn",
+        "content-length": "22",
+        "content-type": "application/json",
+        "cache-control": "no-store, max-age=0",
+        "pragma": "no-cache",
+        "x-content-type-options": "nosniff",
+        "connection": "close"
+      },
+      "elapsed": 0.3784,
+      "body_len": 22,
+      "http_error": "HTTP Error 404: Not Found"
+    }
+  ]
+}

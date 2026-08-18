@@ -1,0 +1,30 @@
+[
+  {
+    "attrs": {
+      "id": "answer-form",
+      "autocomplete": "off"
+    },
+    "inputs": [
+      {
+        "tag": "input",
+        "id": "answer",
+        "name": "answer",
+        "type": "text",
+        "minlength": "4",
+        "maxlength": "7",
+        "pattern": "[abcdefghjkmnpqrstuvwxyz23456789]{4,7}",
+        "placeholder": "4~7 characters",
+        "autocapitalize": "none",
+        "autocomplete": "off",
+        "spellcheck": "false",
+        "required": null
+      },
+      {
+        "tag": "button",
+        "id": "submit-button",
+        "class": "primary",
+        "type": "submit"
+      }
+    ]
+  }
+]

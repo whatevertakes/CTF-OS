@@ -1,0 +1,23 @@
+{
+  "url": "http://3.35.97.192:39111/",
+  "label": "root",
+  "name": "root_7c7a8922b2",
+  "status": 200,
+  "final_url": "http://3.35.97.192:39111/",
+  "headers": {
+    "date": "Tue, 18 Aug 2026 06:20:16 GMT",
+    "server": "uvicorn",
+    "content-security-policy": "default-src 'self'; img-src 'self' blob:; script-src 'self'; style-src 'self'; connect-src 'self'",
+    "content-type": "text/html; charset=utf-8",
+    "accept-ranges": "bytes",
+    "content-length": "2897",
+    "last-modified": "Wed, 12 Aug 2026 18:31:31 GMT",
+    "etag": "\"ee45a7e5045e1f8f598655f28688a4a1\"",
+    "cache-control": "no-store, max-age=0",
+    "pragma": "no-cache",
+    "x-content-type-options": "nosniff",
+    "connection": "close"
+  },
+  "elapsed": 0.374,
+  "body_len": 2897
+}

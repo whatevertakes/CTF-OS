@@ -1,0 +1,17 @@
+[
+  [
+    "link",
+    "href",
+    "/static/style.css"
+  ],
+  [
+    "script",
+    "src",
+    "/static/app.js"
+  ],
+  [
+    "a",
+    "href",
+    "/docs"
+  ]
+]
